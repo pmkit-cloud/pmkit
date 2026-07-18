@@ -1,0 +1,10 @@
+[package]
+name = "pmkit-core"
+description = "Pure ownership value types for PMKit"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true

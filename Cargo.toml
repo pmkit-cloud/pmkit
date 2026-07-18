@@ -1,0 +1,27 @@
+[workspace]
+members = ["crates/pmkit-core"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+rust-version = "1.85"
+version = "0.1.0"
+
+[workspace.lints.rust]
+missing_debug_implementations = "deny"
+missing_docs = "deny"
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+cargo_common_metadata = "allow"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
