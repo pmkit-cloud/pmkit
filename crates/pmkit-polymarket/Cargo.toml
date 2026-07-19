@@ -1,0 +1,21 @@
+[package]
+name = "pmkit-polymarket"
+description = "Polymarket venue adapter for PMKit."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rust_decimal = { workspace = true }
+pmkit-book = { path = "../pmkit-book" }
+polymarket-client-sdk-v2 = { version = "0.6.0-canary.1", package = "polymarket_client_sdk_v2", features = ["clob"] }
+
+[lints]
+workspace = true
