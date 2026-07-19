@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pmkit-core", "crates/pmkit-market"]
+members = ["crates/pmkit-core", "crates/pmkit-market", "crates/pmkit-math"]
 resolver = "3"
 
 [workspace.package]
@@ -32,6 +32,7 @@ pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
 cargo_common_metadata = "allow"
+multiple_crate_versions = "allow"
 expect_used = "deny"
 panic = "deny"
 todo = "deny"

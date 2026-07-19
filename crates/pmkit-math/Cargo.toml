@@ -1,0 +1,19 @@
+[package]
+name = "pmkit-math"
+description = "Pure pricing and fee math for binary prediction markets."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rust_decimal = { workspace = true }
+
+[lints]
+workspace = true
