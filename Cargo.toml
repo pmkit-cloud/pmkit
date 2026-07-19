@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pmkit-core", "crates/pmkit-market", "crates/pmkit-math"]
+members = ["crates/pmkit-core", "crates/pmkit-market", "crates/pmkit-math", "crates/pmkit-book"]
 resolver = "3"
 
 [workspace.package]
