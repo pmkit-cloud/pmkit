@@ -2817,6 +2817,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmkit-paper"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pmkit-book",
+ "pmkit-core",
+ "pmkit-event",
+ "pmkit-exec",
+ "pmkit-market",
+ "pmkit-sim",
+ "rust_decimal",
+ "tokio",
+]
+
+[[package]]
 name = "pmkit-polymarket"
 version = "0.1.0"
 dependencies = [
