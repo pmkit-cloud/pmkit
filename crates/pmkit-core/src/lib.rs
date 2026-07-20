@@ -11,6 +11,8 @@ pub enum EmptyIdError {
     Market,
     /// A strategy ID was empty.
     Strategy,
+    /// A run ID was empty.
+    Run,
 }
 
 impl fmt::Display for EmptyIdError {
@@ -19,6 +21,7 @@ impl fmt::Display for EmptyIdError {
             Self::Portfolio => formatter.write_str("portfolio ID cannot be empty"),
             Self::Market => formatter.write_str("market ID cannot be empty"),
             Self::Strategy => formatter.write_str("strategy ID cannot be empty"),
+            Self::Run => formatter.write_str("run ID cannot be empty"),
         }
     }
 }
@@ -63,6 +66,13 @@ id_type!(
     Strategy,
     "A non-empty strategy identifier.",
     "Creates a strategy identifier.\n\n# Errors\n\nReturns [`EmptyIdError::Strategy`] when `value` is empty or whitespace-only."
+);
+
+id_type!(
+    RunId,
+    Run,
+    "A non-empty run identifier.",
+    "Creates a run identifier.\n\n# Errors\n\nReturns [`EmptyIdError::Run`] when `value` is empty or whitespace-only."
 );
 
 /// Selects an isolated portfolio execution mode.

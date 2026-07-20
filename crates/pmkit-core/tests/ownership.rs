@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use pmkit_core::{
-    EmptyIdError, MarketId, Mode, PortfolioId, PortfolioKey, StrategyId, StrategyKey,
+    EmptyIdError, MarketId, Mode, PortfolioId, PortfolioKey, RunId, StrategyId, StrategyKey,
 };
 
 #[test]
@@ -74,4 +74,11 @@ fn whitespace_only_ids_return_typed_errors() {
     assert_eq!(portfolio, Err(EmptyIdError::Portfolio));
     assert_eq!(market, Err(EmptyIdError::Market));
     assert_eq!(strategy, Err(EmptyIdError::Strategy));
+}
+
+#[test]
+fn run_ids_validate_like_other_ids() {
+    assert!(RunId::new("research-jan").is_ok());
+    assert_eq!(RunId::new(""), Err(EmptyIdError::Run));
+    assert_eq!(RunId::new("  "), Err(EmptyIdError::Run));
 }
