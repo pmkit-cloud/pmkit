@@ -15,6 +15,9 @@ categories.workspace = true
 [dependencies]
 rust_decimal = { workspace = true }
 pmkit-book = { path = "../pmkit-book" }
+pmkit-core = { path = "../pmkit-core" }
+pmkit-market = { path = "../pmkit-market" }
+pmkit-exec = { path = "../pmkit-exec" }
 polymarket-client-sdk-v2 = { version = "0.6.0-canary.1", package = "polymarket_client_sdk_v2", features = ["clob"] }
 
 [lints]
