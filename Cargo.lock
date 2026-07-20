@@ -2802,6 +2802,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmkit-runtime"
+version = "0.1.0"
+dependencies = [
+ "pmkit-core",
+ "pmkit-money",
+ "pmkit-strategy",
+]
+
+[[package]]
 name = "pmkit-strategy"
 version = "0.1.0"
 dependencies = [

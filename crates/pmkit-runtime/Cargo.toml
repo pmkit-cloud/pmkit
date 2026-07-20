@@ -1,0 +1,21 @@
+[package]
+name = "pmkit-runtime"
+description = "Runtime configuration, risk limits, and strategy registration for PMKit."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+pmkit-core = { path = "../pmkit-core" }
+pmkit-money = { path = "../pmkit-money" }
+pmkit-strategy = { path = "../pmkit-strategy" }
+
+[lints]
+workspace = true
