@@ -2795,6 +2795,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmkit-strategy"
+version = "0.1.0"
+dependencies = [
+ "pmkit-book",
+ "pmkit-core",
+ "pmkit-exec",
+ "thiserror",
+]
+
+[[package]]
 name = "polymarket_client_sdk_v2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

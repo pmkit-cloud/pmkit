@@ -1,0 +1,22 @@
+[package]
+name = "pmkit-strategy"
+description = "The strategy contract: traits, context, and returned actions for PMKit."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+pmkit-core = { path = "../pmkit-core" }
+pmkit-book = { path = "../pmkit-book" }
+pmkit-exec = { path = "../pmkit-exec" }
+
+[lints]
+workspace = true
