@@ -1,0 +1,26 @@
+[package]
+name = "pmkit-tape"
+description = "Local user-tape sinks for PMKit market events."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+pmkit-book = { path = "../pmkit-book" }
+pmkit-event = { path = "../pmkit-event" }
+rust_decimal = { workspace = true }
+
+[dev-dependencies]
+pmkit-core = { path = "../pmkit-core" }
+pmkit-market = { path = "../pmkit-market" }
+
+[lints]
+workspace = true

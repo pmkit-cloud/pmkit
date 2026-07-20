@@ -2924,6 +2924,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmkit-tape"
+version = "0.1.0"
+dependencies = [
+ "pmkit-book",
+ "pmkit-core",
+ "pmkit-event",
+ "pmkit-market",
+ "rust_decimal",
+ "serde_json",
+]
+
+[[package]]
 name = "polymarket_client_sdk_v2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
