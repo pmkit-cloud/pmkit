@@ -2870,6 +2870,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmkit-spec"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "pmkit-core",
+ "pmkit-data",
+ "pmkit-event",
+ "pmkit-exec",
+ "pmkit-market",
+ "pmkit-money",
+ "pmkit-run",
+ "pmkit-runtime",
+ "pmkit-strategy",
+ "tokio",
+]
+
+[[package]]
 name = "pmkit-strategy"
 version = "0.1.0"
 dependencies = [

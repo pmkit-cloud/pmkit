@@ -1,0 +1,32 @@
+[package]
+name = "pmkit-spec"
+description = "Run specifications (backtest, paper, live) for PMKit."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+pmkit-core = { path = "../pmkit-core" }
+pmkit-money = { path = "../pmkit-money" }
+pmkit-runtime = { path = "../pmkit-runtime" }
+pmkit-data = { path = "../pmkit-data" }
+pmkit-exec = { path = "../pmkit-exec" }
+pmkit-run = { path = "../pmkit-run" }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+pmkit-event = { path = "../pmkit-event" }
+pmkit-market = { path = "../pmkit-market" }
+pmkit-strategy = { path = "../pmkit-strategy" }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
