@@ -28,6 +28,8 @@ pmkit-paper = { path = "../pmkit-paper" }
 pmkit-market = { path = "../pmkit-market" }
 pmkit-money = { path = "../pmkit-money" }
 pmkit-run = { path = "../pmkit-run" }
+pmkit-manifest = { path = "../pmkit-manifest" }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

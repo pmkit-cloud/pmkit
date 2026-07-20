@@ -2755,6 +2755,7 @@ dependencies = [
  "pmkit-data",
  "pmkit-event",
  "pmkit-exec",
+ "pmkit-manifest",
  "pmkit-market",
  "pmkit-money",
  "pmkit-paper",
@@ -2764,6 +2765,7 @@ dependencies = [
  "pmkit-spec",
  "pmkit-strategy",
  "rust_decimal",
+ "serde_json",
  "thiserror",
  "tokio",
 ]

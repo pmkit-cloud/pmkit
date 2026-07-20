@@ -13,6 +13,7 @@ use pmkit_book::OrderBookL2;
 use pmkit_core::{MarketId, RunId};
 use pmkit_event::MarketEvent;
 use pmkit_exec::{Executor, PlaceOrder};
+use pmkit_manifest::build_manifest;
 use pmkit_market::Outcome;
 use pmkit_paper::PaperExecutor;
 use pmkit_run::LiveConsent;
@@ -154,7 +155,10 @@ impl PmkitBuilder {
         }
 
         let mut reports = HashMap::new();
+        let mut manifests = HashMap::new();
         for spec in runs {
+            let manifest = build_manifest(&spec, &config);
+            let manifest_id = run_id_of(&spec).clone();
             match spec {
                 RunSpec::Backtest(run) => {
                     let report = drive_backtest(&run).await?;
@@ -172,8 +176,13 @@ impl PmkitBuilder {
                     reports.insert(run.id().clone(), RunReport::Live(report));
                 }
             }
+            manifests.insert(manifest_id, manifest);
         }
-        Ok(AppHandle { reports, config })
+        Ok(AppHandle {
+            reports,
+            manifests,
+            config,
+        })
     }
 }
 
@@ -181,6 +190,7 @@ impl PmkitBuilder {
 #[derive(Debug)]
 pub struct AppHandle {
     reports: HashMap<RunId, RunReport>,
+    manifests: HashMap<RunId, serde_json::Value>,
     config: RuntimeConfig,
 }
 
@@ -189,6 +199,12 @@ impl AppHandle {
     #[must_use]
     pub fn report(&self, run: &RunId) -> Option<&RunReport> {
         self.reports.get(run)
+    }
+
+    /// Returns the reproducibility manifest for `run`, if it exists.
+    #[must_use]
+    pub fn manifest(&self, run: &RunId) -> Option<&serde_json::Value> {
+        self.manifests.get(run)
     }
 
     /// Returns the runtime configuration the engine started with.
@@ -647,6 +663,9 @@ mod tests {
             backtest.fills >= 1,
             "the taker buy should fill against the ask"
         );
+        let manifest = app.manifest(&RunId::new("bt")?).ok_or("missing manifest")?;
+        assert_eq!(manifest["mode"], "backtest");
+        assert_eq!(manifest["run"], "bt");
         Ok(())
     }
 
