@@ -12,6 +12,12 @@ use polymarket_client_sdk_v2::clob::types::Side as VenueSide;
 use polymarket_client_sdk_v2::types::U256;
 use rust_decimal::Decimal;
 
+mod execution;
+mod live;
+
+pub use execution::PolymarketExecutor;
+pub use live::PolymarketLiveData;
+
 /// Maps a neutral `PMKit` [`Side`] to the Polymarket venue side.
 #[must_use]
 pub const fn to_venue_side(side: Side) -> VenueSide {
@@ -92,15 +98,17 @@ pub struct VenueOrderInputs {
 }
 
 /// Maps a neutral order to Polymarket CLOB order inputs using a token resolver.
+///
+/// Returns `None` when the order belongs to a different market.
 #[must_use]
-pub const fn venue_order_inputs(order: &PlaceOrder, tokens: &MarketTokens) -> VenueOrderInputs {
-    VenueOrderInputs {
+pub fn venue_order_inputs(order: &PlaceOrder, tokens: &MarketTokens) -> Option<VenueOrderInputs> {
+    (order.market == *tokens.market()).then(|| VenueOrderInputs {
         token_id: tokens.token(order.outcome),
         side: to_venue_side(order.side),
         price: order.price,
         size: order.qty,
         post_only: order.post_only,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -143,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn order_maps_to_venue_inputs() -> Result<(), EmptyIdError> {
+    fn order_maps_to_venue_inputs() -> Result<(), Box<dyn std::error::Error>> {
         let tokens = MarketTokens::new(
             MarketId::new("btc-5m")?,
             U256::from(1_u64),
@@ -157,11 +165,19 @@ mod tests {
             qty: Decimal::from(20),
             post_only: true,
         };
-        let inputs = venue_order_inputs(&order, &tokens);
+        let Some(inputs) = venue_order_inputs(&order, &tokens) else {
+            return Err("expected matching market tokens".into());
+        };
         assert_eq!(inputs.token_id, U256::from(2_u64));
         assert_eq!(inputs.price, Decimal::new(55, 2));
         assert_eq!(inputs.size, Decimal::from(20));
         assert!(inputs.post_only);
+
+        let other_market = PlaceOrder {
+            market: MarketId::new("eth-5m")?,
+            ..order
+        };
+        assert!(venue_order_inputs(&other_market, &tokens).is_none());
         Ok(())
     }
 }

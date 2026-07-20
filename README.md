@@ -37,7 +37,7 @@ changes until `0.1.0` stabilizes.
 | [`pmkit-spec`](crates/pmkit-spec) | Run specs: `BacktestRun`/`PaperRun`/`LiveRun`/`RunSpec`/`ReplaySpec`. |
 | [`pmkit-tape`](crates/pmkit-tape) | Local JSON-lines user-tape sink for market events. |
 | [`pmkit`](crates/pmkit) | Orchestration engine: `Pmkit` builder, `AppHandle`, and the backtest/paper/live drivers. |
-| [`pmkit-polymarket`](crates/pmkit-polymarket) | Polymarket venue adapter: side/token mapping and neutral->venue order inputs. |
+| [`pmkit-polymarket`](crates/pmkit-polymarket) | Polymarket venue adapter: live WebSocket data, authenticated CLOB execution, and neutral/venue mapping. |
 
 The public SDK stays exchange-neutral; venue specifics (Polymarket signing,
 slugs, condition IDs) live behind the adapter, never in the core.
@@ -47,9 +47,8 @@ slugs, condition IDs) live behind the adapter, never in the core.
 The component library and the orchestration engine are in place. All three run
 modes drive end to end: `Pmkit::builder(config).run(spec).start()` runs backtests
 (replay), paper (live data + simulated fills), and live (consent-gated, risk-gated
-order routing), each returning a report. Remaining: the Polymarket live
-data-source and executor implementations, on-chain replay/decode, user-tape
-sinks, position tracking, and the full live risk/reconciliation envelope.
+Polymarket order routing), each returning a report. Remaining: on-chain
+replay/decode and the full live risk/reconciliation envelope.
 
 ## Mental model
 
