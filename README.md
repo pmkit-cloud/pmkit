@@ -35,8 +35,9 @@ changes until `0.1.0` stabilizes.
 | [`pmkit-sim`](crates/pmkit-sim) | Conservative fill-simulation engine. |
 | [`pmkit-paper`](crates/pmkit-paper) | `PaperExecutor` implementing the executor trait over the sim engine. |
 | [`pmkit-spec`](crates/pmkit-spec) | Run specs: `BacktestRun`/`PaperRun`/`LiveRun`/`RunSpec`/`ReplaySpec`. |
-| [`pmkit`](crates/pmkit) | Orchestration engine: `Pmkit` builder, `AppHandle`, and the backtest driver. |
-| [`pmkit-polymarket`](crates/pmkit-polymarket) | Polymarket venue adapter (behind the neutral core). |
+| [`pmkit-tape`](crates/pmkit-tape) | Local JSON-lines user-tape sink for market events. |
+| [`pmkit`](crates/pmkit) | Orchestration engine: `Pmkit` builder, `AppHandle`, and the backtest/paper/live drivers. |
+| [`pmkit-polymarket`](crates/pmkit-polymarket) | Polymarket venue adapter: side/token mapping and neutral->venue order inputs. |
 
 The public SDK stays exchange-neutral; venue specifics (Polymarket signing,
 slugs, condition IDs) live behind the adapter, never in the core.
