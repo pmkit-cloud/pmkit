@@ -43,12 +43,12 @@ slugs, condition IDs) live behind the adapter, never in the core.
 
 ### Roadmap
 
-The component library and a working backtest engine are in place:
-`Pmkit::builder(config).run(backtest).start()` drives replay -> simulation ->
-strategies -> fills and returns a `BacktestReport`. Remaining: paper and live
-orchestration in the engine, the Polymarket live data-source and executor
-implementations, on-chain replay/decode, user-tape sinks, and position tracking
-in the backtest driver.
+The component library and the orchestration engine are in place. All three run
+modes drive end to end: `Pmkit::builder(config).run(spec).start()` runs backtests
+(replay), paper (live data + simulated fills), and live (consent-gated, risk-gated
+order routing), each returning a report. Remaining: the Polymarket live
+data-source and executor implementations, on-chain replay/decode, user-tape
+sinks, position tracking, and the full live risk/reconciliation envelope.
 
 ## Mental model
 
