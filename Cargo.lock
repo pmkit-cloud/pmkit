@@ -2746,6 +2746,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
+name = "pmkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pmkit-book",
+ "pmkit-core",
+ "pmkit-data",
+ "pmkit-event",
+ "pmkit-exec",
+ "pmkit-market",
+ "pmkit-money",
+ "pmkit-run",
+ "pmkit-runtime",
+ "pmkit-sim",
+ "pmkit-spec",
+ "pmkit-strategy",
+ "rust_decimal",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "pmkit-book"
 version = "0.1.0"
 dependencies = [
