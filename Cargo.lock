@@ -2786,6 +2786,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmkit-money"
+version = "0.1.0"
+dependencies = [
+ "rust_decimal",
+]
+
+[[package]]
 name = "pmkit-polymarket"
 version = "0.1.0"
 dependencies = [
