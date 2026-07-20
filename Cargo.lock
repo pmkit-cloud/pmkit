@@ -2757,6 +2757,7 @@ dependencies = [
  "pmkit-exec",
  "pmkit-market",
  "pmkit-money",
+ "pmkit-paper",
  "pmkit-run",
  "pmkit-runtime",
  "pmkit-sim",

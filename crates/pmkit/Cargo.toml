@@ -24,11 +24,12 @@ pmkit-strategy = { path = "../pmkit-strategy" }
 pmkit-book = { path = "../pmkit-book" }
 pmkit-event = { path = "../pmkit-event" }
 pmkit-exec = { path = "../pmkit-exec" }
+pmkit-paper = { path = "../pmkit-paper" }
+pmkit-market = { path = "../pmkit-market" }
 
 [dev-dependencies]
 async-trait = { workspace = true }
 rust_decimal = { workspace = true }
-pmkit-market = { path = "../pmkit-market" }
 pmkit-money = { path = "../pmkit-money" }
 pmkit-run = { path = "../pmkit-run" }
 
