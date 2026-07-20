@@ -224,9 +224,9 @@ async fn drive_backtest(run: &BacktestRun) -> Result<BacktestReport, StartError>
     };
     let replay = tokio::spawn(async move { source.replay(query, tx).await });
 
-    // ponytail: fee category fixed to Crypto and positions untracked in v0.
+    // ponytail: fee category fixed to Crypto; positions tracked from fills.
     let mut sim = SimEngine::new("bt", 0, MarketCategory::Crypto);
-    let positions = Vec::new();
+    let mut positions = Vec::new();
     let mut events_processed = 0_usize;
     let mut fills = 0_usize;
 
@@ -247,12 +247,12 @@ async fn drive_backtest(run: &BacktestRun) -> Result<BacktestReport, StartError>
                 last_trade_price: None,
             };
             sim.update_book(market, *outcome, book.clone());
-            fills += sim.drain_fills().len();
+            fills += absorb_fills(&sim.drain_fills(), &mut positions);
             fills += run_strategies(
                 &mut strategies,
                 market,
                 &book,
-                &positions,
+                &mut positions,
                 *timestamp_ms,
                 &mut sim,
             );
@@ -271,7 +271,7 @@ fn run_strategies(
     strategies: &mut [StrategyInstance],
     market: &pmkit_core::MarketId,
     book: &OrderBookL2,
-    positions: &[pmkit_book::Position],
+    positions: &mut Vec<pmkit_book::Position>,
     timestamp_ms: i64,
     sim: &mut SimEngine,
 ) -> usize {
@@ -283,7 +283,7 @@ fn run_strategies(
         let context = StrategyContext {
             market,
             book,
-            positions,
+            positions: positions.as_slice(),
             now: LogicalTimestamp::from_millis(timestamp_ms),
         };
         if let Ok(actions) = strategy.on_event(context) {
@@ -293,9 +293,25 @@ fn run_strategies(
                 }
             }
         }
-        fills += sim.drain_fills().len();
+        fills += absorb_fills(&sim.drain_fills(), positions);
     }
     fills
+}
+
+fn absorb_fills(fills: &[MarketEvent], positions: &mut Vec<pmkit_book::Position>) -> usize {
+    for event in fills {
+        if let MarketEvent::Fill {
+            outcome,
+            side,
+            price,
+            size,
+            ..
+        } = event
+        {
+            pmkit_book::book::apply_fill(positions, *outcome, *side, *price, *size);
+        }
+    }
+    fills.len()
 }
 
 fn instantiate_strategies(
@@ -317,10 +333,10 @@ fn instantiate_strategies(
     Ok(strategies)
 }
 
-fn drain_paper_fills(rx: &mut tokio::sync::mpsc::Receiver<MarketEvent>) -> usize {
-    let mut fills = 0;
-    while rx.try_recv().is_ok() {
-        fills += 1;
+fn drain_paper_fills(rx: &mut tokio::sync::mpsc::Receiver<MarketEvent>) -> Vec<MarketEvent> {
+    let mut fills = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        fills.push(event);
     }
     fills
 }
@@ -346,8 +362,8 @@ async fn drive_paper(run: &PaperRun) -> Result<PaperReport, StartError> {
     }
     drop(event_tx);
 
-    // ponytail: fee category fixed to Crypto, positions untracked, fill buffer bounded at 1024.
-    let positions = Vec::new();
+    // ponytail: fee category fixed to Crypto; positions tracked; fill buffer bounded at 1024.
+    let mut positions = Vec::new();
     let mut events_processed = 0_usize;
     let mut fills = 0_usize;
 
@@ -368,7 +384,7 @@ async fn drive_paper(run: &PaperRun) -> Result<PaperReport, StartError> {
                 last_trade_price: None,
             };
             let _ = paper.update_book(market, *outcome, book.clone()).await;
-            fills += drain_paper_fills(&mut fill_rx);
+            fills += absorb_fills(&drain_paper_fills(&mut fill_rx), &mut positions);
             for (registered_market, strategy) in &mut *strategies {
                 if *registered_market != *market {
                     continue;
@@ -386,11 +402,11 @@ async fn drive_paper(run: &PaperRun) -> Result<PaperReport, StartError> {
                         }
                     }
                 }
-                fills += drain_paper_fills(&mut fill_rx);
+                fills += absorb_fills(&drain_paper_fills(&mut fill_rx), &mut positions);
             }
         }
     }
-    fills += drain_paper_fills(&mut fill_rx);
+    fills += absorb_fills(&drain_paper_fills(&mut fill_rx), &mut positions);
 
     Ok(PaperReport {
         run: run.id().clone(),
@@ -426,7 +442,7 @@ async fn drive_live(run: &LiveRun) -> Result<LiveReport, StartError> {
 
     // ponytail: v0 risk gate checks only per-order notional; positions,
     // loss/open-order limits, reconciliation, and tape are not yet enforced.
-    let positions = Vec::new();
+    let mut positions = Vec::new();
     let mut events_processed = 0_usize;
     let mut fills = 0_usize;
     let mut rejected = 0_usize;
@@ -470,7 +486,14 @@ async fn drive_live(run: &LiveRun) -> Result<LiveReport, StartError> {
                     }
                 }
             }
-            MarketEvent::Fill { .. } => {
+            MarketEvent::Fill {
+                outcome,
+                side,
+                price,
+                size,
+                ..
+            } => {
+                pmkit_book::book::apply_fill(&mut positions, *outcome, *side, *price, *size);
                 fills += 1;
             }
             _ => {}
