@@ -432,8 +432,24 @@ async fn drive_paper(run: &PaperRun) -> Result<PaperReport, StartError> {
 }
 
 #[must_use]
-fn passes_risk(order: &PlaceOrder, limits: &RiskLimits) -> bool {
-    order.qty * order.price <= limits.max_order_notional.as_decimal()
+fn passes_risk(
+    order: &PlaceOrder,
+    limits: &RiskLimits,
+    positions: &[pmkit_book::Position],
+) -> bool {
+    if order.qty * order.price > limits.max_order_notional.as_decimal() {
+        return false;
+    }
+    let signed = match order.side {
+        pmkit_book::Side::Buy => order.qty,
+        pmkit_book::Side::Sell => -order.qty,
+    };
+    let held = positions
+        .iter()
+        .find(|position| position.outcome == order.outcome)
+        .map(|position| position.qty)
+        .unwrap_or_default();
+    (held + signed).abs() * order.price <= limits.max_position_notional.as_decimal()
 }
 
 async fn drive_live(run: &LiveRun) -> Result<LiveReport, StartError> {
@@ -492,7 +508,7 @@ async fn drive_live(run: &LiveRun) -> Result<LiveReport, StartError> {
                     if let Ok(actions) = strategy.on_event(context) {
                         for action in actions.as_slice() {
                             if let Action::Place(order) = action {
-                                if passes_risk(order, &limits) {
+                                if passes_risk(order, &limits, &positions) {
                                     let _ = executor.submit(order, *timestamp_ms).await;
                                 } else {
                                     rejected += 1;
@@ -809,6 +825,35 @@ mod tests {
     async fn live_run_without_consent_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
         let result = Pmkit::builder(config()?).run(live_run()?).start().await;
         assert!(matches!(result, Err(StartError::LiveConsentMissing(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn risk_gate_enforces_order_and_position_notional() -> Result<(), Box<dyn std::error::Error>> {
+        let limits = RiskLimits {
+            max_order_notional: Money::usdc(10),
+            max_position_notional: Money::usdc(8),
+            max_open_orders: NonZeroU32::new(5).ok_or("nonzero")?,
+            max_loss: Money::usdc(100),
+        };
+        let market = MarketId::new("btc-5m")?;
+        let order = |qty: i64| PlaceOrder {
+            market: market.clone(),
+            outcome: Outcome::Up,
+            side: Side::Buy,
+            price: Decimal::ONE,
+            qty: Decimal::from(qty),
+            post_only: false,
+        };
+        assert!(super::passes_risk(&order(5), &limits, &[]));
+        assert!(!super::passes_risk(&order(15), &limits, &[]));
+        let held = [pmkit_book::Position {
+            outcome: Outcome::Up,
+            qty: Decimal::from(5),
+            avg_entry: Decimal::ONE,
+            unrealized_pnl: Decimal::ZERO,
+        }];
+        assert!(!super::passes_risk(&order(5), &limits, &held));
         Ok(())
     }
 }
