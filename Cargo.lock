@@ -2758,6 +2758,16 @@ name = "pmkit-core"
 version = "0.1.0"
 
 [[package]]
+name = "pmkit-event"
+version = "0.1.0"
+dependencies = [
+ "pmkit-book",
+ "pmkit-core",
+ "pmkit-market",
+ "rust_decimal",
+]
+
+[[package]]
 name = "pmkit-exec"
 version = "0.1.0"
 dependencies = [
