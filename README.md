@@ -21,13 +21,29 @@ changes until `0.1.0` stabilizes.
 
 | Crate | Purpose |
 |---|---|
-| [`pmkit-core`](crates/pmkit-core) | Pure ownership value types: `PortfolioId`, `MarketId`, `StrategyId`, `Mode`, `PortfolioKey`, `StrategyKey`. |
-| [`pmkit-market`](crates/pmkit-market) | Market-data domain primitives for crypto up/down prediction markets: `Asset`, `Outcome`, `MarketDuration`, `Exchange`. |
+| [`pmkit-core`](crates/pmkit-core) | Pure ownership value types: `PortfolioId`, `MarketId`, `StrategyId`, `RunId`, `Mode`, `PortfolioKey`, `StrategyKey`. |
+| [`pmkit-money`](crates/pmkit-money) | `Money` — a USDC monetary amount. |
+| [`pmkit-market`](crates/pmkit-market) | Market-data domain primitives: `Asset`, `Outcome`, `MarketDuration`, `Exchange`. |
+| [`pmkit-book`](crates/pmkit-book) | `Side`, `OrderBookL2`, `Position`, plus book and sizing math. |
+| [`pmkit-math`](crates/pmkit-math) | Pure pricing and fee math: `fees`, `signals`, `fill`, `fair_value`. |
+| [`pmkit-event`](crates/pmkit-event) | Neutral `MarketEvent` model and `Liquidity`. |
+| [`pmkit-exec`](crates/pmkit-exec) | The `Executor` trait (live/paper/backtest boundary) and `PlaceOrder`/`OrderId`. |
+| [`pmkit-strategy`](crates/pmkit-strategy) | The `Strategy`/`StrategyFactory` traits, `StrategyContext`, and `Actions`. |
+| [`pmkit-runtime`](crates/pmkit-runtime) | `RiskLimits`, `RuntimeConfig`, `LiveOrderPolicy`, `StrategyRegistration`. |
+| [`pmkit-run`](crates/pmkit-run) | Run-spec primitives: `EvidenceRequirement`, `RetrievalWait`, `TapePolicy`, `LiveConsent`. |
+| [`pmkit-polymarket`](crates/pmkit-polymarket) | Polymarket venue adapter (behind the neutral core). |
 
-More crates are migrated from the private engine as they are decoupled from
-venue-specific and credential-bearing code. The public SDK stays
-exchange-neutral; venue specifics (Polymarket signing, slugs, condition IDs)
-live behind adapters, never in the core.
+The public SDK stays exchange-neutral; venue specifics (Polymarket signing,
+slugs, condition IDs) live behind the adapter, never in the core.
+
+### Roadmap
+
+The neutral value-type, trait, and config foundation above is in place. The
+orchestration engine is next: data-source traits (`HistoricalDataSource`,
+`LiveDataSource`) over `MarketEvent`, the fill-simulation engine and concrete
+paper executor, run specs (`BacktestRun`/`PaperRun`/`LiveRun`) and the
+`Pmkit` builder / `AppHandle` lifecycle, the backtest engine, and the
+Polymarket live data-source and executor implementations.
 
 ## Mental model
 
