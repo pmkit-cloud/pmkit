@@ -2842,6 +2842,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmkit-sim"
+version = "0.1.0"
+dependencies = [
+ "pmkit-book",
+ "pmkit-core",
+ "pmkit-event",
+ "pmkit-exec",
+ "pmkit-market",
+ "pmkit-math",
+ "rust_decimal",
+]
+
+[[package]]
 name = "pmkit-strategy"
 version = "0.1.0"
 dependencies = [

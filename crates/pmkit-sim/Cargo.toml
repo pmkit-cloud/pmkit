@@ -1,0 +1,25 @@
+[package]
+name = "pmkit-sim"
+description = "Conservative fill-simulation engine for PMKit paper and backtest runs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rust_decimal = { workspace = true }
+pmkit-core = { path = "../pmkit-core" }
+pmkit-market = { path = "../pmkit-market" }
+pmkit-book = { path = "../pmkit-book" }
+pmkit-exec = { path = "../pmkit-exec" }
+pmkit-event = { path = "../pmkit-event" }
+pmkit-math = { path = "../pmkit-math" }
+
+[lints]
+workspace = true
