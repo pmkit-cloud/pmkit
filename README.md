@@ -31,6 +31,11 @@ changes until `0.1.0` stabilizes.
 | [`pmkit-strategy`](crates/pmkit-strategy) | The `Strategy`/`StrategyFactory` traits, `StrategyContext`, and `Actions`. |
 | [`pmkit-runtime`](crates/pmkit-runtime) | `RiskLimits`, `RuntimeConfig`, `LiveOrderPolicy`, `StrategyRegistration`. |
 | [`pmkit-run`](crates/pmkit-run) | Run-spec primitives: `EvidenceRequirement`, `RetrievalWait`, `TapePolicy`, `LiveConsent`. |
+| [`pmkit-data`](crates/pmkit-data) | `HistoricalDataSource`/`LiveDataSource` traits over `MarketEvent`. |
+| [`pmkit-sim`](crates/pmkit-sim) | Conservative fill-simulation engine. |
+| [`pmkit-paper`](crates/pmkit-paper) | `PaperExecutor` implementing the executor trait over the sim engine. |
+| [`pmkit-spec`](crates/pmkit-spec) | Run specs: `BacktestRun`/`PaperRun`/`LiveRun`/`RunSpec`/`ReplaySpec`. |
+| [`pmkit`](crates/pmkit) | Orchestration engine: `Pmkit` builder, `AppHandle`, and the backtest driver. |
 | [`pmkit-polymarket`](crates/pmkit-polymarket) | Polymarket venue adapter (behind the neutral core). |
 
 The public SDK stays exchange-neutral; venue specifics (Polymarket signing,
@@ -38,12 +43,12 @@ slugs, condition IDs) live behind the adapter, never in the core.
 
 ### Roadmap
 
-The neutral value-type, trait, and config foundation above is in place. The
-orchestration engine is next: data-source traits (`HistoricalDataSource`,
-`LiveDataSource`) over `MarketEvent`, the fill-simulation engine and concrete
-paper executor, run specs (`BacktestRun`/`PaperRun`/`LiveRun`) and the
-`Pmkit` builder / `AppHandle` lifecycle, the backtest engine, and the
-Polymarket live data-source and executor implementations.
+The component library and a working backtest engine are in place:
+`Pmkit::builder(config).run(backtest).start()` drives replay -> simulation ->
+strategies -> fills and returns a `BacktestReport`. Remaining: paper and live
+orchestration in the engine, the Polymarket live data-source and executor
+implementations, on-chain replay/decode, user-tape sinks, and position tracking
+in the backtest driver.
 
 ## Mental model
 
