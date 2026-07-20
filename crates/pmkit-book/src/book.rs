@@ -3,7 +3,7 @@
 use pmkit_market::Outcome;
 use rust_decimal::Decimal;
 
-use crate::{OrderBookL2, Position};
+use crate::{OrderBookL2, Position, Side};
 
 /// Lowest ask price in the book, scanning all levels.
 #[inline]
@@ -67,10 +67,52 @@ pub fn position_quantities(positions: &[Position]) -> (Decimal, Decimal) {
     (up, down)
 }
 
+/// Applies a fill to a position set, updating the position for `outcome`.
+///
+/// A buy increases the outcome's quantity; a sell decreases it. The average
+/// entry price is re-weighted only while the position grows in one direction.
+///
+/// This is a v0 accounting model: it computes no realized `PnL` and does not
+/// re-base the average entry when a fill flips the position through zero.
+pub fn apply_fill(
+    positions: &mut Vec<Position>,
+    outcome: Outcome,
+    side: Side,
+    price: Decimal,
+    quantity: Decimal,
+) {
+    let delta = match side {
+        Side::Buy => quantity,
+        Side::Sell => -quantity,
+    };
+    if let Some(position) = positions.iter_mut().find(|p| p.outcome == outcome) {
+        let increasing = (position.qty >= Decimal::ZERO && delta > Decimal::ZERO)
+            || (position.qty <= Decimal::ZERO && delta < Decimal::ZERO);
+        if increasing {
+            let prior = position.qty.abs();
+            let total = prior + quantity;
+            if total > Decimal::ZERO {
+                position.avg_entry = (position.avg_entry * prior + price * quantity) / total;
+            }
+        }
+        position.qty += delta;
+        if position.qty == Decimal::ZERO {
+            position.avg_entry = Decimal::ZERO;
+        }
+    } else {
+        positions.push(Position {
+            outcome,
+            qty: delta,
+            avg_entry: price,
+            unrealized_pnl: Decimal::ZERO,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{best_ask, best_bid, held_qty, mid_price, position_quantities, spread};
-    use crate::{OrderBookL2, Position};
+    use super::{apply_fill, best_ask, best_bid, held_qty, mid_price, position_quantities, spread};
+    use crate::{OrderBookL2, Position, Side};
     use pmkit_market::Outcome;
     use rust_decimal::Decimal;
 
@@ -125,5 +167,37 @@ mod tests {
             position_quantities(&positions),
             (Decimal::from(15), Decimal::from(3))
         );
+    }
+
+    #[test]
+    fn fills_accumulate_then_reduce() {
+        let mut positions = Vec::new();
+        apply_fill(
+            &mut positions,
+            Outcome::Up,
+            Side::Buy,
+            Decimal::new(40, 2),
+            Decimal::from(10),
+        );
+        apply_fill(
+            &mut positions,
+            Outcome::Up,
+            Side::Buy,
+            Decimal::new(50, 2),
+            Decimal::from(10),
+        );
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].qty, Decimal::from(20));
+        assert_eq!(positions[0].avg_entry, Decimal::new(45, 2));
+
+        apply_fill(
+            &mut positions,
+            Outcome::Up,
+            Side::Sell,
+            Decimal::new(60, 2),
+            Decimal::from(5),
+        );
+        assert_eq!(positions[0].qty, Decimal::from(15));
+        assert_eq!(positions[0].avg_entry, Decimal::new(45, 2));
     }
 }
