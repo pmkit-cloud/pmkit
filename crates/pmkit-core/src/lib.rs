@@ -44,6 +44,12 @@ macro_rules! id_type {
                 Ok(Self(value))
             }
         }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
     };
 }
 
