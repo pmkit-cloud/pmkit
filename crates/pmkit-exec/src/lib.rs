@@ -15,6 +15,13 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OrderId(pub String);
 
+/// Authoritative execution state used to seed and reconcile runtime risk.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecutionSnapshot {
+    /// Every order currently open at the executor.
+    pub open_orders: Vec<OrderId>,
+}
+
 /// An order to place on a single market outcome.
 #[derive(Debug, Clone)]
 pub struct PlaceOrder {
@@ -59,6 +66,20 @@ pub enum ExecError {
 /// backtest replays historical fills.
 #[async_trait::async_trait]
 pub trait Executor: Send + Sync {
+    /// Returns authoritative execution state before order placement begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError`] when state cannot be established safely.
+    async fn preflight(&self) -> Result<ExecutionSnapshot, ExecError>;
+
+    /// Refreshes authoritative execution state while the runtime is active.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError`] when state cannot be reconciled safely.
+    async fn reconcile(&self) -> Result<ExecutionSnapshot, ExecError>;
+
     /// Submits a single order and returns its venue id.
     ///
     /// `now_ms` is the current event timestamp (system clock for live,
@@ -115,7 +136,7 @@ pub trait Executor: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecError, Executor, OrderId, PlaceOrder};
+    use super::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
     use pmkit_book::Side;
     use pmkit_core::MarketId;
     use pmkit_market::Outcome;
@@ -128,6 +149,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Executor for MockExecutor {
+        async fn preflight(&self) -> Result<ExecutionSnapshot, ExecError> {
+            Ok(ExecutionSnapshot::default())
+        }
+
+        async fn reconcile(&self) -> Result<ExecutionSnapshot, ExecError> {
+            Ok(ExecutionSnapshot::default())
+        }
+
         async fn submit(&self, _order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
             let n = self.next.fetch_add(1, Ordering::Relaxed);
             Ok(OrderId(format!("order-{n}")))

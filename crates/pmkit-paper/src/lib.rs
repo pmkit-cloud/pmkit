@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use pmkit_book::OrderBookL2;
 use pmkit_core::MarketId;
 use pmkit_event::MarketEvent;
-use pmkit_exec::{ExecError, Executor, OrderId, PlaceOrder};
+use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
 use pmkit_market::Outcome;
 use pmkit_sim::{MarketCategory, SimEngine};
 use tokio::sync::mpsc::Sender;
@@ -73,6 +73,14 @@ impl PaperExecutor {
 
 #[async_trait]
 impl Executor for PaperExecutor {
+    async fn preflight(&self) -> Result<ExecutionSnapshot, ExecError> {
+        Ok(self.snapshot())
+    }
+
+    async fn reconcile(&self) -> Result<ExecutionSnapshot, ExecError> {
+        Ok(self.snapshot())
+    }
+
     async fn submit(&self, order: &PlaceOrder, now_ms: i64) -> Result<OrderId, ExecError> {
         let (id, drained) = {
             let mut engine = self.engine.lock().unwrap_or_else(PoisonError::into_inner);
@@ -99,6 +107,18 @@ impl Executor for PaperExecutor {
             .unwrap_or_else(PoisonError::into_inner)
             .cancel_all();
         Ok(())
+    }
+}
+
+impl PaperExecutor {
+    fn snapshot(&self) -> ExecutionSnapshot {
+        ExecutionSnapshot {
+            open_orders: self
+                .engine
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .resting_order_ids(),
+        }
     }
 }
 
@@ -153,6 +173,39 @@ mod tests {
         };
         assert_eq!(liquidity, Liquidity::Taker);
         assert_eq!(size, Decimal::from(10));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preflight_reports_resting_orders() -> Result<(), Box<dyn std::error::Error>> {
+        let (tx, _rx) = mpsc::channel(8);
+        let paper = PaperExecutor::new(tx, "paper", MarketCategory::Crypto);
+        let market = MarketId::new("btc-5m")?;
+        paper
+            .update_book(
+                &market,
+                Outcome::Up,
+                OrderBookL2 {
+                    bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+                    asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
+                    timestamp_ms: 0,
+                    last_trade_price: None,
+                },
+            )
+            .await?;
+        let order = PlaceOrder {
+            market,
+            outcome: Outcome::Up,
+            side: Side::Buy,
+            price: Decimal::new(45, 2),
+            qty: Decimal::from(10),
+            post_only: true,
+        };
+        let id = paper.submit(&order, 100).await?;
+
+        let snapshot = paper.preflight().await?;
+
+        assert_eq!(snapshot.open_orders, vec![id]);
         Ok(())
     }
 }

@@ -7,20 +7,20 @@
 //! live runs route strategy orders through a consented executor behind a
 //! minimal risk gate (a v0 that omits reconciliation, tape, and full limits).
 
+mod backtest;
+mod live;
+mod paper;
+
 use std::collections::{HashMap, HashSet};
 
-use pmkit_book::OrderBookL2;
 use pmkit_core::{MarketId, RunId};
 use pmkit_event::MarketEvent;
-use pmkit_exec::{Executor, PlaceOrder};
+use pmkit_exec::ExecError;
 use pmkit_manifest::build_manifest;
-use pmkit_market::Outcome;
-use pmkit_paper::PaperExecutor;
 use pmkit_run::LiveConsent;
-use pmkit_runtime::{RiskLimits, RuntimeConfig, StrategyRegistration};
-use pmkit_sim::{MarketCategory, SimEngine};
-use pmkit_spec::{BacktestRun, LiveRun, PaperRun, RunSpec};
-use pmkit_strategy::{Action, LogicalTimestamp, Strategy, StrategyContext};
+use pmkit_runtime::{RuntimeConfig, StrategyRegistration};
+use pmkit_spec::RunSpec;
+use pmkit_strategy::Strategy;
 use thiserror::Error;
 
 /// A registered strategy instance keyed by its exact market.
@@ -91,6 +91,14 @@ pub enum StartError {
     /// A live run was configured without calling `enable_live`.
     #[error("live run {0} requires enable_live consent")]
     LiveConsentMissing(RunId),
+    /// Live execution state could not be established safely.
+    #[error("execution state unavailable for run {run}: {source}")]
+    ExecutionState {
+        /// The run whose executor could not establish state.
+        run: RunId,
+        /// The underlying executor failure.
+        source: ExecError,
+    },
 }
 
 /// Entry point to the engine.
@@ -161,18 +169,18 @@ impl PmkitBuilder {
             let manifest_id = run_id_of(&spec).clone();
             match spec {
                 RunSpec::Backtest(run) => {
-                    let report = drive_backtest(&run).await?;
+                    let report = backtest::drive(&run).await?;
                     reports.insert(run.id().clone(), RunReport::Backtest(report));
                 }
                 RunSpec::Paper(run) => {
-                    let report = drive_paper(&run).await?;
+                    let report = paper::drive(&run).await?;
                     reports.insert(run.id().clone(), RunReport::Paper(report));
                 }
                 RunSpec::Live(run) => {
                     if consent.is_none() {
                         return Err(StartError::LiveConsentMissing(run.id().clone()));
                     }
-                    let report = drive_live(&run).await?;
+                    let report = live::drive(&run).await?;
                     reports.insert(run.id().clone(), RunReport::Live(report));
                 }
             }
@@ -222,98 +230,6 @@ fn run_id_of(spec: &RunSpec) -> &RunId {
     }
 }
 
-async fn drive_backtest(run: &BacktestRun) -> Result<BacktestReport, StartError> {
-    let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
-
-    let markets = strategies
-        .iter()
-        .map(|(market, _)| market.clone())
-        .collect();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
-    let source = run.replay().source().clone();
-    let query = ReplayQuery {
-        markets,
-        from: run.replay().from(),
-        to: run.replay().to(),
-        evidence: run.replay().evidence(),
-        retrieval_wait: run.replay().retrieval_wait(),
-    };
-    let replay = tokio::spawn(async move { source.replay(query, tx).await });
-
-    // ponytail: fee category fixed to Crypto; positions tracked from fills.
-    let mut sim = SimEngine::new("bt", 0, MarketCategory::Crypto);
-    let mut positions = Vec::new();
-    let mut events_processed = 0_usize;
-    let mut fills = 0_usize;
-
-    while let Some(event) = rx.recv().await {
-        events_processed += 1;
-        if let MarketEvent::BookUpdate {
-            market,
-            outcome,
-            bids,
-            asks,
-            timestamp_ms,
-        } = &event
-        {
-            let book = OrderBookL2 {
-                bids: bids.clone(),
-                asks: asks.clone(),
-                timestamp_ms: *timestamp_ms,
-                last_trade_price: None,
-            };
-            sim.update_book(market, *outcome, book.clone());
-            fills += absorb_fills(&sim.drain_fills(), &mut positions);
-            fills += run_strategies(
-                &mut strategies,
-                market,
-                &book,
-                &mut positions,
-                *timestamp_ms,
-                &mut sim,
-            );
-        }
-    }
-
-    let _ = replay.await;
-    Ok(BacktestReport {
-        run: run.id().clone(),
-        events_processed,
-        fills,
-    })
-}
-
-fn run_strategies(
-    strategies: &mut [StrategyInstance],
-    market: &pmkit_core::MarketId,
-    book: &OrderBookL2,
-    positions: &mut Vec<pmkit_book::Position>,
-    timestamp_ms: i64,
-    sim: &mut SimEngine,
-) -> usize {
-    let mut fills = 0;
-    for (registered_market, strategy) in &mut *strategies {
-        if *registered_market != *market {
-            continue;
-        }
-        let context = StrategyContext {
-            market,
-            book,
-            positions: positions.as_slice(),
-            now: LogicalTimestamp::from_millis(timestamp_ms),
-        };
-        if let Ok(actions) = strategy.on_event(context) {
-            for action in actions.as_slice() {
-                if let Action::Place(order) = action {
-                    sim.submit(order, timestamp_ms);
-                }
-            }
-        }
-        fills += absorb_fills(&sim.drain_fills(), positions);
-    }
-    fills
-}
-
 fn absorb_fills(fills: &[MarketEvent], positions: &mut Vec<pmkit_book::Position>) -> usize {
     for event in fills {
         if let MarketEvent::Fill {
@@ -349,511 +265,11 @@ fn instantiate_strategies(
     Ok(strategies)
 }
 
-fn drain_paper_fills(rx: &mut tokio::sync::mpsc::Receiver<MarketEvent>) -> Vec<MarketEvent> {
-    let mut fills = Vec::new();
-    while let Ok(event) = rx.try_recv() {
-        fills.push(event);
-    }
-    fills
-}
-
-async fn drive_paper(run: &PaperRun) -> Result<PaperReport, StartError> {
-    let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
-
-    let (fill_tx, mut fill_rx) = tokio::sync::mpsc::channel(1024);
-    let paper = PaperExecutor::new(fill_tx, "paper", MarketCategory::Crypto);
-
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1024);
-    let mut subscribed = HashSet::new();
-    for (market, _) in &strategies {
-        if !subscribed.insert(market.clone()) {
-            continue;
-        }
-        for outcome in [Outcome::Up, Outcome::Down] {
-            let source = run.market_data().clone();
-            let sink = event_tx.clone();
-            let market = market.clone();
-            tokio::spawn(async move { source.subscribe(market, outcome, sink).await });
-        }
-    }
-    drop(event_tx);
-
-    // ponytail: fee category fixed to Crypto; positions tracked; fill buffer bounded at 1024.
-    let mut positions = Vec::new();
-    let mut events_processed = 0_usize;
-    let mut fills = 0_usize;
-
-    while let Some(event) = event_rx.recv().await {
-        events_processed += 1;
-        if let MarketEvent::BookUpdate {
-            market,
-            outcome,
-            bids,
-            asks,
-            timestamp_ms,
-        } = &event
-        {
-            let book = OrderBookL2 {
-                bids: bids.clone(),
-                asks: asks.clone(),
-                timestamp_ms: *timestamp_ms,
-                last_trade_price: None,
-            };
-            let _ = paper.update_book(market, *outcome, book.clone()).await;
-            fills += absorb_fills(&drain_paper_fills(&mut fill_rx), &mut positions);
-            for (registered_market, strategy) in &mut *strategies {
-                if *registered_market != *market {
-                    continue;
-                }
-                let context = StrategyContext {
-                    market,
-                    book: &book,
-                    positions: &positions,
-                    now: LogicalTimestamp::from_millis(*timestamp_ms),
-                };
-                if let Ok(actions) = strategy.on_event(context) {
-                    for action in actions.as_slice() {
-                        if let Action::Place(order) = action {
-                            let _ = paper.submit(order, *timestamp_ms).await;
-                        }
-                    }
-                }
-                fills += absorb_fills(&drain_paper_fills(&mut fill_rx), &mut positions);
-            }
-        }
-    }
-    fills += absorb_fills(&drain_paper_fills(&mut fill_rx), &mut positions);
-
-    Ok(PaperReport {
-        run: run.id().clone(),
-        events_processed,
-        fills,
-    })
-}
-
-#[must_use]
-fn passes_risk(
-    order: &PlaceOrder,
-    limits: &RiskLimits,
-    positions: &[pmkit_book::Position],
-) -> bool {
-    if order.qty * order.price > limits.max_order_notional.as_decimal() {
-        return false;
-    }
-    let signed = match order.side {
-        pmkit_book::Side::Buy => order.qty,
-        pmkit_book::Side::Sell => -order.qty,
-    };
-    let held = positions
-        .iter()
-        .find(|position| position.outcome == order.outcome)
-        .map(|position| position.qty)
-        .unwrap_or_default();
-    (held + signed).abs() * order.price <= limits.max_position_notional.as_decimal()
-}
-
-async fn drive_live(run: &LiveRun) -> Result<LiveReport, StartError> {
-    let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
-    let executor = run.executor().clone();
-    let limits = run.risk().clone();
-
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1024);
-    let mut subscribed = HashSet::new();
-    for (market, _) in &strategies {
-        if !subscribed.insert(market.clone()) {
-            continue;
-        }
-        for outcome in [Outcome::Up, Outcome::Down] {
-            let source = run.market_data().clone();
-            let sink = event_tx.clone();
-            let market = market.clone();
-            tokio::spawn(async move { source.subscribe(market, outcome, sink).await });
-        }
-    }
-    drop(event_tx);
-
-    // ponytail: v0 risk gate checks only per-order notional; positions,
-    // loss/open-order limits, reconciliation, and tape are not yet enforced.
-    let mut positions = Vec::new();
-    let mut events_processed = 0_usize;
-    let mut fills = 0_usize;
-    let mut rejected = 0_usize;
-
-    while let Some(event) = event_rx.recv().await {
-        events_processed += 1;
-        match &event {
-            MarketEvent::BookUpdate {
-                market,
-                bids,
-                asks,
-                timestamp_ms,
-                ..
-            } => {
-                let book = OrderBookL2 {
-                    bids: bids.clone(),
-                    asks: asks.clone(),
-                    timestamp_ms: *timestamp_ms,
-                    last_trade_price: None,
-                };
-                for (registered_market, strategy) in &mut *strategies {
-                    if *registered_market != *market {
-                        continue;
-                    }
-                    let context = StrategyContext {
-                        market,
-                        book: &book,
-                        positions: &positions,
-                        now: LogicalTimestamp::from_millis(*timestamp_ms),
-                    };
-                    if let Ok(actions) = strategy.on_event(context) {
-                        for action in actions.as_slice() {
-                            if let Action::Place(order) = action {
-                                if passes_risk(order, &limits, &positions) {
-                                    let _ = executor.submit(order, *timestamp_ms).await;
-                                } else {
-                                    rejected += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            MarketEvent::Fill {
-                outcome,
-                side,
-                price,
-                size,
-                ..
-            } => {
-                pmkit_book::book::apply_fill(&mut positions, *outcome, *side, *price, *size);
-                fills += 1;
-            }
-            _ => {}
-        }
-    }
-
-    Ok(LiveReport {
-        run: run.id().clone(),
-        events_processed,
-        fills,
-        rejected,
-    })
-}
-
 #[cfg(test)]
-mod tests {
-    use super::{Pmkit, RunReport, StartError};
-    use async_trait::async_trait;
-    use pmkit_book::Side;
-    use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
-    use pmkit_data::{DataSourceError, HistoricalDataSource, LiveDataSource, ReplayQuery};
-    use pmkit_event::{Liquidity, MarketEvent};
-    use pmkit_exec::{ExecError, Executor, OrderId, PlaceOrder};
-    use pmkit_market::Outcome;
-    use pmkit_money::Money;
-    use pmkit_run::{EvidenceRequirement, RetrievalWait};
-    use pmkit_runtime::{RiskLimits, RuntimeConfig, ShutdownConfig, StrategyRegistration};
-    use pmkit_spec::{BacktestRun, ConservativeV1Config, LiveRun, PaperRun, ReplaySpec};
-    use pmkit_strategy::{
-        Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
-    };
-    use rust_decimal::Decimal;
-    use std::num::{NonZeroU32, NonZeroUsize};
-    use std::sync::Arc;
-    use std::time::Duration;
-    use tokio::sync::mpsc::Sender;
-
-    struct ScriptedHistory {
-        ticks: Vec<i64>,
-    }
-
-    #[async_trait]
-    impl HistoricalDataSource for ScriptedHistory {
-        async fn replay(
-            &self,
-            _query: ReplayQuery,
-            sink: Sender<MarketEvent>,
-        ) -> Result<(), DataSourceError> {
-            let market = MarketId::new("btc-5m").map_err(|_| DataSourceError::NotAvailable)?;
-            for &timestamp_ms in &self.ticks {
-                let event = MarketEvent::BookUpdate {
-                    market: market.clone(),
-                    outcome: Outcome::Up,
-                    bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
-                    asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
-                    timestamp_ms,
-                };
-                sink.send(event)
-                    .await
-                    .map_err(|_| DataSourceError::SinkClosed)?;
-            }
-            Ok(())
-        }
-    }
-
-    struct BuyOnce {
-        placed: bool,
-    }
-
-    impl Strategy for BuyOnce {
-        fn on_event(&mut self, ctx: StrategyContext<'_>) -> Result<Actions, StrategyError> {
-            if self.placed {
-                return Ok(Actions::none());
-            }
-            self.placed = true;
-            Ok(Actions::place(PlaceOrder {
-                market: ctx.market.clone(),
-                outcome: Outcome::Up,
-                side: Side::Buy,
-                price: Decimal::new(50, 2),
-                qty: Decimal::from(10),
-                post_only: false,
-            }))
-        }
-    }
-
-    struct BuyFactory;
-
-    impl StrategyFactory for BuyFactory {
-        fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
-            Ok(Box::new(BuyOnce { placed: false }))
-        }
-    }
-
-    fn config() -> Result<RuntimeConfig, Box<dyn std::error::Error>> {
-        Ok(RuntimeConfig {
-            backtest_concurrency: NonZeroUsize::new(1).ok_or("nonzero")?,
-            startup_timeout: Duration::from_secs(30),
-            shutdown: ShutdownConfig {
-                live_orders: pmkit_runtime::LiveOrderPolicy::CancelOwned,
-                reconciliation_timeout: Duration::from_secs(30),
-                tape_flush_timeout: Duration::from_secs(10),
-            },
-            manifest_dir: "./runs".into(),
-        })
-    }
-
-    fn risk() -> Result<RiskLimits, Box<dyn std::error::Error>> {
-        Ok(RiskLimits {
-            max_order_notional: Money::usdc(100),
-            max_position_notional: Money::usdc(1_000),
-            max_open_orders: NonZeroU32::new(10).ok_or("nonzero")?,
-            max_loss: Money::usdc(500),
-        })
-    }
-
-    #[tokio::test]
-    async fn backtest_drives_replay_through_strategy_to_fill()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let replay = ReplaySpec::new(
-            Arc::new(ScriptedHistory { ticks: vec![1, 2] }),
-            "2026-01-01T00:00:00Z".parse()?,
-            "2026-02-01T00:00:00Z".parse()?,
-            EvidenceRequirement::CorroboratedOnly,
-            RetrievalWait::ReturnPending,
-        );
-        let run = BacktestRun::new(
-            RunId::new("bt")?,
-            PortfolioId::new("research")?,
-            replay,
-            Money::usdc(1_000),
-            risk()?,
-            ConservativeV1Config {
-                activation_latency: Duration::ZERO,
-            },
-        )
-        .strategy(StrategyRegistration::new(
-            StrategyId::new("buyer")?,
-            MarketId::new("btc-5m")?,
-            Arc::new(BuyFactory),
-        ));
-
-        let app = Pmkit::builder(config()?).run(run).start().await?;
-
-        let report = app.report(&RunId::new("bt")?).ok_or("missing report")?;
-        let RunReport::Backtest(backtest) = report else {
-            return Err("expected a backtest report".into());
-        };
-        assert_eq!(backtest.events_processed, 2);
-        assert!(
-            backtest.fills >= 1,
-            "the taker buy should fill against the ask"
-        );
-        let manifest = app.manifest(&RunId::new("bt")?).ok_or("missing manifest")?;
-        assert_eq!(manifest["mode"], "backtest");
-        assert_eq!(manifest["run"], "bt");
-        Ok(())
-    }
-
-    struct ScriptedLive;
-
-    #[async_trait]
-    impl LiveDataSource for ScriptedLive {
-        async fn subscribe(
-            &self,
-            market: MarketId,
-            outcome: Outcome,
-            sink: Sender<MarketEvent>,
-        ) -> Result<(), DataSourceError> {
-            if outcome == Outcome::Up {
-                sink.send(MarketEvent::BookUpdate {
-                    market,
-                    outcome,
-                    bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
-                    asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
-                    timestamp_ms: 1,
-                })
-                .await
-                .map_err(|_| DataSourceError::SinkClosed)?;
-            }
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn paper_run_drives_live_feed_to_fill() -> Result<(), Box<dyn std::error::Error>> {
-        let run = PaperRun::new(
-            RunId::new("paper")?,
-            PortfolioId::new("alice")?,
-            Money::usdc(10_000),
-            risk()?,
-            Arc::new(ScriptedLive),
-            ConservativeV1Config {
-                activation_latency: Duration::ZERO,
-            },
-        )
-        .strategy(StrategyRegistration::new(
-            StrategyId::new("buyer")?,
-            MarketId::new("btc-5m")?,
-            Arc::new(BuyFactory),
-        ));
-
-        let app = Pmkit::builder(config()?).run(run).start().await?;
-        let report = app.report(&RunId::new("paper")?).ok_or("missing report")?;
-        let RunReport::Paper(paper) = report else {
-            return Err("expected a paper report".into());
-        };
-        assert_eq!(paper.events_processed, 1);
-        assert!(
-            paper.fills >= 1,
-            "the taker buy should fill against the ask"
-        );
-        Ok(())
-    }
-
-    struct RecordingExec;
-
-    #[async_trait]
-    impl Executor for RecordingExec {
-        async fn submit(&self, _order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
-            Ok(OrderId("live-1".to_owned()))
-        }
-
-        async fn cancel(&self, _order_id: &OrderId) -> Result<(), ExecError> {
-            Ok(())
-        }
-
-        async fn cancel_all(&self) -> Result<(), ExecError> {
-            Ok(())
-        }
-    }
-
-    struct LiveWithFill;
-
-    #[async_trait]
-    impl LiveDataSource for LiveWithFill {
-        async fn subscribe(
-            &self,
-            market: MarketId,
-            outcome: Outcome,
-            sink: Sender<MarketEvent>,
-        ) -> Result<(), DataSourceError> {
-            if outcome == Outcome::Up {
-                sink.send(MarketEvent::BookUpdate {
-                    market: market.clone(),
-                    outcome,
-                    bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
-                    asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
-                    timestamp_ms: 1,
-                })
-                .await
-                .map_err(|_| DataSourceError::SinkClosed)?;
-                sink.send(MarketEvent::Fill {
-                    strategy: None,
-                    order_id: "venue-1".to_owned(),
-                    market,
-                    outcome,
-                    price: Decimal::new(46, 2),
-                    size: Decimal::from(10),
-                    side: Side::Buy,
-                    fee: Decimal::ZERO,
-                    liquidity: Liquidity::Taker,
-                    timestamp_ms: 2,
-                })
-                .await
-                .map_err(|_| DataSourceError::SinkClosed)?;
-            }
-            Ok(())
-        }
-    }
-
-    fn live_run() -> Result<LiveRun, Box<dyn std::error::Error>> {
-        Ok(LiveRun::new(
-            RunId::new("live")?,
-            PortfolioId::new("alice")?,
-            Arc::new(RecordingExec),
-            Arc::new(LiveWithFill),
-            risk()?,
-        )
-        .strategy(StrategyRegistration::new(
-            StrategyId::new("buyer")?,
-            MarketId::new("btc-5m")?,
-            Arc::new(BuyFactory),
-        )))
-    }
-
-    #[tokio::test]
-    async fn live_run_routes_orders_and_counts_fills() -> Result<(), Box<dyn std::error::Error>> {
-        let report = super::drive_live(&live_run()?).await?;
-        assert_eq!(report.events_processed, 2);
-        assert_eq!(report.fills, 1);
-        assert_eq!(report.rejected, 0);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn live_run_without_consent_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
-        let result = Pmkit::builder(config()?).run(live_run()?).start().await;
-        assert!(matches!(result, Err(StartError::LiveConsentMissing(_))));
-        Ok(())
-    }
-
-    #[test]
-    fn risk_gate_enforces_order_and_position_notional() -> Result<(), Box<dyn std::error::Error>> {
-        let limits = RiskLimits {
-            max_order_notional: Money::usdc(10),
-            max_position_notional: Money::usdc(8),
-            max_open_orders: NonZeroU32::new(5).ok_or("nonzero")?,
-            max_loss: Money::usdc(100),
-        };
-        let market = MarketId::new("btc-5m")?;
-        let order = |qty: i64| PlaceOrder {
-            market: market.clone(),
-            outcome: Outcome::Up,
-            side: Side::Buy,
-            price: Decimal::ONE,
-            qty: Decimal::from(qty),
-            post_only: false,
-        };
-        assert!(super::passes_risk(&order(5), &limits, &[]));
-        assert!(!super::passes_risk(&order(15), &limits, &[]));
-        let held = [pmkit_book::Position {
-            outcome: Outcome::Up,
-            qty: Decimal::from(5),
-            avg_entry: Decimal::ONE,
-            unrealized_pnl: Decimal::ZERO,
-        }];
-        assert!(!super::passes_risk(&order(5), &limits, &held));
-        Ok(())
-    }
-}
+mod backtest_tests;
+#[cfg(test)]
+mod live_tests;
+#[cfg(test)]
+mod paper_tests;
+#[cfg(test)]
+mod test_support;
