@@ -18,7 +18,10 @@ pub use live_risk::mark_positions;
 pub use live_risk::passes_risk;
 use live_tape::LiveTape;
 
-async fn initial_open_orders(run: &LiveRun) -> Result<HashSet<OrderId>, StartError> {
+async fn initial_open_orders(
+    run: &LiveRun,
+    runtime: &RuntimeConfig,
+) -> Result<HashSet<OrderId>, StartError> {
     run.executor()
         .preflight()
         .await
@@ -26,18 +29,28 @@ async fn initial_open_orders(run: &LiveRun) -> Result<HashSet<OrderId>, StartErr
             run: run.id().clone(),
             source,
         })?;
-    reconcile_open_orders(run).await
+    reconcile_open_orders(run, runtime).await
 }
 
-async fn reconcile_open_orders(run: &LiveRun) -> Result<HashSet<OrderId>, StartError> {
-    let snapshot =
-        run.executor()
-            .reconcile()
-            .await
-            .map_err(|source| StartError::ExecutionState {
-                run: run.id().clone(),
-                source,
-            })?;
+async fn reconcile_open_orders(
+    run: &LiveRun,
+    runtime: &RuntimeConfig,
+) -> Result<HashSet<OrderId>, StartError> {
+    let snapshot = tokio::time::timeout(
+        runtime.shutdown.reconciliation_timeout,
+        run.executor().reconcile(),
+    )
+    .await
+    .map_err(|_| StartError::ExecutionState {
+        run: run.id().clone(),
+        source: ExecError::Transport {
+            message: "reconciliation timed out".to_owned(),
+        },
+    })?
+    .map_err(|source| StartError::ExecutionState {
+        run: run.id().clone(),
+        source,
+    })?;
     Ok(snapshot.open_orders.into_iter().collect())
 }
 
@@ -66,7 +79,7 @@ pub async fn drive(run: &LiveRun, runtime: &RuntimeConfig) -> Result<LiveReport,
     let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
     let executor = run.executor().clone();
     let limits = run.risk().clone();
-    let mut open_orders = initial_open_orders(run).await?;
+    let mut open_orders = initial_open_orders(run, runtime).await?;
     let max_open_orders = usize::try_from(limits.max_open_orders.get()).unwrap_or(usize::MAX);
     let mut event_rx = subscribe(run, &strategies);
     let mut tape = LiveTape::open(run, runtime)?;
@@ -112,7 +125,7 @@ pub async fn drive(run: &LiveRun, runtime: &RuntimeConfig) -> Result<LiveReport,
                         for action in actions.as_slice() {
                             if let Action::Place(order) = action {
                                 if open_orders.len() >= max_open_orders {
-                                    open_orders = reconcile_open_orders(run).await?;
+                                    open_orders = reconcile_open_orders(run, runtime).await?;
                                 }
                                 if open_orders.len() >= max_open_orders {
                                     rejected += 1;
@@ -134,7 +147,7 @@ pub async fn drive(run: &LiveRun, runtime: &RuntimeConfig) -> Result<LiveReport,
                                         open_orders.insert(order_id);
                                     }
                                     Err(source @ ExecError::Transport { .. }) => {
-                                        reconcile_open_orders(run).await?;
+                                        reconcile_open_orders(run, runtime).await?;
                                         tape.flush(run)?;
                                         return Err(StartError::ExecutionState {
                                             run: run.id().clone(),

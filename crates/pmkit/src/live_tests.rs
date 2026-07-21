@@ -15,6 +15,7 @@ use rust_decimal::Decimal;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
 #[path = "live_loss_tests.rs"]
@@ -92,6 +93,32 @@ impl Executor for CapacityExec {
 #[derive(Default)]
 struct TransportExec {
     reconciles: AtomicUsize,
+}
+
+struct SlowReconcileExec;
+
+#[async_trait]
+impl Executor for SlowReconcileExec {
+    async fn preflight(&self) -> Result<ExecutionSnapshot, ExecError> {
+        Ok(ExecutionSnapshot::default())
+    }
+
+    async fn reconcile(&self) -> Result<ExecutionSnapshot, ExecError> {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        Ok(ExecutionSnapshot::default())
+    }
+
+    async fn submit(&self, _order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
+        Ok(OrderId("slow-reconcile-order".to_owned()))
+    }
+
+    async fn cancel(&self, _order_id: &OrderId) -> Result<(), ExecError> {
+        Ok(())
+    }
+
+    async fn cancel_all(&self) -> Result<(), ExecError> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -265,5 +292,29 @@ async fn live_run_stops_after_transport_uncertainty() -> Result<(), Box<dyn std:
 
     assert!(matches!(result, Err(StartError::ExecutionState { .. })));
     assert_eq!(executor.reconciles.load(Ordering::Relaxed), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_run_rejects_slow_reconciliation() -> Result<(), Box<dyn std::error::Error>> {
+    let run = LiveRun::new(
+        RunId::new("live-slow-reconcile")?,
+        PortfolioId::new("alice")?,
+        Arc::new(SlowReconcileExec),
+        Arc::new(LiveWithFill),
+        risk()?,
+    );
+    let mut runtime = config()?;
+    runtime.shutdown.reconciliation_timeout = Duration::from_millis(1);
+
+    let result = live::drive(&run, &runtime).await;
+
+    assert!(matches!(
+        result,
+        Err(StartError::ExecutionState {
+            source: ExecError::Transport { message },
+            ..
+        }) if message == "reconciliation timed out"
+    ));
     Ok(())
 }

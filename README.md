@@ -48,7 +48,8 @@ The component library and the orchestration engine are in place. All three run
 modes drive end to end: `Pmkit::builder(config).run(spec).start()` runs backtests
 (replay), paper (live data + simulated fills), and live (consent-gated, risk-gated
 Polymarket order routing), each returning a report. Remaining: on-chain
-replay/decode and the full live risk/reconciliation envelope.
+replay/decode and policy-aware live shutdown cancellation; live reconciliation
+is bounded by `RuntimeConfig.shutdown.reconciliation_timeout`.
 
 ## Mental model
 

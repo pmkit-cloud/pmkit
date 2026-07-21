@@ -5,7 +5,7 @@
 //! -> fills), returning an [`AppHandle`] that exposes each run's
 //! [`RunReport`]. Paper runs are driven similarly against a live data source;
 //! live runs route strategy orders through a consented executor behind a
-//! minimal risk gate (a v0 that omits reconciliation, tape, and full limits).
+//! risk gate with bounded execution-state reconciliation and optional tapes.
 
 mod backtest;
 mod live;
