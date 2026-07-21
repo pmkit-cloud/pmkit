@@ -9,14 +9,16 @@ use pmkit_data::{DataSourceError, LiveDataSource};
 use pmkit_event::{Liquidity, MarketEvent};
 use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
 use pmkit_market::Outcome;
-use pmkit_money::Money;
-use pmkit_runtime::{RiskLimits, StrategyRegistration};
+use pmkit_runtime::StrategyRegistration;
 use pmkit_spec::LiveRun;
 use rust_decimal::Decimal;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc::Sender;
+
+#[path = "live_loss_tests.rs"]
+mod live_loss_tests;
 
 struct RecordingExec;
 
@@ -261,34 +263,5 @@ async fn live_run_stops_after_transport_uncertainty() -> Result<(), Box<dyn std:
 
     assert!(matches!(result, Err(StartError::ExecutionState { .. })));
     assert_eq!(executor.reconciles.load(Ordering::Relaxed), 2);
-    Ok(())
-}
-
-#[test]
-fn risk_gate_enforces_order_and_position_notional() -> Result<(), Box<dyn std::error::Error>> {
-    let limits = RiskLimits {
-        max_order_notional: Money::usdc(10),
-        max_position_notional: Money::usdc(8),
-        max_open_orders: NonZeroU32::new(5).ok_or("nonzero")?,
-        max_loss: Money::usdc(100),
-    };
-    let market = MarketId::new("btc-5m")?;
-    let order = |qty: i64| PlaceOrder {
-        market: market.clone(),
-        outcome: Outcome::Up,
-        side: Side::Buy,
-        price: Decimal::ONE,
-        qty: Decimal::from(qty),
-        post_only: false,
-    };
-    assert!(live::passes_risk(&order(5), &limits, &[]));
-    assert!(!live::passes_risk(&order(15), &limits, &[]));
-    let held = [pmkit_book::Position {
-        outcome: Outcome::Up,
-        qty: Decimal::from(5),
-        avg_entry: Decimal::ONE,
-        unrealized_pnl: Decimal::ZERO,
-    }];
-    assert!(!live::passes_risk(&order(5), &limits, &held));
     Ok(())
 }

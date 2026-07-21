@@ -30,10 +30,10 @@ pmkit-money = { path = "../pmkit-money" }
 pmkit-run = { path = "../pmkit-run" }
 pmkit-manifest = { path = "../pmkit-manifest" }
 serde_json = { workspace = true }
+rust_decimal = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
-rust_decimal = { workspace = true }
 
 [lints]
 workspace = true

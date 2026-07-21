@@ -1,0 +1,203 @@
+use super::CapacityExec;
+use crate::{live, test_support::risk};
+use async_trait::async_trait;
+use pmkit_book::Side;
+use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
+use pmkit_data::{DataSourceError, LiveDataSource};
+use pmkit_event::{Liquidity, MarketEvent};
+use pmkit_exec::PlaceOrder;
+use pmkit_market::Outcome;
+use pmkit_money::Money;
+use pmkit_runtime::{RiskLimits, StrategyRegistration};
+use pmkit_spec::LiveRun;
+use pmkit_strategy::{
+    Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
+};
+use rust_decimal::Decimal;
+use std::collections::HashMap;
+use std::num::NonZeroU32;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use tokio::sync::mpsc::Sender;
+
+struct LossThenRecovery;
+
+#[async_trait]
+impl LiveDataSource for LossThenRecovery {
+    async fn subscribe(
+        &self,
+        market: MarketId,
+        outcome: Outcome,
+        sink: Sender<MarketEvent>,
+    ) -> Result<(), DataSourceError> {
+        if outcome == Outcome::Up {
+            for (price, timestamp_ms) in [
+                (Decimal::new(60, 2), 1),
+                (Decimal::new(40, 2), 3),
+                (Decimal::new(60, 2), 4),
+            ] {
+                sink.send(MarketEvent::BookUpdate {
+                    market: market.clone(),
+                    outcome,
+                    bids: vec![(price, Decimal::from(10))],
+                    asks: vec![(price, Decimal::from(10))],
+                    timestamp_ms,
+                })
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)?;
+                if timestamp_ms == 1 {
+                    sink.send(MarketEvent::Fill {
+                        strategy: None,
+                        order_id: "venue-1".to_owned(),
+                        market: market.clone(),
+                        outcome,
+                        price,
+                        size: Decimal::from(10),
+                        side: Side::Buy,
+                        fee: Decimal::ZERO,
+                        liquidity: Liquidity::Taker,
+                        timestamp_ms: 2,
+                    })
+                    .await
+                    .map_err(|_| DataSourceError::SinkClosed)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct OrderAfterLoss;
+
+impl Strategy for OrderAfterLoss {
+    fn on_event(&mut self, ctx: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        if ctx.now.as_millis() < 3 {
+            return Ok(Actions::none());
+        }
+        Ok(Actions::place(PlaceOrder {
+            market: ctx.market.clone(),
+            outcome: Outcome::Up,
+            side: Side::Buy,
+            price: Decimal::ONE,
+            qty: Decimal::ONE,
+            post_only: false,
+        }))
+    }
+}
+
+struct OrderAfterLossFactory;
+
+impl StrategyFactory for OrderAfterLossFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(OrderAfterLoss))
+    }
+}
+
+#[tokio::test]
+async fn live_run_latches_loss_limit_after_marked_drawdown()
+-> Result<(), Box<dyn std::error::Error>> {
+    let executor = Arc::new(CapacityExec::default());
+    let mut limits = risk()?;
+    limits.max_loss = Money::usdc(2);
+    let run = LiveRun::new(
+        RunId::new("live-loss")?,
+        PortfolioId::new("alice")?,
+        executor.clone(),
+        Arc::new(LossThenRecovery),
+        limits,
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("loss-checker")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(OrderAfterLossFactory),
+    ));
+
+    let report = live::drive(&run).await?;
+
+    assert_eq!(executor.submits.load(Ordering::Relaxed), 0);
+    assert_eq!(report.rejected, 2);
+    Ok(())
+}
+
+#[test]
+fn risk_gate_rejects_a_marked_loss_at_the_limit() -> Result<(), Box<dyn std::error::Error>> {
+    let limits = RiskLimits {
+        max_order_notional: Money::usdc(10),
+        max_position_notional: Money::usdc(10),
+        max_open_orders: NonZeroU32::new(5).ok_or("nonzero")?,
+        max_loss: Money::usdc(2),
+    };
+    let market = MarketId::new("btc-5m")?;
+    let mut positions = HashMap::from([(
+        market.clone(),
+        vec![pmkit_book::Position {
+            outcome: Outcome::Up,
+            qty: Decimal::from(10),
+            avg_entry: Decimal::new(60, 2),
+            unrealized_pnl: Decimal::ZERO,
+        }],
+    )]);
+    let marks = HashMap::from([((market.clone(), Outcome::Up), Decimal::new(40, 2))]);
+    let portfolio_pnl = live::mark_positions(&mut positions, &marks);
+    let order = PlaceOrder {
+        market: market.clone(),
+        outcome: Outcome::Up,
+        side: Side::Buy,
+        price: Decimal::ONE,
+        qty: Decimal::ONE,
+        post_only: false,
+    };
+
+    assert_eq!(portfolio_pnl, Some(Decimal::new(-2, 0)));
+    assert!(!live::passes_risk(
+        &order,
+        &limits,
+        positions.get(&market).ok_or("market positions")?,
+        portfolio_pnl,
+    ));
+    Ok(())
+}
+
+#[test]
+fn risk_gate_enforces_order_and_position_notional() -> Result<(), Box<dyn std::error::Error>> {
+    let limits = RiskLimits {
+        max_order_notional: Money::usdc(10),
+        max_position_notional: Money::usdc(8),
+        max_open_orders: NonZeroU32::new(5).ok_or("nonzero")?,
+        max_loss: Money::usdc(100),
+    };
+    let market = MarketId::new("btc-5m")?;
+    let order = |qty: i64| PlaceOrder {
+        market: market.clone(),
+        outcome: Outcome::Up,
+        side: Side::Buy,
+        price: Decimal::ONE,
+        qty: Decimal::from(qty),
+        post_only: false,
+    };
+    assert!(live::passes_risk(
+        &order(5),
+        &limits,
+        &[],
+        Some(Decimal::ZERO),
+    ));
+    assert!(!live::passes_risk(
+        &order(15),
+        &limits,
+        &[],
+        Some(Decimal::ZERO),
+    ));
+    let held = [pmkit_book::Position {
+        outcome: Outcome::Up,
+        qty: Decimal::from(5),
+        avg_entry: Decimal::ONE,
+        unrealized_pnl: Decimal::ZERO,
+    }];
+    assert!(!live::passes_risk(
+        &order(5),
+        &limits,
+        &held,
+        Some(Decimal::ZERO),
+    ));
+    Ok(())
+}
