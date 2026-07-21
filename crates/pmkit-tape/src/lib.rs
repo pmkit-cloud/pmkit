@@ -228,6 +228,7 @@ pub fn reference_envelope_json(envelope: &CexReferenceEnvelope) -> serde_json::V
         CexReferenceEvent::Trade {
             asset,
             exchange,
+            aggregate_trade_id,
             price,
             qty,
             is_buyer_maker,
@@ -237,6 +238,7 @@ pub fn reference_envelope_json(envelope: &CexReferenceEnvelope) -> serde_json::V
             "ts": timestamp_ms,
             "asset": asset.to_string(),
             "exchange": exchange.to_string(),
+            "aggregate_trade_id": aggregate_trade_id,
             "price": price.to_string(),
             "qty": qty.to_string(),
             "is_buyer_maker": is_buyer_maker,

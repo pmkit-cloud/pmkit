@@ -8,10 +8,17 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use pmkit_core::{MarketId, PortfolioId};
 use pmkit_event::{MarketEvent, StreamMetadata};
-use pmkit_market::Outcome;
+use pmkit_market::{Exchange, Outcome};
 use pmkit_run::{EvidenceRequirement, RetrievalWait};
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
+
+mod binance;
+
+pub use binance::{
+    BinanceAggTradeParseError, CexHistorySource, binance_history_source,
+    parse_binance_agg_trade_live, parse_binance_vision_agg_trade_row,
+};
 
 /// An unmodified PM public-market frame plus the metadata needed to audit it.
 #[derive(Debug, Clone)]
@@ -68,6 +75,12 @@ pub enum DataSourceError {
     /// No data is available for the requested window.
     #[error("requested data is not available for the given window")]
     NotAvailable,
+    /// The exchange has no matched official history source.
+    #[error("history is unavailable for {exchange}")]
+    HistoryUnavailable {
+        /// Exchange without a compatible official archive.
+        exchange: Exchange,
+    },
     /// The delivery channel was closed by the receiver.
     #[error("data delivery channel closed")]
     SinkClosed,

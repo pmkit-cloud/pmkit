@@ -22,6 +22,7 @@ pmkit-market = { path = "../pmkit-market" }
 pmkit-event = { path = "../pmkit-event" }
 pmkit-run = { path = "../pmkit-run" }
 serde_json = { workspace = true }
+rust_decimal = { workspace = true }
 
 [lints]
 workspace = true

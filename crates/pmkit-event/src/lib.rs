@@ -154,7 +154,7 @@ pub enum PmAccountEvent {
 }
 
 /// A normalized reference-exchange fact.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CexReferenceEvent {
     /// A reference-exchange trade (for example a Binance aggregate trade).
     Trade {
@@ -162,6 +162,8 @@ pub enum CexReferenceEvent {
         asset: Asset,
         /// Source exchange.
         exchange: Exchange,
+        /// Exchange-assigned aggregate trade identity.
+        aggregate_trade_id: u64,
         /// Trade price.
         price: Decimal,
         /// Trade quantity.

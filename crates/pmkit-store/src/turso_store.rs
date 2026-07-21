@@ -224,6 +224,7 @@ mod tests {
                 fact: CexReferenceEvent::Trade {
                     asset: Asset::Btc,
                     exchange: Exchange::Binance,
+                    aggregate_trade_id: 1,
                     price: 1.into(),
                     qty: 2.into(),
                     is_buyer_maker: false,
