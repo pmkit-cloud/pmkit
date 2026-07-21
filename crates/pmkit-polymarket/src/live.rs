@@ -3,14 +3,37 @@ use std::fmt;
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use pmkit_core::MarketId;
-use pmkit_data::{DataSourceError, LiveDataSource};
-use pmkit_event::MarketEvent;
+use pmkit_data::{DataSourceError, LiveDataSource, RawPmAccountFrame, RawPmMarketFrame};
+use pmkit_event::{MarketEvent, PmAccountEnvelope, PmMarketEnvelope};
 use pmkit_market::Outcome;
 use polymarket_client_sdk_v2::clob::ws::{BookUpdate, Client, LastTradePrice};
 use polymarket_client_sdk_v2::error::Error as SdkError;
 use tokio::sync::mpsc::Sender;
 
 use crate::{MarketTokens, from_venue_side};
+
+/// Adapts raw Polymarket frames into typed PM stream envelopes.
+pub trait PolymarketFrameAdapter {
+    /// Adapts one public-market frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataSourceError`] when the frame cannot be adapted.
+    fn adapt_market_frame(
+        &self,
+        frame: RawPmMarketFrame,
+    ) -> Result<PmMarketEnvelope, DataSourceError>;
+
+    /// Adapts one authenticated-account frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataSourceError`] when the frame cannot be adapted.
+    fn adapt_account_frame(
+        &self,
+        frame: RawPmAccountFrame,
+    ) -> Result<PmAccountEnvelope, DataSourceError>;
+}
 
 /// Polymarket order-book and trade WebSocket source.
 #[derive(Clone)]

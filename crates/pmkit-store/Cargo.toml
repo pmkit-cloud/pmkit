@@ -1,6 +1,6 @@
 [package]
-name = "pmkit-data"
-description = "Market data-source traits (historical replay and live) for PMKit."
+name = "pmkit-store"
+description = "Trait-first durable tape and strategy-decision storage for PMKit."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,14 +14,19 @@ categories.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
-chrono = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true }
 pmkit-core = { path = "../pmkit-core" }
-pmkit-market = { path = "../pmkit-market" }
+pmkit-book = { path = "../pmkit-book" }
 pmkit-event = { path = "../pmkit-event" }
-pmkit-run = { path = "../pmkit-run" }
+pmkit-exec = { path = "../pmkit-exec" }
+pmkit-strategy = { path = "../pmkit-strategy" }
+pmkit-tape = { path = "../pmkit-tape" }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
+turso = "0.7"
+
+[dev-dependencies]
+pmkit-market = { path = "../pmkit-market" }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

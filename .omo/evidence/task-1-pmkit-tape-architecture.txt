@@ -1,0 +1,21 @@
+Todo 1: split PM tape stream envelopes
+
+Commands and results:
+
+$ cargo fmt --all -- --check
+PASS
+
+$ cargo test -p pmkit-event -p pmkit-store
+PASS: 5 tests passed across 4 suites
+
+$ cargo test -p pmkit-event stream_envelope_is_not_strategy_fact
+PASS: 1 test passed, 2 filtered out
+
+$ cargo test -p pmkit-data -p pmkit-polymarket
+PASS: 8 tests passed across 4 suites
+
+$ bash /Users/yovanoc/.cache/opencode/packages/oh-my-openagent@4.18.2/node_modules/oh-my-openagent/dist/skills/programming/scripts/rust/check-no-excuse-rules.sh crates/pmkit-event/src/lib.rs crates/pmkit-data/src/lib.rs crates/pmkit-polymarket/src/lib.rs crates/pmkit-polymarket/src/live.rs crates/pmkit-store/src/lib.rs crates/pmkit-store/src/turso_store.rs crates/pmkit-tape/src/lib.rs
+PASS: no-excuse rules passed for 7 files
+
+$ cargo clippy -p pmkit-event -p pmkit-data -p pmkit-polymarket -p pmkit-tape -p pmkit-store --all-targets -- -D warnings
+PASS: no issues found

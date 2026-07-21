@@ -6,12 +6,55 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use pmkit_core::MarketId;
-use pmkit_event::MarketEvent;
+use pmkit_core::{MarketId, PortfolioId};
+use pmkit_event::{MarketEvent, StreamMetadata};
 use pmkit_market::Outcome;
 use pmkit_run::{EvidenceRequirement, RetrievalWait};
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
+
+/// An unmodified PM public-market frame plus the metadata needed to audit it.
+#[derive(Debug, Clone)]
+pub struct RawPmMarketFrame {
+    /// Preserved transport metadata.
+    pub metadata: StreamMetadata,
+    /// Raw provider payload before venue adaptation.
+    pub payload: serde_json::Value,
+}
+
+/// An unmodified PM authenticated-account frame plus its transport metadata.
+#[derive(Debug, Clone)]
+pub struct RawPmAccountFrame {
+    /// Portfolio that owns this authenticated stream.
+    pub portfolio: PortfolioId,
+    /// Preserved transport metadata.
+    pub metadata: StreamMetadata,
+    /// Raw provider payload before venue adaptation.
+    pub payload: serde_json::Value,
+}
+
+/// A source of raw PM public-market frames.
+#[async_trait]
+pub trait PmMarketFrameSource: Send + Sync {
+    /// Subscribes to raw provider frames for one market outcome.
+    async fn subscribe_market_frames(
+        &self,
+        market: MarketId,
+        outcome: Outcome,
+        sink: Sender<RawPmMarketFrame>,
+    ) -> Result<(), DataSourceError>;
+}
+
+/// A source of raw PM authenticated-account frames.
+#[async_trait]
+pub trait PmAccountFrameSource: Send + Sync {
+    /// Subscribes to raw provider frames for one portfolio.
+    async fn subscribe_account_frames(
+        &self,
+        portfolio: PortfolioId,
+        sink: Sender<RawPmAccountFrame>,
+    ) -> Result<(), DataSourceError>;
+}
 
 /// A failure while sourcing market data.
 #[derive(Debug, Error)]

@@ -16,7 +16,7 @@ mod execution;
 mod live;
 
 pub use execution::PolymarketExecutor;
-pub use live::PolymarketLiveData;
+pub use live::{PolymarketFrameAdapter, PolymarketLiveData};
 
 /// Maps a neutral `PMKit` [`Side`] to the Polymarket venue side.
 #[must_use]
