@@ -101,6 +101,14 @@ pub enum StartError {
     },
 }
 
+/// A failure raised while interacting with a started runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum RuntimeError {
+    /// The requested run is not part of this application.
+    #[error("unknown run id: {0}")]
+    UnknownRun(RunId),
+}
+
 /// Entry point to the engine.
 #[derive(Debug)]
 pub struct Pmkit;
@@ -203,6 +211,22 @@ pub struct AppHandle {
 }
 
 impl AppHandle {
+    /// Returns the persisted terminal report for `run`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::UnknownRun`] when the application does not own
+    /// the requested run.
+    pub async fn wait_for(&self, run: RunId) -> Result<RunReport, RuntimeError> {
+        std::future::ready(
+            self.reports
+                .get(&run)
+                .cloned()
+                .ok_or(RuntimeError::UnknownRun(run)),
+        )
+        .await
+    }
+
     /// Returns the report for `run`, if it exists.
     #[must_use]
     pub fn report(&self, run: &RunId) -> Option<&RunReport> {

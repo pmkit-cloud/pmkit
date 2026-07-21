@@ -1,5 +1,5 @@
 use crate::{
-    Pmkit, RunReport,
+    AppHandle, Pmkit, RunReport, RuntimeError,
     test_support::{BuyFactory, config, risk},
 };
 use async_trait::async_trait;
@@ -44,9 +44,7 @@ impl HistoricalDataSource for ScriptedHistory {
     }
 }
 
-#[tokio::test]
-async fn backtest_drives_replay_through_strategy_to_fill() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn backtest_app() -> Result<AppHandle, Box<dyn std::error::Error>> {
     let replay = ReplaySpec::new(
         Arc::new(ScriptedHistory { ticks: vec![1, 2] }),
         "2026-01-01T00:00:00Z".parse()?,
@@ -70,9 +68,17 @@ async fn backtest_drives_replay_through_strategy_to_fill() -> Result<(), Box<dyn
         Arc::new(BuyFactory),
     ));
 
-    let app = Pmkit::builder(config()?).run(run).start().await?;
+    let runtime_config = config()?;
+    let app = Pmkit::builder(runtime_config).run(run).start().await?;
+    Ok(app)
+}
 
-    let report = app.report(&RunId::new("bt")?).ok_or("missing report")?;
+#[tokio::test]
+async fn backtest_drives_replay_through_strategy_to_fill() -> Result<(), Box<dyn std::error::Error>>
+{
+    let app = backtest_app().await?;
+
+    let report = app.wait_for(RunId::new("bt")?).await?;
     let RunReport::Backtest(backtest) = report else {
         return Err("expected a backtest report".into());
     };
@@ -84,5 +90,31 @@ async fn backtest_drives_replay_through_strategy_to_fill() -> Result<(), Box<dyn
     let manifest = app.manifest(&RunId::new("bt")?).ok_or("missing manifest")?;
     assert_eq!(manifest["mode"], "backtest");
     assert_eq!(manifest["run"], "bt");
+    Ok(())
+}
+
+#[tokio::test]
+async fn wait_for_is_repeatable() -> Result<(), Box<dyn std::error::Error>> {
+    let app = backtest_app().await?;
+
+    let first = app.wait_for(RunId::new("bt")?).await?;
+    let second = app.wait_for(RunId::new("bt")?).await?;
+
+    let (RunReport::Backtest(first), RunReport::Backtest(second)) = (first, second) else {
+        return Err("expected backtest reports".into());
+    };
+    assert_eq!(first.events_processed, second.events_processed);
+    assert_eq!(first.fills, second.fills);
+    Ok(())
+}
+
+#[tokio::test]
+async fn wait_for_rejects_unknown_run() -> Result<(), Box<dyn std::error::Error>> {
+    let app = backtest_app().await?;
+    let unknown = RunId::new("missing")?;
+
+    let result = app.wait_for(unknown.clone()).await;
+
+    assert!(matches!(result, Err(RuntimeError::UnknownRun(run)) if run == unknown));
     Ok(())
 }
