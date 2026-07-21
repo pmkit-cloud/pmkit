@@ -1,5 +1,8 @@
 use super::CapacityExec;
-use crate::{live, test_support::risk};
+use crate::{
+    live,
+    test_support::{config, risk},
+};
 use async_trait::async_trait;
 use pmkit_book::Side;
 use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
@@ -112,7 +115,7 @@ async fn live_run_latches_loss_limit_after_marked_drawdown()
         Arc::new(OrderAfterLossFactory),
     ));
 
-    let report = live::drive(&run).await?;
+    let report = live::drive(&run, &config()?).await?;
 
     assert_eq!(executor.submits.load(Ordering::Relaxed), 0);
     assert_eq!(report.rejected, 2);

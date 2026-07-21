@@ -19,6 +19,8 @@ use tokio::sync::mpsc::Sender;
 
 #[path = "live_loss_tests.rs"]
 mod live_loss_tests;
+#[path = "live_tape_tests.rs"]
+mod live_tape_tests;
 
 struct RecordingExec;
 
@@ -174,7 +176,7 @@ fn live_run() -> Result<LiveRun, Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn live_run_routes_orders_and_counts_fills() -> Result<(), Box<dyn std::error::Error>> {
-    let report = live::drive(&live_run()?).await?;
+    let report = live::drive(&live_run()?, &config()?).await?;
     assert_eq!(report.events_processed, 2);
     assert_eq!(report.fills, 1);
     assert_eq!(report.rejected, 0);
@@ -207,7 +209,7 @@ async fn live_run_preflights_and_rejects_at_open_order_limit()
         Arc::new(BuyFactory),
     ));
 
-    let report = live::drive(&run).await?;
+    let report = live::drive(&run, &config()?).await?;
 
     assert_eq!(executor.snapshots.load(Ordering::Relaxed), 3);
     assert_eq!(executor.submits.load(Ordering::Relaxed), 0);
@@ -236,7 +238,7 @@ async fn live_run_reconciles_capacity_before_rejecting() -> Result<(), Box<dyn s
         Arc::new(BuyFactory),
     ));
 
-    let report = live::drive(&run).await?;
+    let report = live::drive(&run, &config()?).await?;
 
     assert_eq!(executor.submits.load(Ordering::Relaxed), 1);
     assert_eq!(report.rejected, 0);
@@ -259,7 +261,7 @@ async fn live_run_stops_after_transport_uncertainty() -> Result<(), Box<dyn std:
         Arc::new(BuyFactory),
     ));
 
-    let result = live::drive(&run).await;
+    let result = live::drive(&run, &config()?).await;
 
     assert!(matches!(result, Err(StartError::ExecutionState { .. })));
     assert_eq!(executor.reconciles.load(Ordering::Relaxed), 2);

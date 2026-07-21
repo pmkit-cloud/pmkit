@@ -29,6 +29,7 @@ pmkit-market = { path = "../pmkit-market" }
 pmkit-money = { path = "../pmkit-money" }
 pmkit-run = { path = "../pmkit-run" }
 pmkit-manifest = { path = "../pmkit-manifest" }
+pmkit-tape = { path = "../pmkit-tape" }
 serde_json = { workspace = true }
 rust_decimal = { workspace = true }
 

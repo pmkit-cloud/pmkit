@@ -99,6 +99,14 @@ pub enum StartError {
         /// The underlying executor failure.
         source: ExecError,
     },
+    /// Live tape capture failed while configured as required.
+    #[error("live tape failed for run {run}: {source}")]
+    Tape {
+        /// The run whose tape failed.
+        run: RunId,
+        /// The underlying filesystem failure.
+        source: std::io::Error,
+    },
 }
 
 /// A failure raised while interacting with a started runtime.
@@ -188,7 +196,7 @@ impl PmkitBuilder {
                     if consent.is_none() {
                         return Err(StartError::LiveConsentMissing(run.id().clone()));
                     }
-                    let report = live::drive(&run).await?;
+                    let report = live::drive(&run, &config).await?;
                     reports.insert(run.id().clone(), RunReport::Live(report));
                 }
             }
