@@ -1,7 +1,7 @@
 # PMKit
 
 PMKit is an open-source **Rust SDK first** engine for building, backtesting, and
-running trading strategies on prediction markets (Polymarket in v1).
+running trading strategies on Polymarket prediction markets.
 
 You write a small Rust binary that links your strategies and configures one or
 more backtest, paper, and live runs. PMKit owns orchestration, shared market
@@ -80,7 +80,7 @@ Rules:
 4. A strategy returns intents. It never receives credentials or calls an
    exchange directly.
 
-## Not in v1
+## Out of scope
 
 - No generic `pmkit run strategy-name` CLI or dynamic plugin protocol.
 - No YAML/TOML deployment language — Rust is the typed source of truth.
