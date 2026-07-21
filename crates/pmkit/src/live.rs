@@ -3,7 +3,7 @@ use pmkit_book::OrderBookL2;
 use pmkit_event::MarketEvent;
 use pmkit_exec::{ExecError, OrderId};
 use pmkit_market::Outcome;
-use pmkit_runtime::RuntimeConfig;
+use pmkit_runtime::{LiveOrderPolicy, RuntimeConfig};
 use pmkit_spec::LiveRun;
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
 use std::collections::HashSet;
@@ -54,6 +54,33 @@ async fn reconcile_open_orders(
     Ok(snapshot.open_orders.into_iter().collect())
 }
 
+async fn shutdown_orders(
+    run: &LiveRun,
+    runtime: &RuntimeConfig,
+    open_orders: &HashSet<OrderId>,
+) -> Result<(), StartError> {
+    match runtime.shutdown.live_orders {
+        LiveOrderPolicy::Leave => Ok(()),
+        LiveOrderPolicy::CancelOwned => run
+            .executor()
+            .cancel_batch(&open_orders.iter().cloned().collect::<Vec<_>>())
+            .await
+            .map_err(|source| StartError::ExecutionState {
+                run: run.id().clone(),
+                source,
+            }),
+        LiveOrderPolicy::CancelAllExplicit => {
+            run.executor()
+                .cancel_all()
+                .await
+                .map_err(|source| StartError::ExecutionState {
+                    run: run.id().clone(),
+                    source,
+                })
+        }
+    }
+}
+
 fn subscribe(
     run: &LiveRun,
     strategies: &[StrategyInstance],
@@ -84,12 +111,10 @@ pub async fn drive(run: &LiveRun, runtime: &RuntimeConfig) -> Result<LiveReport,
     let mut event_rx = subscribe(run, &strategies);
     let mut tape = LiveTape::open(run, runtime)?;
 
-    // ponytail: v0 live execution omits realized PnL accounting.
     let mut risk_state = LiveRiskState::default();
     let mut events_processed = 0_usize;
     let mut fills = 0_usize;
     let mut rejected = 0_usize;
-
     while let Some(event) = event_rx.recv().await {
         tape.append(run, &event)?;
         events_processed += 1;
@@ -171,7 +196,7 @@ pub async fn drive(run: &LiveRun, runtime: &RuntimeConfig) -> Result<LiveReport,
         }
     }
 
-    tape.flush(run)?;
+    tape.finish(run, runtime, &open_orders).await?;
 
     Ok(LiveReport {
         run: run.id().clone(),

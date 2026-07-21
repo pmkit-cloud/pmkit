@@ -9,7 +9,7 @@ use pmkit_data::{DataSourceError, LiveDataSource};
 use pmkit_event::{Liquidity, MarketEvent};
 use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
 use pmkit_market::Outcome;
-use pmkit_runtime::StrategyRegistration;
+use pmkit_runtime::{LiveOrderPolicy, StrategyRegistration};
 use pmkit_spec::LiveRun;
 use rust_decimal::Decimal;
 use std::num::NonZeroU32;
@@ -117,6 +117,37 @@ impl Executor for SlowReconcileExec {
     }
 
     async fn cancel_all(&self) -> Result<(), ExecError> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ShutdownExec {
+    cancels: AtomicUsize,
+    cancel_all_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl Executor for ShutdownExec {
+    async fn preflight(&self) -> Result<ExecutionSnapshot, ExecError> {
+        Ok(ExecutionSnapshot::default())
+    }
+
+    async fn reconcile(&self) -> Result<ExecutionSnapshot, ExecError> {
+        Ok(ExecutionSnapshot::default())
+    }
+
+    async fn submit(&self, _order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
+        Ok(OrderId("owned-order".to_owned()))
+    }
+
+    async fn cancel(&self, _order_id: &OrderId) -> Result<(), ExecError> {
+        self.cancels.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn cancel_all(&self) -> Result<(), ExecError> {
+        self.cancel_all_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -316,5 +347,56 @@ async fn live_run_rejects_slow_reconciliation() -> Result<(), Box<dyn std::error
             ..
         }) if message == "reconciliation timed out"
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_run_cancels_owned_orders_on_shutdown() -> Result<(), Box<dyn std::error::Error>> {
+    let executor = Arc::new(ShutdownExec::default());
+    let run = LiveRun::new(
+        RunId::new("live-cancel-owned")?,
+        PortfolioId::new("alice")?,
+        executor.clone(),
+        Arc::new(LiveWithFill),
+        risk()?,
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(BuyFactory),
+    ));
+    let mut runtime = config()?;
+    runtime.shutdown.live_orders = LiveOrderPolicy::CancelOwned;
+
+    let report = live::drive(&run, &runtime).await?;
+
+    assert_eq!(report.events_processed, 2);
+    assert_eq!(executor.cancels.load(Ordering::Relaxed), 1);
+    assert_eq!(executor.cancel_all_calls.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_run_cancel_all_requires_explicit_policy() -> Result<(), Box<dyn std::error::Error>> {
+    let executor = Arc::new(ShutdownExec::default());
+    let run = LiveRun::new(
+        RunId::new("live-cancel-all")?,
+        PortfolioId::new("alice")?,
+        executor.clone(),
+        Arc::new(LiveWithFill),
+        risk()?,
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(BuyFactory),
+    ));
+    let mut runtime = config()?;
+    runtime.shutdown.live_orders = LiveOrderPolicy::CancelAllExplicit;
+
+    live::drive(&run, &runtime).await?;
+
+    assert_eq!(executor.cancels.load(Ordering::Relaxed), 0);
+    assert_eq!(executor.cancel_all_calls.load(Ordering::Relaxed), 1);
     Ok(())
 }

@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::fs::{self, File};
 
 use pmkit_event::MarketEvent;
+use pmkit_exec::OrderId;
 use pmkit_run::TapePolicy;
 use pmkit_runtime::RuntimeConfig;
 use pmkit_spec::LiveRun;
@@ -69,6 +71,16 @@ impl LiveTape {
             }
         }
         Ok(())
+    }
+
+    pub(super) async fn finish(
+        &mut self,
+        run: &LiveRun,
+        runtime: &RuntimeConfig,
+        open_orders: &HashSet<OrderId>,
+    ) -> Result<(), StartError> {
+        self.flush(run)?;
+        super::shutdown_orders(run, runtime, open_orders).await
     }
 }
 
