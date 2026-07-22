@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use pmkit_core::MarketId;
-use pmkit_data::{DataSourceError, HistoricalDataSource, LiveDataSource, ReplayQuery};
-use pmkit_event::MarketEvent;
+use pmkit_data::{
+    DataSourceError, HistoricalDataSource, LiveDataSource, ReplayQuery, SourceSignal,
+};
 use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
 use pmkit_market::Outcome;
 use pmkit_money::Money;
@@ -19,7 +20,7 @@ impl HistoricalDataSource for NoHistory {
     async fn replay(
         &self,
         _query: ReplayQuery,
-        _sink: Sender<MarketEvent>,
+        _sink: Sender<SourceSignal>,
     ) -> Result<(), DataSourceError> {
         Ok(())
     }
@@ -33,7 +34,7 @@ impl LiveDataSource for NoLive {
         &self,
         _market: MarketId,
         _outcome: Outcome,
-        _sink: Sender<MarketEvent>,
+        _sink: Sender<SourceSignal>,
     ) -> Result<(), DataSourceError> {
         Ok(())
     }

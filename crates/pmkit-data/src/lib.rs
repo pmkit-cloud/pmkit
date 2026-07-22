@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use pmkit_core::{MarketId, PortfolioId};
-use pmkit_event::{MarketEvent, StreamMetadata};
+use pmkit_event::{MarketEvent, PmMarketEnvelope, SourceEnvelope, StreamMetadata};
 use pmkit_market::{Exchange, Outcome};
 use pmkit_run::{EvidenceRequirement, RetrievalWait};
 use thiserror::Error;
@@ -84,6 +84,45 @@ pub enum DataSourceError {
     /// The delivery channel was closed by the receiver.
     #[error("data delivery channel closed")]
     SinkClosed,
+    /// A source could not provide a causally safe stream.
+    #[error("replay gap: {message}")]
+    ReplayGap {
+        /// Why the stream cannot safely continue.
+        message: String,
+    },
+}
+
+/// A source lifecycle signal consumed by the deterministic merge boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceSignal {
+    /// An envelope carrying a normalized fact and transport identity.
+    Data(Box<SourceEnvelope>),
+    /// The source guarantees it will not later emit at or before this timestamp.
+    Watermark(i64),
+    /// The source intentionally completed its finite stream.
+    Eof,
+}
+
+impl SourceSignal {
+    /// Wraps a legacy normalized PM event in deterministic test metadata.
+    #[must_use]
+    pub fn market_event(fact: MarketEvent) -> Self {
+        let source_time_ms = fact.timestamp_ms();
+        Self::Data(Box::new(SourceEnvelope::PmMarket(PmMarketEnvelope {
+            metadata: StreamMetadata {
+                schema_version: 1,
+                source_id: "legacy-pm".to_owned(),
+                source_time_ms,
+                canonical_source_rank: 0,
+                receipt_time_ms: source_time_ms,
+                connection_id: "legacy-pm".to_owned(),
+                connection_epoch: 0,
+                frame_sequence: source_time_ms,
+                ingest_sequence: 0,
+            },
+            fact,
+        })))
+    }
 }
 
 /// A bounded historical replay request.
@@ -104,8 +143,7 @@ pub struct ReplayQuery {
 /// A source of historical market events for backtests.
 #[async_trait]
 pub trait HistoricalDataSource: Send + Sync {
-    /// Replays the requested window, delivering events into `sink` in
-    /// non-decreasing timestamp order.
+    /// Replays the requested window as ordered lifecycle signals.
     ///
     /// # Errors
     ///
@@ -114,14 +152,14 @@ pub trait HistoricalDataSource: Send + Sync {
     async fn replay(
         &self,
         query: ReplayQuery,
-        sink: Sender<MarketEvent>,
+        sink: Sender<SourceSignal>,
     ) -> Result<(), DataSourceError>;
 }
 
 /// A source of live market events for paper and live runs.
 #[async_trait]
 pub trait LiveDataSource: Send + Sync {
-    /// Subscribes to a market outcome, delivering events into `sink` until the
+    /// Subscribes to a market outcome, delivering lifecycle signals until the
     /// subscription is dropped.
     ///
     /// # Errors
@@ -132,16 +170,16 @@ pub trait LiveDataSource: Send + Sync {
         &self,
         market: MarketId,
         outcome: Outcome,
-        sink: Sender<MarketEvent>,
+        sink: Sender<SourceSignal>,
     ) -> Result<(), DataSourceError>;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DataSourceError, HistoricalDataSource, ReplayQuery};
+    use super::{DataSourceError, HistoricalDataSource, ReplayQuery, SourceSignal};
     use async_trait::async_trait;
     use pmkit_core::MarketId;
-    use pmkit_event::MarketEvent;
+    use pmkit_event::{MarketEvent, SourceEnvelope};
     use pmkit_run::{EvidenceRequirement, RetrievalWait};
     use tokio::sync::mpsc::{self, Sender};
 
@@ -154,12 +192,14 @@ mod tests {
         async fn replay(
             &self,
             _query: ReplayQuery,
-            sink: Sender<MarketEvent>,
+            sink: Sender<SourceSignal>,
         ) -> Result<(), DataSourceError> {
             for &timestamp_ms in &self.ticks {
-                sink.send(MarketEvent::Tick { timestamp_ms })
-                    .await
-                    .map_err(|_| DataSourceError::SinkClosed)?;
+                sink.send(SourceSignal::market_event(MarketEvent::Tick {
+                    timestamp_ms,
+                }))
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)?;
             }
             Ok(())
         }
@@ -182,8 +222,14 @@ mod tests {
         source.replay(query, tx).await?;
 
         let mut seen = Vec::new();
-        while let Some(event) = rx.recv().await {
-            seen.push(event.timestamp_ms());
+        while let Some(signal) = rx.recv().await {
+            let SourceSignal::Data(envelope) = signal else {
+                continue;
+            };
+            let SourceEnvelope::PmMarket(envelope) = *envelope else {
+                continue;
+            };
+            seen.push(envelope.fact.timestamp_ms());
         }
         assert_eq!(seen, vec![1, 2, 3]);
         Ok(())

@@ -8,6 +8,8 @@
 //! risk gate with bounded execution-state reconciliation and optional tapes.
 
 mod backtest;
+/// Deterministic envelope-aware source merging.
+pub mod feed;
 mod live;
 mod paper;
 
@@ -299,6 +301,8 @@ fn instantiate_strategies(
 
 #[cfg(test)]
 mod backtest_tests;
+#[cfg(test)]
+mod feed_tests;
 #[cfg(test)]
 mod live_tests;
 #[cfg(test)]

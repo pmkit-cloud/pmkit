@@ -88,8 +88,7 @@ mod tests {
     use super::build_manifest;
     use async_trait::async_trait;
     use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
-    use pmkit_data::{DataSourceError, HistoricalDataSource, ReplayQuery};
-    use pmkit_event::MarketEvent;
+    use pmkit_data::{DataSourceError, HistoricalDataSource, ReplayQuery, SourceSignal};
     use pmkit_money::Money;
     use pmkit_run::{EvidenceRequirement, RetrievalWait};
     use pmkit_runtime::{RiskLimits, RuntimeConfig, ShutdownConfig, StrategyRegistration};
@@ -109,7 +108,7 @@ mod tests {
         async fn replay(
             &self,
             _query: ReplayQuery,
-            _sink: Sender<MarketEvent>,
+            _sink: Sender<SourceSignal>,
         ) -> Result<(), DataSourceError> {
             Ok(())
         }

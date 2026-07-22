@@ -3,7 +3,9 @@ use std::fmt;
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use pmkit_core::MarketId;
-use pmkit_data::{DataSourceError, LiveDataSource, RawPmAccountFrame, RawPmMarketFrame};
+use pmkit_data::{
+    DataSourceError, LiveDataSource, RawPmAccountFrame, RawPmMarketFrame, SourceSignal,
+};
 use pmkit_event::{MarketEvent, PmAccountEnvelope, PmMarketEnvelope};
 use pmkit_market::Outcome;
 use polymarket_client_sdk_v2::clob::ws::{BookUpdate, Client, LastTradePrice};
@@ -65,7 +67,7 @@ impl LiveDataSource for PolymarketLiveData {
         &self,
         market: MarketId,
         outcome: Outcome,
-        sink: Sender<MarketEvent>,
+        sink: Sender<SourceSignal>,
     ) -> Result<(), DataSourceError> {
         if &market != self.tokens.market() {
             return Err(DataSourceError::NotAvailable);
@@ -91,7 +93,7 @@ impl LiveDataSource for PolymarketLiveData {
             tokio::select! {
                 update = books.next() => match update {
                     Some(Ok(update)) => {
-                        if sink.send(book_event(market.clone(), outcome, update)).await.is_err() {
+                        if sink.send(SourceSignal::market_event(book_event(market.clone(), outcome, update))).await.is_err() {
                             break Err(DataSourceError::SinkClosed);
                         }
                     }
@@ -101,7 +103,7 @@ impl LiveDataSource for PolymarketLiveData {
                 update = trades.next() => match update {
                     Some(Ok(update)) => {
                         if let Some(event) = trade_event(market.clone(), outcome, &update)
-                            && sink.send(event).await.is_err()
+                            && sink.send(SourceSignal::market_event(event)).await.is_err()
                         {
                             break Err(DataSourceError::SinkClosed);
                         }

@@ -1,6 +1,6 @@
 use super::{LiveReport, StartError, StrategyInstance, instantiate_strategies};
 use pmkit_book::OrderBookL2;
-use pmkit_event::MarketEvent;
+use pmkit_event::{MarketEvent, SourceEnvelope, StrategyFact};
 use pmkit_exec::{ExecError, OrderId};
 use pmkit_market::Outcome;
 use pmkit_runtime::{LiveOrderPolicy, RuntimeConfig};
@@ -84,7 +84,7 @@ async fn shutdown_orders(
 fn subscribe(
     run: &LiveRun,
     strategies: &[StrategyInstance],
-) -> tokio::sync::mpsc::Receiver<MarketEvent> {
+) -> tokio::sync::mpsc::Receiver<pmkit_data::SourceSignal> {
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(1024);
     let mut subscribed = HashSet::new();
     for (market, _) in strategies {
@@ -102,6 +102,25 @@ fn subscribe(
     event_rx
 }
 
+fn market_event(signal: pmkit_data::SourceSignal) -> Option<MarketEvent> {
+    let pmkit_data::SourceSignal::Data(envelope) = signal else {
+        return None;
+    };
+    let SourceEnvelope::PmMarket(envelope) = *envelope else {
+        return None;
+    };
+    Some(envelope.fact)
+}
+
+fn report(run: &LiveRun, counts: [usize; 3]) -> LiveReport {
+    LiveReport {
+        run: run.id().clone(),
+        events_processed: counts[0],
+        fills: counts[1],
+        rejected: counts[2],
+    }
+}
+
 pub async fn drive(run: &LiveRun, runtime: &RuntimeConfig) -> Result<LiveReport, StartError> {
     let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
     let executor = run.executor().clone();
@@ -115,7 +134,10 @@ pub async fn drive(run: &LiveRun, runtime: &RuntimeConfig) -> Result<LiveReport,
     let mut events_processed = 0_usize;
     let mut fills = 0_usize;
     let mut rejected = 0_usize;
-    while let Some(event) = event_rx.recv().await {
+    while let Some(signal) = event_rx.recv().await {
+        let Some(event) = market_event(signal) else {
+            continue;
+        };
         tape.append(run, &event)?;
         events_processed += 1;
         match &event {
@@ -133,6 +155,7 @@ pub async fn drive(run: &LiveRun, runtime: &RuntimeConfig) -> Result<LiveReport,
                     timestamp_ms: *timestamp_ms,
                     last_trade_price: None,
                 };
+                let fact = StrategyFact::Market(event.clone());
                 let portfolio_unrealized_pnl =
                     risk_state.update_book(market, *outcome, &book, &limits);
                 for (registered_market, strategy) in &mut *strategies {
@@ -141,6 +164,7 @@ pub async fn drive(run: &LiveRun, runtime: &RuntimeConfig) -> Result<LiveReport,
                     }
                     let market_positions = risk_state.positions(market);
                     let context = StrategyContext {
+                        fact: &fact,
                         market,
                         book: &book,
                         positions: market_positions,
@@ -198,10 +222,5 @@ pub async fn drive(run: &LiveRun, runtime: &RuntimeConfig) -> Result<LiveReport,
 
     tape.finish(run, runtime, &open_orders).await?;
 
-    Ok(LiveReport {
-        run: run.id().clone(),
-        events_processed,
-        fills,
-        rejected,
-    })
+    Ok(report(run, [events_processed, fills, rejected]))
 }

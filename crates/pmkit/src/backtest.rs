@@ -1,7 +1,7 @@
 use super::{BacktestReport, StartError, StrategyInstance, absorb_fills, instantiate_strategies};
 use pmkit_book::OrderBookL2;
 use pmkit_data::ReplayQuery;
-use pmkit_event::MarketEvent;
+use pmkit_event::{MarketEvent, SourceEnvelope, StrategyFact};
 use pmkit_sim::{MarketCategory, SimEngine};
 use pmkit_spec::BacktestRun;
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
@@ -30,7 +30,14 @@ pub async fn drive(run: &BacktestRun) -> Result<BacktestReport, StartError> {
     let mut events_processed = 0_usize;
     let mut fills = 0_usize;
 
-    while let Some(event) = rx.recv().await {
+    while let Some(signal) = rx.recv().await {
+        let SourceEnvelope::PmMarket(envelope) = (match signal {
+            pmkit_data::SourceSignal::Data(envelope) => *envelope,
+            pmkit_data::SourceSignal::Watermark(_) | pmkit_data::SourceSignal::Eof => continue,
+        }) else {
+            continue;
+        };
+        let event = envelope.fact;
         events_processed += 1;
         if let MarketEvent::BookUpdate {
             market,
@@ -51,6 +58,7 @@ pub async fn drive(run: &BacktestRun) -> Result<BacktestReport, StartError> {
             fills += run_strategies(
                 &mut strategies,
                 market,
+                *outcome,
                 &book,
                 &mut positions,
                 *timestamp_ms,
@@ -70,6 +78,7 @@ pub async fn drive(run: &BacktestRun) -> Result<BacktestReport, StartError> {
 fn run_strategies(
     strategies: &mut [StrategyInstance],
     market: &pmkit_core::MarketId,
+    outcome: pmkit_market::Outcome,
     book: &OrderBookL2,
     positions: &mut Vec<pmkit_book::Position>,
     timestamp_ms: i64,
@@ -81,6 +90,13 @@ fn run_strategies(
             continue;
         }
         let context = StrategyContext {
+            fact: &StrategyFact::Market(MarketEvent::BookUpdate {
+                market: market.clone(),
+                outcome,
+                bids: book.bids.clone(),
+                asks: book.asks.clone(),
+                timestamp_ms,
+            }),
             market,
             book,
             positions: positions.as_slice(),

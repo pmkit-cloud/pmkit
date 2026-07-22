@@ -9,6 +9,10 @@ use pmkit_core::{MarketId, PortfolioId, StrategyId};
 use pmkit_market::{Asset, Exchange, Outcome};
 use rust_decimal::Decimal;
 
+mod feed;
+
+pub use feed::{CanonicalSourceKey, SourceEnvelope};
+
 /// Whether a fill provided or took liquidity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Liquidity {
@@ -19,7 +23,7 @@ pub enum Liquidity {
 }
 
 /// A single event flowing through a per-market loop.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarketEvent {
     /// Full order-book snapshot for a market outcome.
     BookUpdate {
@@ -117,7 +121,7 @@ impl MarketEvent {
 }
 
 /// A normalized authenticated-account fact from Polymarket.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PmAccountEvent {
     /// A fill on one of the portfolio's orders.
     Fill {
@@ -216,7 +220,7 @@ pub struct StreamMetadata {
 }
 
 /// A PM market frame with its transport metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PmMarketEnvelope {
     /// Preserved transport metadata.
     pub metadata: StreamMetadata,
@@ -225,7 +229,7 @@ pub struct PmMarketEnvelope {
 }
 
 /// A PM authenticated-account frame with its transport metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PmAccountEnvelope {
     /// Portfolio receiving the authenticated account frame.
     pub portfolio: PortfolioId,
@@ -236,7 +240,7 @@ pub struct PmAccountEnvelope {
 }
 
 /// A CEX reference frame with its transport metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CexReferenceEnvelope {
     /// Preserved transport metadata.
     pub metadata: StreamMetadata,
@@ -245,7 +249,7 @@ pub struct CexReferenceEnvelope {
 }
 
 /// A normalized fact a strategy may receive.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StrategyFact {
     /// PM market fact.
     Market(MarketEvent),

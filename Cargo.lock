@@ -3753,6 +3753,7 @@ version = "0.1.0"
 dependencies = [
  "pmkit-book",
  "pmkit-core",
+ "pmkit-event",
  "pmkit-exec",
  "thiserror",
 ]

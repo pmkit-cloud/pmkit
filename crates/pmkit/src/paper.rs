@@ -1,6 +1,6 @@
 use super::{PaperReport, StartError, absorb_fills, instantiate_strategies};
 use pmkit_book::OrderBookL2;
-use pmkit_event::MarketEvent;
+use pmkit_event::{MarketEvent, SourceEnvelope, StrategyFact};
 use pmkit_exec::Executor;
 use pmkit_market::Outcome;
 use pmkit_paper::PaperExecutor;
@@ -43,7 +43,14 @@ pub async fn drive(run: &PaperRun) -> Result<PaperReport, StartError> {
     let mut events_processed = 0_usize;
     let mut fills = 0_usize;
 
-    while let Some(event) = event_rx.recv().await {
+    while let Some(signal) = event_rx.recv().await {
+        let SourceEnvelope::PmMarket(envelope) = (match signal {
+            pmkit_data::SourceSignal::Data(envelope) => *envelope,
+            pmkit_data::SourceSignal::Watermark(_) | pmkit_data::SourceSignal::Eof => continue,
+        }) else {
+            continue;
+        };
+        let event = envelope.fact;
         events_processed += 1;
         if let MarketEvent::BookUpdate {
             market,
@@ -59,6 +66,7 @@ pub async fn drive(run: &PaperRun) -> Result<PaperReport, StartError> {
                 timestamp_ms: *timestamp_ms,
                 last_trade_price: None,
             };
+            let fact = StrategyFact::Market(event.clone());
             let _ = paper.update_book(market, *outcome, book.clone()).await;
             fills += absorb_fills(&drain_fills(&mut fill_rx), &mut positions);
             for (registered_market, strategy) in &mut *strategies {
@@ -66,6 +74,7 @@ pub async fn drive(run: &PaperRun) -> Result<PaperReport, StartError> {
                     continue;
                 }
                 let context = StrategyContext {
+                    fact: &fact,
                     market,
                     book: &book,
                     positions: &positions,

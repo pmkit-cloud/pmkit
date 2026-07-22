@@ -1,0 +1,34 @@
+Todo 3: deterministic envelope source merge
+
+Commands and results:
+
+$ cargo test -p pmkit deterministic_source_merge_matches_all_modes
+PASS: 1 test passed
+
+$ cargo test -p pmkit source_gap_aborts_before_strategy_evaluation
+PASS: 1 test passed
+
+$ cargo check --workspace --all-targets
+PASS
+
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+PASS
+
+$ cargo test --workspace
+PASS: 101 tests passed across 39 suites
+
+$ cargo fmt --all -- --check
+PASS
+
+$ git diff --check
+PASS
+
+Contract summary:
+- Sources emit explicit `SourceSignal::{Data(Box<SourceEnvelope>), Watermark, Eof}` values.
+- `SourceEnvelope` derives PM keys from `(source_timestamp, canonical_source_rank,
+  connection_epoch, frame_sequence)` and CEX trade keys from `(source_timestamp,
+  canonical_source_rank, aggregate_trade_id)`; ingest sequence is never a key.
+- `MergedFeed` owns finite source fixture tasks in a `JoinSet`, drains a bounded `mpsc`,
+  rejects late records and incomplete replay coverage as `DataSourceError::ReplayGap`,
+  and releases only normalized `StrategyFact` values in canonical order.
+- `StrategyContext` accepts `StrategyFact`, not a transport envelope.

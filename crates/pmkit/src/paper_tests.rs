@@ -4,7 +4,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
-use pmkit_data::{DataSourceError, LiveDataSource};
+use pmkit_data::{DataSourceError, LiveDataSource, SourceSignal};
 use pmkit_event::MarketEvent;
 use pmkit_market::Outcome;
 use pmkit_money::Money;
@@ -23,16 +23,16 @@ impl LiveDataSource for ScriptedLive {
         &self,
         market: MarketId,
         outcome: Outcome,
-        sink: Sender<MarketEvent>,
+        sink: Sender<SourceSignal>,
     ) -> Result<(), DataSourceError> {
         if outcome == Outcome::Up {
-            sink.send(MarketEvent::BookUpdate {
+            sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
                 market,
                 outcome,
                 bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
                 asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
                 timestamp_ms: 1,
-            })
+            }))
             .await
             .map_err(|_| DataSourceError::SinkClosed)?;
         }

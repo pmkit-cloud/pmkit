@@ -7,6 +7,7 @@
 
 use pmkit_book::{OrderBookL2, Position};
 use pmkit_core::MarketId;
+use pmkit_event::StrategyFact;
 use pmkit_exec::{OrderId, PlaceOrder};
 use thiserror::Error;
 
@@ -91,6 +92,8 @@ impl Actions {
 /// Immutable per-event context handed to a strategy.
 #[derive(Debug)]
 pub struct StrategyContext<'a> {
+    /// The normalized PM, account, or CEX fact that triggered this evaluation.
+    pub fact: &'a StrategyFact,
     /// The exact market the strategy trades.
     pub market: &'a MarketId,
     /// The current order book for the traded outcome token.
@@ -145,6 +148,7 @@ mod tests {
     };
     use pmkit_book::OrderBookL2;
     use pmkit_core::MarketId;
+    use pmkit_event::StrategyFact;
 
     struct FlatStrategy;
 
@@ -167,7 +171,11 @@ mod tests {
         let mut strategy = FlatFactory.create()?;
         let market = MarketId::new("btc-5m")?;
         let book = OrderBookL2::default();
+        let fact = StrategyFact::Market(pmkit_event::MarketEvent::Tick {
+            timestamp_ms: 1_700_000_000_000,
+        });
         let actions = strategy.on_event(StrategyContext {
+            fact: &fact,
             market: &market,
             book: &book,
             positions: &[],

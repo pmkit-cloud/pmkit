@@ -4,7 +4,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
-use pmkit_data::{DataSourceError, HistoricalDataSource, ReplayQuery};
+use pmkit_data::{DataSourceError, HistoricalDataSource, ReplayQuery, SourceSignal};
 use pmkit_event::MarketEvent;
 use pmkit_market::Outcome;
 use pmkit_money::Money;
@@ -25,7 +25,7 @@ impl HistoricalDataSource for ScriptedHistory {
     async fn replay(
         &self,
         _query: ReplayQuery,
-        sink: Sender<MarketEvent>,
+        sink: Sender<SourceSignal>,
     ) -> Result<(), DataSourceError> {
         let market = MarketId::new("btc-5m").map_err(|_| DataSourceError::NotAvailable)?;
         for &timestamp_ms in &self.ticks {
@@ -36,7 +36,7 @@ impl HistoricalDataSource for ScriptedHistory {
                 asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
                 timestamp_ms,
             };
-            sink.send(event)
+            sink.send(SourceSignal::market_event(event))
                 .await
                 .map_err(|_| DataSourceError::SinkClosed)?;
         }

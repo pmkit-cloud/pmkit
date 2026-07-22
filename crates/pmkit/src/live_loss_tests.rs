@@ -6,7 +6,7 @@ use crate::{
 use async_trait::async_trait;
 use pmkit_book::Side;
 use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
-use pmkit_data::{DataSourceError, LiveDataSource};
+use pmkit_data::{DataSourceError, LiveDataSource, SourceSignal};
 use pmkit_event::{Liquidity, MarketEvent};
 use pmkit_exec::PlaceOrder;
 use pmkit_market::Outcome;
@@ -31,7 +31,7 @@ impl LiveDataSource for LossThenRecovery {
         &self,
         market: MarketId,
         outcome: Outcome,
-        sink: Sender<MarketEvent>,
+        sink: Sender<SourceSignal>,
     ) -> Result<(), DataSourceError> {
         if outcome == Outcome::Up {
             for (price, timestamp_ms) in [
@@ -39,17 +39,17 @@ impl LiveDataSource for LossThenRecovery {
                 (Decimal::new(40, 2), 3),
                 (Decimal::new(60, 2), 4),
             ] {
-                sink.send(MarketEvent::BookUpdate {
+                sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
                     market: market.clone(),
                     outcome,
                     bids: vec![(price, Decimal::from(10))],
                     asks: vec![(price, Decimal::from(10))],
                     timestamp_ms,
-                })
+                }))
                 .await
                 .map_err(|_| DataSourceError::SinkClosed)?;
                 if timestamp_ms == 1 {
-                    sink.send(MarketEvent::Fill {
+                    sink.send(SourceSignal::market_event(MarketEvent::Fill {
                         strategy: None,
                         order_id: "venue-1".to_owned(),
                         market: market.clone(),
@@ -60,7 +60,7 @@ impl LiveDataSource for LossThenRecovery {
                         fee: Decimal::ZERO,
                         liquidity: Liquidity::Taker,
                         timestamp_ms: 2,
-                    })
+                    }))
                     .await
                     .map_err(|_| DataSourceError::SinkClosed)?;
                 }

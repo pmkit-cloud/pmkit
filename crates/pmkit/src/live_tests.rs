@@ -5,7 +5,7 @@ use crate::{
 use async_trait::async_trait;
 use pmkit_book::Side;
 use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
-use pmkit_data::{DataSourceError, LiveDataSource};
+use pmkit_data::{DataSourceError, LiveDataSource, SourceSignal};
 use pmkit_event::{Liquidity, MarketEvent};
 use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
 use pmkit_market::Outcome;
@@ -186,19 +186,19 @@ impl LiveDataSource for LiveWithFill {
         &self,
         market: MarketId,
         outcome: Outcome,
-        sink: Sender<MarketEvent>,
+        sink: Sender<SourceSignal>,
     ) -> Result<(), DataSourceError> {
         if outcome == Outcome::Up {
-            sink.send(MarketEvent::BookUpdate {
+            sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
                 market: market.clone(),
                 outcome,
                 bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
                 asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
                 timestamp_ms: 1,
-            })
+            }))
             .await
             .map_err(|_| DataSourceError::SinkClosed)?;
-            sink.send(MarketEvent::Fill {
+            sink.send(SourceSignal::market_event(MarketEvent::Fill {
                 strategy: None,
                 order_id: "venue-1".to_owned(),
                 market,
@@ -209,7 +209,7 @@ impl LiveDataSource for LiveWithFill {
                 fee: Decimal::ZERO,
                 liquidity: Liquidity::Taker,
                 timestamp_ms: 2,
-            })
+            }))
             .await
             .map_err(|_| DataSourceError::SinkClosed)?;
         }
