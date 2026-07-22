@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs::{self, File};
 
-use pmkit_event::MarketEvent;
+use pmkit_event::{MarketEvent, PmAccountEnvelope, PmAccountEvent, StreamMetadata};
 use pmkit_exec::OrderId;
 use pmkit_run::TapePolicy;
 use pmkit_runtime::RuntimeConfig;
@@ -13,6 +13,7 @@ use super::StartError;
 pub(super) struct LiveTape {
     policy: Option<TapePolicy>,
     tape: Option<JsonLinesTape<File>>,
+    ingest_sequence: u64,
 }
 
 impl LiveTape {
@@ -21,6 +22,7 @@ impl LiveTape {
             return Ok(Self {
                 policy: None,
                 tape: None,
+                ingest_sequence: 0,
             });
         };
         let path = tape_path(run, runtime);
@@ -40,14 +42,67 @@ impl LiveTape {
         Ok(Self {
             policy: Some(policy),
             tape,
+            ingest_sequence: 0,
         })
     }
 
     pub(super) fn append(&mut self, run: &LiveRun, event: &MarketEvent) -> Result<(), StartError> {
+        let fact = match event {
+            MarketEvent::Fill {
+                strategy,
+                order_id,
+                market,
+                outcome,
+                price,
+                size,
+                side,
+                fee,
+                liquidity,
+                timestamp_ms,
+            } => PmAccountEvent::Fill {
+                strategy: strategy.clone(),
+                order_id: order_id.clone(),
+                market: market.clone(),
+                outcome: *outcome,
+                price: *price,
+                size: *size,
+                side: *side,
+                fee: *fee,
+                liquidity: *liquidity,
+                timestamp_ms: *timestamp_ms,
+            },
+            MarketEvent::OrderAck {
+                strategy,
+                order_id,
+                timestamp_ms,
+            } => PmAccountEvent::OrderAck {
+                strategy: strategy.clone(),
+                order_id: order_id.clone(),
+                timestamp_ms: *timestamp_ms,
+            },
+            MarketEvent::BookUpdate { .. }
+            | MarketEvent::BestBidAsk { .. }
+            | MarketEvent::LastTrade { .. }
+            | MarketEvent::Tick { .. } => return Ok(()),
+        };
         let Some(tape) = &mut self.tape else {
             return Ok(());
         };
-        if let Err(source) = tape.append(event) {
+        let timestamp_ms = event.timestamp_ms();
+        let envelope = PmAccountEnvelope {
+            portfolio: run.portfolio().clone(),
+            metadata: StreamMetadata {
+                schema_version: 1,
+                source_id: "pmkit-live".into(),
+                source_time_ms: timestamp_ms,
+                receipt_time_ms: timestamp_ms,
+                connection_id: run.id().to_string(),
+                ingest_sequence: self.ingest_sequence,
+            },
+            fact,
+        };
+        self.ingest_sequence += 1;
+        if let Err(source) = tape.append(&envelope) {
             if self.policy == Some(TapePolicy::Required) {
                 return Err(StartError::Tape {
                     run: run.id().clone(),

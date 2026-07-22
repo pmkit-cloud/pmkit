@@ -4,7 +4,8 @@ use pmkit_run::TapePolicy;
 use std::fs;
 
 #[tokio::test]
-async fn live_run_writes_each_event_to_required_tape() -> Result<(), Box<dyn std::error::Error>> {
+async fn live_run_writes_account_events_to_required_tape() -> Result<(), Box<dyn std::error::Error>>
+{
     let mut runtime = config()?;
     let tape_dir = std::env::temp_dir().join(format!("pmkit-live-tape-{}", std::process::id()));
     if tape_dir.exists() {
@@ -21,9 +22,9 @@ async fn live_run_writes_each_event_to_required_tape() -> Result<(), Box<dyn std
     let tape = fs::read_to_string(tape_file)?;
 
     assert_eq!(report.events_processed, 2);
-    assert_eq!(tape.lines().count(), 2);
-    assert!(tape.contains("\"kind\":\"book_update\""));
+    assert_eq!(tape.lines().count(), 1);
     assert!(tape.contains("\"kind\":\"fill\""));
+    assert!(tape.contains("\"schema_version\":1"));
     fs::remove_dir_all(tape_dir)?;
     Ok(())
 }
