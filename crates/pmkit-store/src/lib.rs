@@ -42,7 +42,7 @@ pub use chain::{Address, AddressError, ChainId, ContractRegistry, LegacyV1Contra
 pub use chain_store::CanonicalLogStore;
 pub use log::{
     CanonicalChainLog, CanonicalLogIdentity, CanonicalLogSegment, ChainCheckpoint, ChainEvent,
-    OutcomeTokenAmount,
+    OutcomeTokenAmount, TradeSide,
 };
 pub use source::{CanonicalLogSource, ChainSourceError, FixtureCanonicalLogSource};
 pub use turso_store::TursoTapeStore;

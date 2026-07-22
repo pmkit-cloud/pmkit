@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use rust_decimal::Decimal;
 
 use crate::{
-    Address, CanonicalChainLog, ChainCheckpoint, ChainEvent, WalletActivity, WalletActivityKind,
-    WalletPosition, WalletQuery, WalletSnapshot, WalletTrade,
+    Address, CanonicalChainLog, ChainCheckpoint, ChainEvent, TradeSide, WalletActivity,
+    WalletActivityKind, WalletPosition, WalletQuery, WalletSnapshot, WalletTrade,
 };
 
 pub fn reconstruct_wallet(query: &WalletQuery, logs: &[CanonicalChainLog]) -> WalletSnapshot {
@@ -111,22 +111,10 @@ impl ReconstructionState {
                     *payout,
                 );
             }
-            ChainEvent::OrderFilled {
-                maker,
-                taker,
-                asset_id,
-                maker_amount,
-                taker_amount,
-                fee,
-            } if maker == &self.wallet || taker == &self.wallet => {
-                self.apply_trade(
-                    log,
-                    maker == &self.wallet,
-                    asset_id,
-                    maker_amount,
-                    taker_amount,
-                    fee,
-                );
+            event @ ChainEvent::OrderFilled { maker, taker, .. }
+                if maker == &self.wallet || taker == &self.wallet =>
+            {
+                self.apply_trade(log, event);
             }
             ChainEvent::OrdersMatched {
                 trader,
@@ -167,25 +155,48 @@ impl ReconstructionState {
         }
     }
 
-    fn apply_trade(
-        &mut self,
-        log: &CanonicalChainLog,
-        maker: bool,
-        asset_id: &str,
-        maker_amount: &Decimal,
-        taker_amount: &Decimal,
-        fee: &Decimal,
-    ) {
-        let (size, counter_amount) = if maker {
-            (*maker_amount, *taker_amount)
+    fn apply_trade(&mut self, log: &CanonicalChainLog, event: &ChainEvent) {
+        let ChainEvent::OrderFilled {
+            maker,
+            maker_asset_id,
+            taker_asset_id,
+            maker_side,
+            maker_amount,
+            taker_amount,
+            fee,
+            ..
+        } = event
+        else {
+            return;
+        };
+        let maker = maker == &self.wallet;
+        let (asset_id, direction, size, counter_amount) = if maker {
+            match maker_side {
+                TradeSide::Buy => (taker_asset_id, TradeSide::Buy, *taker_amount, *maker_amount),
+                TradeSide::Sell => (
+                    maker_asset_id,
+                    TradeSide::Sell,
+                    *maker_amount,
+                    *taker_amount,
+                ),
+            }
         } else {
-            (*taker_amount, *maker_amount)
+            match maker_side {
+                TradeSide::Buy => (
+                    taker_asset_id,
+                    TradeSide::Sell,
+                    *taker_amount,
+                    *maker_amount,
+                ),
+                TradeSide::Sell => (maker_asset_id, TradeSide::Buy, *maker_amount, *taker_amount),
+            }
         };
         self.trades.push(WalletTrade {
             transaction_hash: log.identity.transaction_hash.clone(),
             block_number: log.identity.block_number,
             asset_id: asset_id.to_owned(),
             maker,
+            side: direction,
             size,
             counter_amount,
             fee: *fee,

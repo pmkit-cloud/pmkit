@@ -32,13 +32,15 @@ impl CanonicalLogStore for TursoTapeStore {
         segment: &CanonicalLogSegment,
     ) -> Result<(), StoreError> {
         validate_segment(registry, segment)?;
+        let chain_id =
+            i64::try_from(registry.chain_id.get()).map_err(|_| StoreError::LimitTooLarge)?;
+        validate_stored_chain(&self.connection, chain_id, &segment.common_ancestor).await?;
         let transaction = self.connection.unchecked_transaction().await?;
         transaction
             .execute(
                 DELETE_CANONICAL_LOGS_AFTER,
                 (
-                    i64::try_from(registry.chain_id.get())
-                        .map_err(|_| StoreError::LimitTooLarge)?,
+                    chain_id,
                     i64::try_from(segment.common_ancestor.block_number)
                         .map_err(|_| StoreError::LimitTooLarge)?,
                 ),
@@ -107,9 +109,7 @@ impl CanonicalLogStore for TursoTapeStore {
         while let Some(row) = rows.next().await? {
             logs.push(decode_log(&row)?);
         }
-        let mut snapshot = rebuild_wallet(query, &logs);
-        snapshot.canonical_tip = read_checkpoint(&self.connection, chain_id).await?;
-        Ok(snapshot)
+        Ok(rebuild_wallet(query, &logs))
     }
 }
 
@@ -118,11 +118,59 @@ fn validate_segment(
     segment: &CanonicalLogSegment,
 ) -> Result<(), StoreError> {
     if segment.common_ancestor.chain_id != registry.chain_id
+        || !segment.logs.windows(2).all(|logs| {
+            let previous = &logs[0].identity;
+            let next = &logs[1].identity;
+            (
+                previous.block_number,
+                previous.transaction_index,
+                previous.log_index,
+            ) < (next.block_number, next.transaction_index, next.log_index)
+                && (previous.block_number != next.block_number
+                    || previous.block_hash == next.block_hash)
+        })
         || segment.logs.iter().any(|log| {
             log.identity.block_number <= segment.common_ancestor.block_number
                 || !registry.accepts(log)
         })
     {
+        return Err(StoreError::InvalidCanonicalSegment);
+    }
+    Ok(())
+}
+
+async fn validate_stored_chain(
+    connection: &turso::Connection,
+    chain_id: i64,
+    ancestor: &ChainCheckpoint,
+) -> Result<(), StoreError> {
+    let checkpoint = read_checkpoint(connection, chain_id).await?;
+    let tip = read_tip(connection, chain_id).await?;
+    if checkpoint != tip {
+        return Err(StoreError::InvalidCanonicalSegment);
+    }
+    let Some(tip) = tip else {
+        return (ancestor.block_number == 0)
+            .then_some(())
+            .ok_or(StoreError::InvalidCanonicalSegment);
+    };
+    if ancestor.block_number > tip.block_number {
+        return Err(StoreError::InvalidCanonicalSegment);
+    }
+    let mut hashes = connection
+        .query(
+            crate::schema::READ_CANONICAL_BLOCK_HASH,
+            (
+                chain_id,
+                i64::try_from(ancestor.block_number).map_err(|_| StoreError::LimitTooLarge)?,
+            ),
+        )
+        .await?;
+    let Some(row) = hashes.next().await? else {
+        return Err(StoreError::InvalidCanonicalSegment);
+    };
+    let hash: String = row.get(0)?;
+    if hash != ancestor.block_hash || hashes.next().await?.is_some() {
         return Err(StoreError::InvalidCanonicalSegment);
     }
     Ok(())
@@ -195,6 +243,25 @@ async fn read_checkpoint(
         crate::ChainId::POLYGON,
         u64::try_from(block_number).map_err(|_| StoreError::CanonicalLogDecode {
             message: "negative checkpoint block".into(),
+        })?,
+        row.get::<String>(1)?,
+    )))
+}
+
+async fn read_tip(
+    connection: &turso::Connection,
+    chain_id: i64,
+) -> Result<Option<ChainCheckpoint>, StoreError> {
+    let mut rows = connection
+        .query(crate::schema::READ_CANONICAL_TIP, [chain_id])
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    Ok(Some(ChainCheckpoint::new(
+        crate::ChainId::POLYGON,
+        u64::try_from(row.get::<i64>(0)?).map_err(|_| StoreError::CanonicalLogDecode {
+            message: "negative canonical tip block".into(),
         })?,
         row.get::<String>(1)?,
     )))

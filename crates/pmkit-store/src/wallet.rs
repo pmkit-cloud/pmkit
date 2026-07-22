@@ -1,6 +1,6 @@
 use rust_decimal::Decimal;
 
-use crate::{Address, CanonicalChainLog, ChainCheckpoint};
+use crate::{Address, CanonicalChainLog, ChainCheckpoint, TradeSide};
 
 use crate::wallet_reducer::reconstruct_wallet;
 
@@ -47,6 +47,8 @@ pub struct WalletTrade {
     pub asset_id: String,
     /// Whether the queried wallet was the maker.
     pub maker: bool,
+    /// The queried wallet's outcome-token direction.
+    pub side: TradeSide,
     /// The wallet's filled amount.
     pub size: Decimal,
     /// The paired filled amount.

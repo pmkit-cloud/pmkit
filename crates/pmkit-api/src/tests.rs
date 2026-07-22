@@ -1,7 +1,9 @@
 use pmkit_store::{Address, ChainCheckpoint, ChainId, WalletPosition, WalletSnapshot};
 use rust_decimal::Decimal;
 
-use crate::{ChainTruthApiV1, DataOrdersQuery, NotReconstructibleFromChain, PositionsQuery};
+use crate::{
+    ChainTruthApiV1, DataOrdersQuery, NotReconstructibleFromChain, PositionsQuery, QueryError,
+};
 
 #[test]
 fn clob_compatible_wallet_reads_match_fixtures() -> Result<(), Box<dyn std::error::Error>> {
@@ -10,10 +12,16 @@ fn clob_compatible_wallet_reads_match_fixtures() -> Result<(), Box<dyn std::erro
         wallet: Address::new("0x00000000000000000000000000000000000000aa")?,
         canonical_tip: Some(ChainCheckpoint::new(ChainId::POLYGON, 1, "0xblock")),
         collateral_balance: Decimal::ZERO,
-        positions: vec![WalletPosition {
-            asset_id: "yes".into(),
-            size: Decimal::ONE,
-        }],
+        positions: vec![
+            WalletPosition {
+                asset_id: "no".into(),
+                size: Decimal::ONE,
+            },
+            WalletPosition {
+                asset_id: "yes".into(),
+                size: Decimal::ONE,
+            },
+        ],
         settled_collateral: Decimal::ZERO,
         trades: Vec::new(),
         activity: Vec::new(),
@@ -23,16 +31,25 @@ fn clob_compatible_wallet_reads_match_fixtures() -> Result<(), Box<dyn std::erro
     // When: positions are requested with Data API offset semantics.
     let response = api.positions(&PositionsQuery::new(
         "0x00000000000000000000000000000000000000aa",
-        100,
-        0,
-    )?);
+        1,
+        1,
+    )?)?;
 
     // Then: the response preserves only chain-provable CLOB-compatible fields.
-    assert_eq!(response.version, "v1");
-    assert_eq!(response.data.len(), 1);
+    assert_eq!(response.len(), 1);
     assert_eq!(
-        response.data[0].proxy_wallet,
+        response[0].proxy_wallet,
         "0x00000000000000000000000000000000000000aa"
+    );
+    assert_eq!(response[0].asset, "yes");
+    assert_eq!(api.balance().balance, Decimal::ZERO);
+    assert_eq!(
+        api.positions(&PositionsQuery::new(
+            "0x00000000000000000000000000000000000000bb",
+            1,
+            0
+        )?),
+        Err(QueryError::WalletMismatch)
     );
     Ok(())
 }

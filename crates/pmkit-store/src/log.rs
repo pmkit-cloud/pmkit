@@ -29,6 +29,16 @@ pub struct OutcomeTokenAmount {
     pub amount: Decimal,
 }
 
+/// The chain-proven direction of an outcome-token fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum TradeSide {
+    /// The wallet acquired outcome tokens.
+    Buy,
+    /// The wallet transferred outcome tokens.
+    Sell,
+}
+
 /// A typed Polymarket event parsed from a canonical EVM log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -95,8 +105,12 @@ pub enum ChainEvent {
         maker: Address,
         /// The taker wallet.
         taker: Address,
-        /// The outcome token identifier.
-        asset_id: String,
+        /// The asset transferred by the maker.
+        maker_asset_id: String,
+        /// The asset transferred by the taker.
+        taker_asset_id: String,
+        /// The maker's chain-proven outcome-token direction.
+        maker_side: TradeSide,
         /// The maker amount filled.
         maker_amount: Decimal,
         /// The taker amount filled.

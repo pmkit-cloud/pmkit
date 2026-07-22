@@ -125,3 +125,13 @@ ORDER BY block_number, transaction_index, log_index";
 
 pub const READ_CANONICAL_CHECKPOINT: &str = "
 SELECT block_number, block_hash FROM canonical_chain_checkpoints WHERE chain_id = ?1";
+
+pub const READ_CANONICAL_BLOCK_HASH: &str = "
+SELECT block_hash FROM canonical_chain_logs
+WHERE chain_id = ?1 AND block_number = ?2
+GROUP BY block_hash";
+
+pub const READ_CANONICAL_TIP: &str = "
+SELECT block_number, block_hash FROM canonical_chain_logs
+WHERE chain_id = ?1
+ORDER BY block_number DESC, transaction_index DESC, log_index DESC LIMIT 1";

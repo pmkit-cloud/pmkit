@@ -2,19 +2,6 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use thiserror::Error;
 
-/// A versioned offset-paginated chain-truth response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ChainTruthPage<T> {
-    /// The `PMKit` API schema version.
-    pub version: &'static str,
-    /// The applied request limit.
-    pub limit: usize,
-    /// The applied request offset.
-    pub offset: usize,
-    /// The chain-proven response rows.
-    pub data: Vec<T>,
-}
-
 /// A position query with the official Data API offset shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionsQuery {
@@ -137,6 +124,7 @@ pub struct DataOrderQuery {
 
 /// A chain-proven current outcome-token position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChainTruthPosition {
     /// The proxy wallet.
     pub proxy_wallet: String,
@@ -148,6 +136,7 @@ pub struct ChainTruthPosition {
 
 /// A chain-proven settled condition, without offchain display metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChainTruthClosedPosition {
     /// The proxy wallet.
     pub proxy_wallet: String,
@@ -159,6 +148,7 @@ pub struct ChainTruthClosedPosition {
 
 /// A chain-proven exchange fill.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChainTruthTrade {
     /// The wallet that participated in the fill.
     pub proxy_wallet: String,
@@ -170,6 +160,8 @@ pub struct ChainTruthTrade {
     pub block_number: u64,
     /// Whether the wallet was the maker.
     pub maker: bool,
+    /// The chain-proven fill direction for this wallet.
+    pub side: String,
     /// The wallet's filled amount.
     pub size: Decimal,
     /// The paired filled amount.
@@ -180,11 +172,13 @@ pub struct ChainTruthTrade {
 
 /// A chain-proven protocol activity row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChainTruthActivity {
     /// The proxy wallet.
     pub proxy_wallet: String,
     /// The direct protocol event kind.
-    pub kind: String,
+    #[serde(rename = "type")]
+    pub activity_type: String,
     /// The canonical transaction hash.
     pub transaction_hash: String,
     /// The canonical block height.
@@ -195,6 +189,15 @@ pub struct ChainTruthActivity {
     pub asset: Option<String>,
     /// The directly emitted amount.
     pub amount: Decimal,
+}
+
+/// A collateral balance that can be reconstructed from canonical transfers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChainTruthBalance {
+    /// The collateral asset used by the canonical registry.
+    pub asset: &'static str,
+    /// The exact reconstructed collateral balance.
+    pub balance: Decimal,
 }
 
 /// A typed refusal for CLOB concepts that require offchain lifecycle data.
@@ -220,6 +223,9 @@ pub enum QueryError {
         /// The endpoint-specific maximum.
         maximum: usize,
     },
+    /// The requested user is not the wallet used to build this projection.
+    #[error("user does not match the reconstructed wallet")]
+    WalletMismatch,
 }
 
 fn page_query(

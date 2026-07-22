@@ -1,9 +1,9 @@
-use pmkit_store::{WalletActivityKind, WalletSnapshot};
+use pmkit_store::{Address, TradeSide, WalletActivityKind, WalletSnapshot};
 
 use crate::{
-    ActivityQuery, ChainTruthActivity, ChainTruthClosedPosition, ChainTruthPage,
+    ActivityQuery, ChainTruthActivity, ChainTruthBalance, ChainTruthClosedPosition,
     ChainTruthPosition, ChainTruthTrade, ClosedPositionsQuery, DataOrderQuery, DataOrdersQuery,
-    NotReconstructibleFromChain, PositionsQuery, TradesQuery,
+    NotReconstructibleFromChain, PositionsQuery, QueryError, TradesQuery,
 };
 
 /// Version 1 of `PMKit`'s chain-truth API projection.
@@ -20,8 +20,11 @@ impl ChainTruthApiV1 {
     }
 
     /// Returns current outcome-token positions using Data API offset pagination.
-    #[must_use]
-    pub fn positions(&self, query: &PositionsQuery) -> ChainTruthPage<ChainTruthPosition> {
+    ///
+    /// # Errors
+    /// Returns [`QueryError::WalletMismatch`] when `user` differs from the reconstructed wallet.
+    pub fn positions(&self, query: &PositionsQuery) -> Result<Vec<ChainTruthPosition>, QueryError> {
+        self.validate_user(&query.user)?;
         let wallet = self.snapshot.wallet.as_str();
         let data = self
             .snapshot
@@ -32,33 +35,44 @@ impl ChainTruthApiV1 {
                 asset: position.asset_id.clone(),
                 size: position.size,
             });
-        page(query.limit, query.offset, data.collect())
+        Ok(page(query.limit, query.offset, data.collect()))
     }
 
     /// Returns CTF-redemption records using Data API offset pagination.
-    #[must_use]
+    ///
+    /// # Errors
+    /// Returns [`QueryError::WalletMismatch`] when `user` differs from the reconstructed wallet.
     pub fn closed_positions(
         &self,
         query: &ClosedPositionsQuery,
-    ) -> ChainTruthPage<ChainTruthClosedPosition> {
+    ) -> Result<Vec<ChainTruthClosedPosition>, QueryError> {
+        self.validate_user(&query.user)?;
         let wallet = self.snapshot.wallet.as_str();
         let data = self
             .snapshot
             .activity
             .iter()
             .filter(|activity| activity.kind == WalletActivityKind::Redemption)
-            .map(|activity| ChainTruthClosedPosition {
-                proxy_wallet: wallet.into(),
-                condition_id: activity.condition_id.clone().unwrap_or_default(),
-                settled_collateral: activity.amount,
+            .filter_map(|activity| {
+                activity
+                    .condition_id
+                    .clone()
+                    .map(|condition_id| ChainTruthClosedPosition {
+                        proxy_wallet: wallet.into(),
+                        condition_id,
+                        settled_collateral: activity.amount,
+                    })
             })
             .collect();
-        page(query.limit, query.offset, data)
+        Ok(page(query.limit, query.offset, data))
     }
 
     /// Returns exchange fills using Data API offset pagination.
-    #[must_use]
-    pub fn trades(&self, query: &TradesQuery) -> ChainTruthPage<ChainTruthTrade> {
+    ///
+    /// # Errors
+    /// Returns [`QueryError::WalletMismatch`] when `user` differs from the reconstructed wallet.
+    pub fn trades(&self, query: &TradesQuery) -> Result<Vec<ChainTruthTrade>, QueryError> {
+        self.validate_user(&query.user)?;
         let wallet = self.snapshot.wallet.as_str();
         let data = self
             .snapshot
@@ -70,33 +84,48 @@ impl ChainTruthApiV1 {
                 transaction_hash: trade.transaction_hash.clone(),
                 block_number: trade.block_number,
                 maker: trade.maker,
+                side: side(trade.side).into(),
                 size: trade.size,
                 counter_amount: trade.counter_amount,
                 fee: trade.fee,
             })
             .collect();
-        page(query.limit, query.offset, data)
+        Ok(page(query.limit, query.offset, data))
     }
 
     /// Returns CTF and exchange protocol activity using Data API offset pagination.
-    #[must_use]
-    pub fn activity(&self, query: &ActivityQuery) -> ChainTruthPage<ChainTruthActivity> {
+    ///
+    /// # Errors
+    /// Returns [`QueryError::WalletMismatch`] when `user` differs from the reconstructed wallet.
+    pub fn activity(&self, query: &ActivityQuery) -> Result<Vec<ChainTruthActivity>, QueryError> {
+        self.validate_user(&query.user)?;
         let wallet = self.snapshot.wallet.as_str();
         let data = self
             .snapshot
             .activity
             .iter()
-            .map(|activity| ChainTruthActivity {
-                proxy_wallet: wallet.into(),
-                kind: format!("{:?}", activity.kind),
-                transaction_hash: activity.transaction_hash.clone(),
-                block_number: activity.block_number,
-                condition_id: activity.condition_id.clone(),
-                asset: activity.asset_id.clone(),
-                amount: activity.amount,
+            .filter_map(|activity| {
+                activity_type(activity.kind).map(|activity_type| ChainTruthActivity {
+                    proxy_wallet: wallet.into(),
+                    activity_type: activity_type.into(),
+                    transaction_hash: activity.transaction_hash.clone(),
+                    block_number: activity.block_number,
+                    condition_id: activity.condition_id.clone(),
+                    asset: activity.asset_id.clone(),
+                    amount: activity.amount,
+                })
             })
             .collect();
-        page(query.limit, query.offset, data)
+        Ok(page(query.limit, query.offset, data))
+    }
+
+    /// Returns the collateral balance with no offchain valuation fabricated.
+    #[must_use]
+    pub const fn balance(&self) -> ChainTruthBalance {
+        ChainTruthBalance {
+            asset: "USDC",
+            balance: self.snapshot.collateral_balance,
+        }
     }
 
     /// Refuses CLOB order-list reconstruction because signed order state is offchain.
@@ -120,19 +149,37 @@ impl ChainTruthApiV1 {
     ) -> Result<(), NotReconstructibleFromChain> {
         Err(NotReconstructibleFromChain::Order)
     }
+
+    fn validate_user(&self, user: &str) -> Result<(), QueryError> {
+        let user = Address::new(user).map_err(|_| QueryError::WalletMismatch)?;
+        (user == self.snapshot.wallet)
+            .then_some(())
+            .ok_or(QueryError::WalletMismatch)
+    }
 }
 
-fn page<T>(limit: usize, offset: usize, mut data: Vec<T>) -> ChainTruthPage<T> {
+fn page<T>(limit: usize, offset: usize, mut data: Vec<T>) -> Vec<T> {
     let end = offset.saturating_add(limit).min(data.len());
-    let data = if offset >= data.len() {
+    if offset >= data.len() {
         Vec::new()
     } else {
         data.drain(offset..end).collect()
-    };
-    ChainTruthPage {
-        version: "v1",
-        limit,
-        offset,
-        data,
+    }
+}
+
+const fn side(side: TradeSide) -> &'static str {
+    match side {
+        TradeSide::Buy => "BUY",
+        TradeSide::Sell => "SELL",
+    }
+}
+
+const fn activity_type(kind: WalletActivityKind) -> Option<&'static str> {
+    match kind {
+        WalletActivityKind::Trade => Some("TRADE"),
+        WalletActivityKind::Split => Some("SPLIT"),
+        WalletActivityKind::Merge => Some("MERGE"),
+        WalletActivityKind::Redemption => Some("REDEEM"),
+        WalletActivityKind::Match | WalletActivityKind::Fee => None,
     }
 }
