@@ -1,4 +1,18 @@
 //! Durable PM envelopes and causal decisions for `PMKit`.
+//!
+//! [`TursoTapeStore`] implements [`TapeStore`] over a local Turso (libSQL)
+//! database. It stores:
+//!
+//! - **Lossless PM envelopes** — versioned raw frames with normalized
+//!   projections, SHA-256 integrity digests, and deterministic replay cursors.
+//! - **Causal decisions** — portable strategy snapshots with risk verdicts.
+//! - **Idempotent order intents** — pending → accepted/rejected/unknown
+//!   transitions linked to decision correlation IDs.
+//!
+//! All queries are owner-scoped (`PortfolioId` + `RunId`) and use static
+//! parameterized SQL. `delete_database()` removes the entire local database
+//! and sidecar files. Storage is opt-in; omitting it leaves the default
+//! no-storage path unchanged.
 
 use std::num::NonZeroUsize;
 

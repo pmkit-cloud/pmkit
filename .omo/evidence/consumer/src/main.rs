@@ -25,6 +25,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if std::env::args().any(|argument| argument == "--store-fails") {
         return pre_submission_failure().await;
     }
+    if std::env::args().any(|argument| argument == "--missing-cache") {
+        return missing_cache_replay_gap().await;
+    }
     let mut expected = None;
     for (name, mode) in [
         ("backtest", FeedMode::Backtest),
@@ -111,3 +114,16 @@ impl TapeStore for FailingStore {
     async fn transition_intent(&self, _: &CausalIdentity, _: IntentOutcome) -> Result<(), StoreError> { Err(failure()) }
 }
 fn failure() -> StoreError { StoreError::Storage { message: "fixture failure".into() } }
+
+async fn missing_cache_replay_gap() -> Result<(), Box<dyn Error>> {
+    let cache = pmkit_data::VerifiedBinanceArchiveCache::new(
+        std::env::temp_dir().join("pmkit-missing-cache-test"),
+        pmkit_data::CachePolicy::Bounded { max_bytes: 1024 * 1024 },
+    );
+    let result = cache.replay(Asset::Btc, "2099-01-01".parse()?).await;
+    let Err(DataSourceError::ReplayGap { .. }) = result else {
+        return Err(format!("expected ReplayGap, got: {result:?}").into());
+    };
+    println!("todo8 consumer: missing-cache yields ReplayGap");
+    Ok(())
+}

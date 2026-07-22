@@ -1,8 +1,17 @@
 //! Market data-source traits for `PMKit`.
 //!
-//! A data source delivers [`MarketEvent`]s into a caller-provided channel. The
-//! historical source replays a bounded window; the live source streams until
-//! the subscription is dropped. Neither performs any venue signing.
+//! Defines `HistoricalDataSource` and `LiveDataSource` traits that deliver
+//! [`SourceSignal`]s into a caller-provided channel. `PMKit` enforces a matched
+//! live/history source pair: Binance `@aggTrade` live pairs with Vision
+//! `aggTrades` history. Exchanges without an official archive (Bybit, etc.)
+//! return [`DataSourceError::HistoryUnavailable`].
+//!
+//! [`VerifiedBinanceArchiveCache`] provides a bounded, SHA-256-verified local
+//! cache of official Binance Vision archives. Missing or corrupt archives
+//! yield [`DataSourceError::ReplayGap`].
+//!
+//! Raw PM frame sources (`PmMarketFrameSource`, `PmAccountFrameSource`) deliver
+//! byte-identical provider text before venue adaptation for lossless storage.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

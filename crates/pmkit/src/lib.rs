@@ -5,7 +5,9 @@
 //! -> fills), returning an [`AppHandle`] that exposes each run's
 //! [`RunReport`]. Paper runs are driven similarly against a live data source;
 //! live runs route strategy orders through a consented executor behind a
-//! risk gate with bounded execution-state reconciliation and optional tapes.
+//! risk gate with bounded execution-state reconciliation, optional tapes, and
+//! opt-in durable PM-envelope and causal-decision storage via
+//! [`PmkitBuilder::storage`].
 
 mod backtest;
 /// Portable causal decision snapshots and durable execution recording.

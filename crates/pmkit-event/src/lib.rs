@@ -1,8 +1,13 @@
-//! Neutral market event model for `PMKit`.
+//! Neutral market event model and typed stream envelopes for `PMKit`.
 //!
 //! [`MarketEvent`] is the normalized PM market fact a strategy receives. It carries no
 //! venue-specific token identifiers — outcomes are addressed by
 //! [`MarketId`] plus [`Outcome`].
+//!
+//! Typed envelopes (`PmMarketEnvelope`, `PmAccountEnvelope`, `CexReferenceEnvelope`)
+//! preserve byte-identical raw frames with transport metadata. Strategies receive
+//! only [`StrategyFact`], never envelopes — the `StrategyInput` trait enforces this
+//! at compile time.
 
 use pmkit_book::Side;
 use pmkit_core::{MarketId, PortfolioId, StrategyId};

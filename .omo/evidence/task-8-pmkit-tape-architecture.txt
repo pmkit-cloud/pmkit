@@ -1,0 +1,51 @@
+Todo 8 evidence
+===============
+
+Public docs updated
+-------------------
+README.md now covers:
+- PM ownership boundary (typed envelopes vs strategy facts)
+- Lossless envelope fields (schema_version, source_id, connection_id,
+  source/receipt timestamps, canonical_source_rank, connection_epoch,
+  frame_sequence, ingest_sequence, raw_frame, normalized)
+- Verified bounded Binance replay cache (SHA-256 verification, per-key locks,
+  byte limits, atomic rename, LRU/quota under CachePolicy::Bounded)
+- Whole-database deletion (TursoTapeStore::delete_database removes DB + sidecars)
+- Source eligibility/gaps (matched live/history pair, HistoryUnavailable for
+  Bybit/others, ReplayGap on missing/corrupt/oversized archives)
+- Opt-in storage (PmkitBuilder::storage, CEX events never persisted)
+- Onchain extension listed as planned, not shipped
+- No promises of Bybit or CEX BBO/depth parity
+
+Crate docs updated:
+- pmkit-data: source traits, Binance parity, verified cache, raw frame sources
+- pmkit-store: TursoTapeStore, envelopes, decisions, intents, owner-scoped SQL,
+  whole-DB deletion, opt-in storage
+- pmkit-event: typed envelopes, StrategyInput compile-time barrier
+- pmkit: opt-in durable storage via PmkitBuilder::storage
+
+External consumer
+-----------------
+Command:
+  cargo run --manifest-path .omo/evidence/consumer/Cargo.toml
+Result:
+  todo7 consumer: backtest/paper/live snapshots match
+
+Command:
+  cargo run --manifest-path .omo/evidence/consumer/Cargo.toml -- --missing-cache
+Result:
+  todo8 consumer: missing-cache yields ReplayGap
+
+Command:
+  cargo run --manifest-path .omo/evidence/consumer/Cargo.toml -- --store-fails
+Result:
+  todo7 consumer: typed pre-submission storage failure aborted submission
+
+Workspace gates
+---------------
+  cargo fmt --all -- --check
+  cargo clippy --workspace --all-targets -- -D warnings
+  cargo test --workspace
+  cargo doc --workspace --no-deps
+
+Result: formatting and Clippy passed; 110 tests across 39 suites passed; docs generated.
