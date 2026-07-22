@@ -3617,7 +3617,9 @@ name = "pmkit-api"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "pmkit-store",
+ "polymarket_client_sdk_v2",
  "rust_decimal",
  "serde",
  "thiserror",
@@ -3826,6 +3828,8 @@ dependencies = [
  "pmkit-core",
  "pmkit-event",
  "pmkit-exec",
+ "pmkit-market",
+ "rust_decimal",
  "thiserror",
 ]
 

@@ -24,6 +24,7 @@ use tokio::sync::mpsc::Sender;
 
 mod binance;
 mod binance_cache;
+mod binance_history;
 
 #[cfg(test)]
 /// Test-only Binance archive cache fixtures and local HTTP server.
@@ -36,6 +37,7 @@ pub use binance::{
     parse_binance_agg_trade_live, parse_binance_vision_agg_trade_row,
 };
 pub use binance_cache::{BinanceArchiveLimits, CachePolicy, VerifiedBinanceArchiveCache};
+pub use binance_history::BinanceVisionHistory;
 
 /// An unmodified PM public-market frame plus the metadata needed to audit it.
 #[derive(Debug, Clone)]

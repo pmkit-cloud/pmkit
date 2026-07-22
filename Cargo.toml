@@ -26,6 +26,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 sha2 = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tempfile = "3"
+polymarket-client-sdk-v2 = { version = "0.6.0-canary.1", package = "polymarket_client_sdk_v2", features = ["gamma", "clob", "ws"] }
 
 [workspace.lints.rust]
 missing_debug_implementations = "deny"

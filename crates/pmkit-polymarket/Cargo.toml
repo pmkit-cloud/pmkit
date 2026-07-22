@@ -25,7 +25,7 @@ pmkit-market = { path = "../pmkit-market" }
 pmkit-run = { path = "../pmkit-run" }
 pmkit-exec = { path = "../pmkit-exec" }
 pmkit-store = { path = "../pmkit-store" }
-polymarket-client-sdk-v2 = { version = "0.6.0-canary.1", package = "polymarket_client_sdk_v2", features = ["clob", "ws"] }
+polymarket-client-sdk-v2 = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 

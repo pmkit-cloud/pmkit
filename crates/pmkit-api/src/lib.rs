@@ -1,9 +1,11 @@
 //! Versioned Polymarket chain-truth read types.
 
 mod api;
+mod gamma;
 mod types;
 
 pub use api::ChainTruthApiV1;
+pub use gamma::{GammaClient, GammaMarket};
 pub use types::{
     ActivityQuery, ChainTruthActivity, ChainTruthBalance, ChainTruthClosedPosition,
     ChainTruthPosition, ChainTruthTrade, ClosedPositionsQuery, DataOrderQuery, DataOrdersQuery,

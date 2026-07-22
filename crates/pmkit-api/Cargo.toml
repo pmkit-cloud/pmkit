@@ -14,7 +14,9 @@ categories.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+chrono = { workspace = true }
 pmkit-store = { path = "../pmkit-store" }
+polymarket-client-sdk-v2 = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
