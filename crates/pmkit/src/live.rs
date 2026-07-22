@@ -5,11 +5,11 @@ use super::{
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_book::OrderBookL2;
 use pmkit_event::{MarketEvent, SourceEnvelope, StrategyFact};
-use pmkit_exec::{ExecError, OrderId};
+use pmkit_exec::{ExecError, Executor, OrderId, PlaceOrder};
 use pmkit_market::Outcome;
 use pmkit_runtime::{LiveOrderPolicy, RuntimeConfig};
 use pmkit_spec::LiveRun;
-use pmkit_store::{OwnerScope, TapeStore};
+use pmkit_store::{CausalIdentity, OwnerScope, StoreError, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
 use std::collections::HashSet;
 
@@ -133,6 +133,48 @@ async fn store_signal(
         })
 }
 
+/// A failed order placement that must abort the live run after cleanup.
+enum PlaceFailure {
+    /// The venue outcome is unknown; the durable intent stays pending for recovery.
+    Transport(ExecError),
+    /// Durable storage failed before or after the venue call.
+    Storage(StoreError),
+}
+
+/// Places one order, routing through durable causal recording when storage is configured.
+async fn place_order(
+    store: Option<&dyn TapeStore>,
+    executor: &dyn Executor,
+    order: &PlaceOrder,
+    now_ms: i64,
+    decision: &CausalIdentity,
+    action_index: u32,
+) -> Result<Option<OrderId>, PlaceFailure> {
+    let Some(store) = store else {
+        return match executor.submit(order, now_ms).await {
+            Ok(order_id) => Ok(Some(order_id)),
+            Err(source @ ExecError::Transport { .. }) => Err(PlaceFailure::Transport(source)),
+            Err(ExecError::Rejected { .. } | ExecError::NotFound { .. }) => Ok(None),
+        };
+    };
+    let recorder = crate::causal::CausalRecorder::new(store);
+    let intent = recorder.intent(decision, action_index, order);
+    match recorder
+        .submit(&intent, || executor.submit(order, now_ms))
+        .await
+    {
+        Ok(receipt) => Ok(Some(receipt.order_id)),
+        Err(crate::causal::RecorderError::VenueRejected { .. }) => Ok(None),
+        Err(crate::causal::RecorderError::VenueUnknown { source }) => {
+            Err(PlaceFailure::Transport(source))
+        }
+        Err(
+            crate::causal::RecorderError::AcceptedButUnrecorded { source }
+            | crate::causal::RecorderError::Store(source),
+        ) => Err(PlaceFailure::Storage(source)),
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the live run owns one ordered risk, tape, storage, and shutdown lifecycle"
@@ -218,7 +260,7 @@ pub async fn drive_with_store(
                         now: LogicalTimestamp::from_millis(*timestamp_ms),
                     };
                     if let Ok(actions) = strategy.on_event(context) {
-                        for action in actions.as_slice() {
+                        for (action_index, action) in actions.as_slice().iter().enumerate() {
                             if let Action::Place(order) = action {
                                 if open_orders.len() >= max_open_orders {
                                     open_orders = reconcile_open_orders(run, runtime).await?;
@@ -238,21 +280,45 @@ pub async fn drive_with_store(
                                     rejected += 1;
                                     continue;
                                 }
-                                match executor.submit(order, *timestamp_ms).await {
-                                    Ok(order_id) => {
+                                let identity = CausalIdentity {
+                                    scope: scope.clone(),
+                                    correlation_id: format!("{market:?}:{timestamp_ms}"),
+                                    source_timestamp_ms: envelope.metadata.source_time_ms,
+                                    ingest_sequence: i64::try_from(
+                                        envelope.metadata.ingest_sequence,
+                                    )
+                                    .unwrap_or(i64::MAX),
+                                };
+                                let placement = place_order(
+                                    store,
+                                    executor.as_ref(),
+                                    order,
+                                    *timestamp_ms,
+                                    &identity,
+                                    u32::try_from(action_index).unwrap_or(u32::MAX),
+                                )
+                                .await;
+                                match placement {
+                                    Ok(Some(order_id)) => {
                                         open_orders.insert(order_id);
                                     }
-                                    Err(source @ ExecError::Transport { .. }) => {
+                                    Ok(None) => {}
+                                    Err(failure) => {
                                         reconcile_open_orders(run, runtime).await?;
                                         tape.flush(run)?;
-                                        return Err(StartError::ExecutionState {
-                                            run: run.id().clone(),
-                                            source,
+                                        return Err(match failure {
+                                            PlaceFailure::Transport(source) => {
+                                                StartError::ExecutionState {
+                                                    run: run.id().clone(),
+                                                    source,
+                                                }
+                                            }
+                                            PlaceFailure::Storage(source) => StartError::Storage {
+                                                run: run.id().clone(),
+                                                source,
+                                            },
                                         });
                                     }
-                                    Err(
-                                        ExecError::Rejected { .. } | ExecError::NotFound { .. },
-                                    ) => {}
                                 }
                             }
                         }

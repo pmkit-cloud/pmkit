@@ -11,6 +11,7 @@ use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
 use pmkit_market::Outcome;
 use pmkit_runtime::{LiveOrderPolicy, StrategyRegistration};
 use pmkit_spec::LiveRun;
+use pmkit_store::{OwnerScope, TapeStore, TursoTapeStore};
 use rust_decimal::Decimal;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -404,5 +405,43 @@ async fn live_run_cancel_all_requires_explicit_policy() -> Result<(), Box<dyn st
 
     assert_eq!(executor.cancels.load(Ordering::Relaxed), 0);
     assert_eq!(executor.cancel_all_calls.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
+async fn live_transport_failure_leaves_recoverable_pending_intent()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: a live run with durable storage and a venue whose submit is transport-uncertain.
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("pmkit-live-pending-{suffix}.db"));
+    let store = TursoTapeStore::open_local(&path).await?;
+    let run = LiveRun::new(
+        RunId::new("live-store-transport")?,
+        PortfolioId::new("alice")?,
+        Arc::new(TransportExec::default()),
+        Arc::new(LiveWithFill),
+        risk()?,
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(BuyFactory),
+    ));
+
+    // When: the run drives through the merged feed with storage configured.
+    let result = live::drive_with_store(&run, &config()?, Some(&store)).await;
+
+    // Then: it stops on transport uncertainty and one durable pending intent remains for recovery.
+    assert!(matches!(result, Err(StartError::ExecutionState { .. })));
+    let scope = OwnerScope::new(
+        PortfolioId::new("alice")?,
+        RunId::new("live-store-transport")?,
+    );
+    let pending = store.read_pending_intents(&scope).await?;
+    assert_eq!(pending.len(), 1);
+    store.delete_database()?;
     Ok(())
 }
