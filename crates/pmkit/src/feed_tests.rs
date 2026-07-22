@@ -68,7 +68,7 @@ async fn deterministic_source_merge_matches_all_modes() -> Result<(), Box<dyn st
         ),
     ];
     let mut expected = None;
-    for mode in [FeedMode::Backtest, FeedMode::Paper, FeedMode::LiveFixture] {
+    for mode in [FeedMode::Backtest, FeedMode::Paper, FeedMode::Live] {
         let facts = MergedFeed::from_fixture(mode, fixture.clone(), Some(20))
             .collect()
             .await?;

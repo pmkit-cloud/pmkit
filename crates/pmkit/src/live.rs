@@ -2,6 +2,7 @@ use super::{
     LiveReport, StartError, StrategyInstance, instantiate_strategies,
     store_signal as persist_signal,
 };
+use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_book::OrderBookL2;
 use pmkit_event::{MarketEvent, SourceEnvelope, StrategyFact};
 use pmkit_exec::{ExecError, OrderId};
@@ -85,35 +86,23 @@ async fn shutdown_orders(
     }
 }
 
-fn subscribe(
-    run: &LiveRun,
-    strategies: &[StrategyInstance],
-) -> tokio::sync::mpsc::Receiver<pmkit_data::SourceSignal> {
-    let (event_tx, event_rx) = tokio::sync::mpsc::channel(1024);
+fn sources(run: &LiveRun, strategies: &[StrategyInstance]) -> Vec<SourceTaskDefinition> {
     let mut subscribed = HashSet::new();
+    let mut sources = Vec::new();
     for (market, _) in strategies {
         if !subscribed.insert(market.clone()) {
             continue;
         }
         for outcome in [Outcome::Up, Outcome::Down] {
             let source = run.market_data().clone();
-            let sink = event_tx.clone();
             let market = market.clone();
-            tokio::spawn(async move { source.subscribe(market, outcome, sink).await });
+            let name = format!("pm:{market:?}:{outcome:?}");
+            sources.push(SourceTaskDefinition::new(name, move |sink| async move {
+                source.subscribe(market, outcome, sink).await
+            }));
         }
     }
-    drop(event_tx);
-    event_rx
-}
-
-fn market_event(signal: pmkit_data::SourceSignal) -> Option<MarketEvent> {
-    let pmkit_data::SourceSignal::Data(envelope) = signal else {
-        return None;
-    };
-    let SourceEnvelope::PmMarket(envelope) = *envelope else {
-        return None;
-    };
-    Some(envelope.fact)
+    sources
 }
 
 fn report(run: &LiveRun, counts: [usize; 3]) -> LiveReport {
@@ -158,19 +147,44 @@ pub async fn drive_with_store(
     let limits = run.risk().clone();
     let mut open_orders = initial_open_orders(run, runtime).await?;
     let max_open_orders = usize::try_from(limits.max_open_orders.get()).unwrap_or(usize::MAX);
-    let mut event_rx = subscribe(run, &strategies);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1024);
+    let feed = MergedFeed::from_tasks(FeedMode::Live, sources(run, &strategies), None);
+    let merge = tokio::spawn(async move { feed.forward(event_tx).await });
     let mut tape = LiveTape::open(run, runtime)?;
     let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
+    if let Some(store) = store {
+        store
+            .read_pending_intents(&scope)
+            .await
+            .map_err(|source| StartError::Storage {
+                run: run.id().clone(),
+                source,
+            })?;
+        store
+            .read_unknown_intents(&scope)
+            .await
+            .map_err(|source| StartError::Storage {
+                run: run.id().clone(),
+                source,
+            })?;
+    }
 
     let mut risk_state = LiveRiskState::default();
     let mut events_processed = 0_usize;
     let mut fills = 0_usize;
     let mut rejected = 0_usize;
-    while let Some(signal) = event_rx.recv().await {
-        store_signal(run, store, &scope, &signal).await?;
-        let Some(event) = market_event(signal) else {
+    while let Some(merged) = event_rx.recv().await {
+        store_signal(
+            run,
+            store,
+            &scope,
+            &pmkit_data::SourceSignal::Data(Box::new(merged.source.clone())),
+        )
+        .await?;
+        let SourceEnvelope::PmMarket(envelope) = merged.source else {
             continue;
         };
+        let event = envelope.fact;
         tape.append(run, &event)?;
         events_processed += 1;
         match &event {
@@ -252,6 +266,19 @@ pub async fn drive_with_store(
             _ => {}
         }
     }
+
+    merge
+        .await
+        .map_err(|error| StartError::Source {
+            run: run.id().clone(),
+            source: pmkit_data::DataSourceError::ReplayGap {
+                message: format!("merged feed task failed: {error}"),
+            },
+        })?
+        .map_err(|source| StartError::Source {
+            run: run.id().clone(),
+            source,
+        })?;
 
     finish(
         run,

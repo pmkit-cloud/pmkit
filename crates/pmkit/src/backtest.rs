@@ -2,6 +2,7 @@ use super::{
     BacktestReport, StartError, StrategyInstance, absorb_fills, instantiate_strategies,
     store_signal,
 };
+use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_book::OrderBookL2;
 use pmkit_data::ReplayQuery;
 use pmkit_event::{MarketEvent, SourceEnvelope, StrategyFact};
@@ -29,7 +30,14 @@ pub async fn drive(
         evidence: run.replay().evidence(),
         retrieval_wait: run.replay().retrieval_wait(),
     };
-    let replay = tokio::spawn(async move { source.replay(query, tx).await });
+    let feed = MergedFeed::from_tasks(
+        FeedMode::Backtest,
+        vec![SourceTaskDefinition::new("pm", move |sink| async move {
+            source.replay(query, sink).await
+        })],
+        Some(run.replay().to().timestamp_millis()),
+    );
+    let replay = tokio::spawn(async move { feed.forward(tx).await });
 
     // ponytail: fee category fixed to Crypto; positions tracked from fills.
     let mut sim = SimEngine::new("bt", 0, MarketCategory::Crypto);
@@ -38,17 +46,18 @@ pub async fn drive(
     let mut fills = 0_usize;
     let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
 
-    while let Some(signal) = rx.recv().await {
-        store_signal(store, &scope, &signal)
-            .await
-            .map_err(|source| StartError::Storage {
-                run: run.id().clone(),
-                source,
-            })?;
-        let SourceEnvelope::PmMarket(envelope) = (match signal {
-            pmkit_data::SourceSignal::Data(envelope) => *envelope,
-            pmkit_data::SourceSignal::Watermark(_) | pmkit_data::SourceSignal::Eof => continue,
-        }) else {
+    while let Some(merged) = rx.recv().await {
+        store_signal(
+            store,
+            &scope,
+            &pmkit_data::SourceSignal::Data(Box::new(merged.source.clone())),
+        )
+        .await
+        .map_err(|source| StartError::Storage {
+            run: run.id().clone(),
+            source,
+        })?;
+        let SourceEnvelope::PmMarket(envelope) = merged.source else {
             continue;
         };
         let event = envelope.fact;
@@ -81,7 +90,18 @@ pub async fn drive(
         }
     }
 
-    let _ = replay.await;
+    replay
+        .await
+        .map_err(|error| StartError::Source {
+            run: run.id().clone(),
+            source: pmkit_data::DataSourceError::ReplayGap {
+                message: format!("merged feed task failed: {error}"),
+            },
+        })?
+        .map_err(|source| StartError::Source {
+            run: run.id().clone(),
+            source,
+        })?;
     Ok(BacktestReport {
         run: run.id().clone(),
         events_processed,

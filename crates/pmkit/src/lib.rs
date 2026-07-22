@@ -86,6 +86,14 @@ pub enum RunReport {
 /// A failure raised while starting runs.
 #[derive(Debug, Error)]
 pub enum StartError {
+    /// A required market-data source could not complete a safe lifecycle.
+    #[error("data source failed for run {run}: {source}")]
+    Source {
+        /// The affected run.
+        run: RunId,
+        /// The fail-closed source error.
+        source: pmkit_data::DataSourceError,
+    },
     /// Two runs shared the same [`RunId`].
     #[error("duplicate run id: {0}")]
     DuplicateRunId(RunId),

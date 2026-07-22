@@ -213,6 +213,12 @@ impl LiveDataSource for LiveWithFill {
             .await
             .map_err(|_| DataSourceError::SinkClosed)?;
         }
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
         Ok(())
     }
 }

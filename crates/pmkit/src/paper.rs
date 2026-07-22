@@ -1,4 +1,5 @@
 use super::{PaperReport, StartError, absorb_fills, instantiate_strategies, store_signal};
+use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_book::OrderBookL2;
 use pmkit_event::{MarketEvent, SourceEnvelope, StrategyFact};
 use pmkit_exec::Executor;
@@ -29,18 +30,22 @@ pub async fn drive(
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1024);
     let mut subscribed = HashSet::new();
+    let mut sources = Vec::new();
     for (market, _) in &strategies {
         if !subscribed.insert(market.clone()) {
             continue;
         }
         for outcome in [Outcome::Up, Outcome::Down] {
             let source = run.market_data().clone();
-            let sink = event_tx.clone();
             let market = market.clone();
-            tokio::spawn(async move { source.subscribe(market, outcome, sink).await });
+            let name = format!("pm:{market:?}:{outcome:?}");
+            sources.push(SourceTaskDefinition::new(name, move |sink| async move {
+                source.subscribe(market, outcome, sink).await
+            }));
         }
     }
-    drop(event_tx);
+    let feed = MergedFeed::from_tasks(FeedMode::Paper, sources, None);
+    let merge = tokio::spawn(async move { feed.forward(event_tx).await });
 
     // ponytail: fee category fixed to Crypto; positions tracked; fill buffer bounded at 1024.
     let mut positions = Vec::new();
@@ -48,17 +53,18 @@ pub async fn drive(
     let mut fills = 0_usize;
     let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
 
-    while let Some(signal) = event_rx.recv().await {
-        store_signal(store, &scope, &signal)
-            .await
-            .map_err(|source| StartError::Storage {
-                run: run.id().clone(),
-                source,
-            })?;
-        let SourceEnvelope::PmMarket(envelope) = (match signal {
-            pmkit_data::SourceSignal::Data(envelope) => *envelope,
-            pmkit_data::SourceSignal::Watermark(_) | pmkit_data::SourceSignal::Eof => continue,
-        }) else {
+    while let Some(merged) = event_rx.recv().await {
+        store_signal(
+            store,
+            &scope,
+            &pmkit_data::SourceSignal::Data(Box::new(merged.source.clone())),
+        )
+        .await
+        .map_err(|source| StartError::Storage {
+            run: run.id().clone(),
+            source,
+        })?;
+        let SourceEnvelope::PmMarket(envelope) = merged.source else {
             continue;
         };
         let event = envelope.fact;
@@ -102,6 +108,18 @@ pub async fn drive(
             }
         }
     }
+    merge
+        .await
+        .map_err(|error| StartError::Source {
+            run: run.id().clone(),
+            source: pmkit_data::DataSourceError::ReplayGap {
+                message: format!("merged feed task failed: {error}"),
+            },
+        })?
+        .map_err(|source| StartError::Source {
+            run: run.id().clone(),
+            source,
+        })?;
     fills += absorb_fills(&drain_fills(&mut fill_rx), &mut positions);
 
     Ok(PaperReport {

@@ -264,9 +264,6 @@ impl<'a, S: TapeStore + ?Sized> CausalRecorder<'a, S> {
                 Err(RecorderError::VenueRejected { source })
             }
             Err(source @ ExecError::Transport { .. }) => {
-                self.store
-                    .transition_intent(&intent.identity, IntentOutcome::Unknown)
-                    .await?;
                 Err(RecorderError::VenueUnknown { source })
             }
         }
