@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pmkit-core", "crates/pmkit-market", "crates/pmkit-math", "crates/pmkit-book", "crates/pmkit-exec", "crates/pmkit-polymarket", "crates/pmkit-strategy", "crates/pmkit-money", "crates/pmkit-runtime", "crates/pmkit-run", "crates/pmkit-event", "crates/pmkit-data", "crates/pmkit-sim", "crates/pmkit-paper", "crates/pmkit-spec", "crates/pmkit", "crates/pmkit-tape", "crates/pmkit-manifest", "crates/pmkit-store"]
+members = ["crates/pmkit-core", "crates/pmkit-market", "crates/pmkit-math", "crates/pmkit-book", "crates/pmkit-exec", "crates/pmkit-polymarket", "crates/pmkit-strategy", "crates/pmkit-money", "crates/pmkit-runtime", "crates/pmkit-run", "crates/pmkit-event", "crates/pmkit-data", "crates/pmkit-sim", "crates/pmkit-paper", "crates/pmkit-spec", "crates/pmkit", "crates/pmkit-tape", "crates/pmkit-manifest", "crates/pmkit-store", "crates/pmkit-api"]
 resolver = "3"
 
 [workspace.package]

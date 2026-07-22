@@ -3612,6 +3612,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmkit-api"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pmkit-store",
+ "rust_decimal",
+ "serde",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "pmkit-book"
 version = "0.1.0"
 dependencies = [
@@ -3792,6 +3804,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "pmkit-core",
+ "rust_decimal",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror",

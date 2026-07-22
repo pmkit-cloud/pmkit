@@ -21,7 +21,7 @@ use crate::{
 /// A local Turso-backed implementation of [`TapeStore`].
 pub struct TursoTapeStore {
     _database: turso::Database,
-    connection: turso::Connection,
+    pub(crate) connection: turso::Connection,
     path: PathBuf,
 }
 

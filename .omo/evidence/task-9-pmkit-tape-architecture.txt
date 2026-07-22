@@ -1,0 +1,21 @@
+Todo 9 evidence
+
+Canonical source identity:
+(chain_id, block_number, block_hash, transaction_hash, transaction_index, log_index)
+
+Canonical reorg algorithm:
+1. A typed CanonicalLogSource returns a segment after its common ancestor checkpoint.
+2. ContractRegistry validates Polygon 137 and current configured pUSD/CTF/V2 exchange contracts.
+3. TursoTapeStore starts a transaction, deletes canonical logs after the ancestor,
+   writes the replacement parsed logs with static parameterized SQL, and updates the tip checkpoint.
+4. Wallet snapshots replay only stored canonical logs in (block, transaction, log) order.
+
+Verified focused commands:
+- cargo test -p pmkit-store wallet_reconstruction_matches_canonical_logs
+- cargo test -p pmkit-store reorg_replaces_orphaned_wallet_events
+- cargo test -p pmkit-api clob_compatible_wallet_reads_match_fixtures
+- cargo test -p pmkit-api offchain_order_is_not_reconstructible_from_chain
+
+API coverage:
+pmkit-api v1 positions, closed positions, trades, and activity use Data API offset limits.
+CLOB /data/orders and /data/order/{id} return typed NotReconstructibleFromChain.

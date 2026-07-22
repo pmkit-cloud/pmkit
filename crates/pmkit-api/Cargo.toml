@@ -1,6 +1,6 @@
 [package]
-name = "pmkit-store"
-description = "Trait-first durable tape and strategy-decision storage for PMKit."
+name = "pmkit-api"
+description = "Versioned chain-truth reads compatible with reconstructible Polymarket data APIs."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,13 +14,10 @@ categories.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
-pmkit-core = { path = "../pmkit-core" }
+pmkit-store = { path = "../pmkit-store" }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
-sha2 = "0.10"
 thiserror = { workspace = true }
-turso = "0.7"
 
 [dev-dependencies]
 tokio = { workspace = true }

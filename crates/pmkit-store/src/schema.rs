@@ -47,6 +47,24 @@ CREATE TABLE IF NOT EXISTS durable_intents (
 );
 CREATE INDEX IF NOT EXISTS durable_intents_owner_pending
     ON durable_intents (portfolio_id, run_id, state, source_timestamp_ms, ingest_sequence);
+CREATE TABLE IF NOT EXISTS canonical_chain_logs (
+    chain_id INTEGER NOT NULL,
+    block_number INTEGER NOT NULL,
+    block_hash TEXT NOT NULL,
+    transaction_hash TEXT NOT NULL,
+    transaction_index INTEGER NOT NULL,
+    log_index INTEGER NOT NULL,
+    contract_address TEXT NOT NULL,
+    event_json TEXT NOT NULL,
+    PRIMARY KEY (chain_id, block_number, block_hash, transaction_hash, transaction_index, log_index)
+);
+CREATE INDEX IF NOT EXISTS canonical_chain_logs_order
+    ON canonical_chain_logs (chain_id, block_number, transaction_index, log_index);
+CREATE TABLE IF NOT EXISTS canonical_chain_checkpoints (
+    chain_id INTEGER PRIMARY KEY,
+    block_number INTEGER NOT NULL,
+    block_hash TEXT NOT NULL
+);
 ";
 
 pub const INSERT_ENVELOPE: &str = "
@@ -83,3 +101,27 @@ pub const TRANSITION_PENDING_INTENT: &str = "
 UPDATE durable_intents SET state = ?1
 WHERE portfolio_id = ?2 AND run_id = ?3 AND correlation_id = ?4
   AND source_timestamp_ms = ?5 AND ingest_sequence = ?6 AND state = 'pending'";
+
+pub const DELETE_CANONICAL_LOGS_AFTER: &str = "
+DELETE FROM canonical_chain_logs WHERE chain_id = ?1 AND block_number > ?2";
+
+pub const INSERT_CANONICAL_LOG: &str = "
+INSERT INTO canonical_chain_logs (
+    chain_id, block_number, block_hash, transaction_hash, transaction_index, log_index,
+    contract_address, event_json
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+ON CONFLICT DO NOTHING";
+
+pub const UPSERT_CANONICAL_CHECKPOINT: &str = "
+INSERT INTO canonical_chain_checkpoints (chain_id, block_number, block_hash)
+VALUES (?1, ?2, ?3)
+ON CONFLICT(chain_id) DO UPDATE SET block_number = excluded.block_number, block_hash = excluded.block_hash";
+
+pub const READ_CANONICAL_LOGS: &str = "
+SELECT block_number, block_hash, transaction_hash, transaction_index, log_index, contract_address, event_json
+FROM canonical_chain_logs
+WHERE chain_id = ?1 AND (?2 IS NULL OR block_number >= ?2) AND (?3 IS NULL OR block_number <= ?3)
+ORDER BY block_number, transaction_index, log_index";
+
+pub const READ_CANONICAL_CHECKPOINT: &str = "
+SELECT block_number, block_hash FROM canonical_chain_checkpoints WHERE chain_id = ?1";

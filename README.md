@@ -162,11 +162,21 @@ events are never persisted to the tape store.
   credentials in storage.
 - No Bybit or other CEX parity until a matched official archive exists.
 
-### Planned (not yet shipped)
+### Onchain wallet reconstruction
 
-- Onchain wallet reconstruction from canonical Polymarket events with
-  CLOB-compatible read APIs. Offchain-only order endpoints will return a
-  typed `NotReconstructibleFromChain` result.
+`pmkit-store` ingests parsed canonical Polygon logs through a trait-first
+source boundary. A replacement segment names its common-ancestor checkpoint;
+storage transactionally deletes later logs before persisting replacement logs
+and rebuilding wallet balances, outcome-token positions, settlement, fills,
+and activity. The registry accepts only Polygon (137), the current pUSD, CTF,
+and V2 exchange contracts shown in its explicit configuration; historical V1
+exchange addresses require opt-in configuration for a backfill.
+
+`pmkit-api` exposes versioned, chain-truth positions, closed positions, trades,
+and activity with their documented offset limits. It does not expose live
+valuation, display metadata, user profiles, or signed-order lifecycle. CLOB
+`/data/orders` and `/data/order/{id}` return typed
+`NotReconstructibleFromChain` results rather than fabricated data.
 
 ## Building
 

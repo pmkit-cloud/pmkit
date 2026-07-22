@@ -21,15 +21,34 @@ use pmkit_core::{PortfolioId, RunId};
 use serde_json::Value;
 use thiserror::Error;
 
+mod chain;
+mod chain_store;
 mod integrity;
 mod local_files;
+mod log;
 mod schema;
+mod source;
 mod turso_store;
+mod wallet;
+mod wallet_reducer;
 
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod chain_tests;
+
+pub use chain::{Address, AddressError, ChainId, ContractRegistry, LegacyV1Contracts};
+pub use chain_store::CanonicalLogStore;
+pub use log::{
+    CanonicalChainLog, CanonicalLogIdentity, CanonicalLogSegment, ChainCheckpoint, ChainEvent,
+    OutcomeTokenAmount,
+};
+pub use source::{CanonicalLogSource, ChainSourceError, FixtureCanonicalLogSource};
 pub use turso_store::TursoTapeStore;
+pub use wallet::{
+    WalletActivity, WalletActivityKind, WalletPosition, WalletQuery, WalletSnapshot, WalletTrade,
+};
 
 /// Failure raised while recording or reading storage streams.
 #[derive(Debug, Error)]
@@ -55,6 +74,18 @@ pub enum StoreError {
     /// A requested page size exceeded `SQLite`'s signed limit.
     #[error("requested page size exceeds SQLite's signed limit")]
     LimitTooLarge,
+    /// A log belongs to an unsupported chain or contract registry entry.
+    #[error("canonical log is outside the configured Polygon contract registry")]
+    UnsupportedCanonicalLog,
+    /// A canonical log could not be decoded from durable storage.
+    #[error("canonical log could not be decoded: {message}")]
+    CanonicalLogDecode {
+        /// Serialization detail from the durable record.
+        message: String,
+    },
+    /// A canonical segment contains an invalid checkpoint relationship.
+    #[error("canonical segment does not begin after its common ancestor")]
+    InvalidCanonicalSegment,
 }
 
 impl From<turso::Error> for StoreError {
