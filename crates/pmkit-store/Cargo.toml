@@ -15,17 +15,12 @@ categories.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 pmkit-core = { path = "../pmkit-core" }
-pmkit-book = { path = "../pmkit-book" }
-pmkit-event = { path = "../pmkit-event" }
-pmkit-exec = { path = "../pmkit-exec" }
-pmkit-strategy = { path = "../pmkit-strategy" }
-pmkit-tape = { path = "../pmkit-tape" }
 serde_json = { workspace = true }
+sha2 = "0.10"
 thiserror = { workspace = true }
 turso = "0.7"
 
 [dev-dependencies]
-pmkit-market = { path = "../pmkit-market" }
 tokio = { workspace = true }
 
 [lints]

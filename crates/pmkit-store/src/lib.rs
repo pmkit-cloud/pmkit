@@ -1,15 +1,19 @@
-//! Durable market, user, and strategy-decision streams for `PMKit`.
+//! Durable PM envelopes and causal decisions for `PMKit`.
 
 use std::num::NonZeroUsize;
 
 use async_trait::async_trait;
-use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
-use pmkit_event::{CexReferenceEnvelope, PmAccountEnvelope, PmMarketEnvelope};
-use pmkit_strategy::Actions;
+use pmkit_core::{PortfolioId, RunId};
 use serde_json::Value;
 use thiserror::Error;
 
+mod integrity;
+mod local_files;
+mod schema;
 mod turso_store;
+
+#[cfg(test)]
+mod tests;
 
 pub use turso_store::TursoTapeStore;
 
@@ -22,9 +26,18 @@ pub enum StoreError {
         /// Storage-specific detail.
         message: String,
     },
-    /// A stored JSON payload was invalid.
-    #[error("stored JSON was invalid: {0}")]
-    Json(#[from] serde_json::Error),
+    /// A source identity already exists in its owner scope.
+    #[error("source identity already exists")]
+    DuplicateSourceIdentity,
+    /// A causal decision or intent identity already exists.
+    #[error("causal identity already exists")]
+    DuplicateCausalIdentity,
+    /// A cursor belongs to a different owner scope.
+    #[error("replay cursor belongs to another owner scope")]
+    ScopeMismatch,
+    /// No pending intent can transition for the supplied identity.
+    #[error("pending intent was not found")]
+    PendingIntentNotFound,
     /// A requested page size exceeded `SQLite`'s signed limit.
     #[error("requested page size exceeds SQLite's signed limit")]
     LimitTooLarge,
@@ -38,78 +51,179 @@ impl From<turso::Error> for StoreError {
     }
 }
 
-/// An event read back from a tape stream.
+/// The portfolio/run boundary that owns durable PM records.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredEvent {
-    /// The event's source timestamp in milliseconds.
-    pub timestamp_ms: i64,
-    /// The portable event payload.
-    pub payload: Value,
+pub struct OwnerScope {
+    /// The portfolio that owns the records.
+    pub portfolio_id: PortfolioId,
+    /// The run that owns the records.
+    pub run_id: RunId,
 }
 
-/// A strategy decision made for one market event.
-#[derive(Debug, Clone)]
-pub struct StrategyDecision {
-    /// The portfolio that owns this decision stream.
-    pub portfolio: PortfolioId,
-    /// The owning run.
-    pub run: RunId,
-    /// The strategy making the decision.
-    pub strategy: StrategyId,
-    /// The exact market the decision addresses.
-    pub market: MarketId,
-    /// The decision timestamp in milliseconds.
-    pub timestamp_ms: i64,
-    /// The strategy's requested actions before runtime validation.
-    pub actions: Actions,
-}
-
-impl StrategyDecision {
-    /// Creates a decision record from a strategy's returned actions.
+impl OwnerScope {
+    /// Creates an owner scope from its portfolio and run identifiers.
     #[must_use]
-    pub const fn new(
-        portfolio: PortfolioId,
-        run: RunId,
-        strategy: StrategyId,
-        market: MarketId,
-        timestamp_ms: i64,
-        actions: Actions,
-    ) -> Self {
+    pub const fn new(portfolio_id: PortfolioId, run_id: RunId) -> Self {
         Self {
-            portfolio,
-            run,
-            strategy,
-            market,
-            timestamp_ms,
-            actions,
+            portfolio_id,
+            run_id,
         }
     }
 }
 
-/// A durable recorder for the three `PMKit` streams.
-///
-/// One instance represents one operator's local storage. The trait does not
-/// create a platform account or transmit SDK-user data to a paid API.
+/// A cursor in deterministic PM source order within one owner scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayCursor {
+    /// The owner scope whose rows this cursor may continue.
+    pub scope: OwnerScope,
+    /// The source timestamp of the last replayed record.
+    pub source_timestamp_ms: i64,
+    /// The ingest sequence of the last replayed record.
+    pub ingest_sequence: i64,
+}
+
+impl ReplayCursor {
+    /// Creates a cursor from the final record on a replay page.
+    #[must_use]
+    pub const fn new(scope: OwnerScope, source_timestamp_ms: i64, ingest_sequence: i64) -> Self {
+        Self {
+            scope,
+            source_timestamp_ms,
+            ingest_sequence,
+        }
+    }
+}
+
+/// A versioned PM transport frame and its normalized projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmEnvelope {
+    /// The envelope schema version.
+    pub schema_version: u16,
+    /// The portfolio/run scope that owns this frame.
+    pub scope: OwnerScope,
+    /// The PM venue identifier.
+    pub venue_id: String,
+    /// The configuration digest active while the frame was captured.
+    pub config_hash: String,
+    /// The upstream source identity.
+    pub source_id: String,
+    /// The connection identity that delivered the frame.
+    pub connection_id: String,
+    /// The upstream source timestamp in milliseconds.
+    pub source_timestamp_ms: i64,
+    /// The local receipt timestamp in milliseconds.
+    pub receipt_timestamp_ms: i64,
+    /// The monotonically assigned ingest sequence.
+    pub ingest_sequence: i64,
+    /// The byte-identical PM transport frame.
+    pub raw_frame: Vec<u8>,
+    /// The normalized PM projection derived from the frame.
+    pub normalized: Value,
+}
+
+/// The identity shared by causal decisions and durable intents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CausalIdentity {
+    /// The portfolio/run scope that owns the causal record.
+    pub scope: OwnerScope,
+    /// The caller-provided correlation identifier.
+    pub correlation_id: String,
+    /// The source timestamp that caused the record.
+    pub source_timestamp_ms: i64,
+    /// The ingest sequence that caused the record.
+    pub ingest_sequence: i64,
+}
+
+/// A normalized strategy decision tied to one causal identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CausalDecision {
+    /// The identity of the decision.
+    pub identity: CausalIdentity,
+    /// The normalized decision payload.
+    pub payload: Value,
+}
+
+/// A terminal outcome for a previously durable pending intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntentOutcome {
+    /// The external venue accepted the intent.
+    Accepted,
+    /// The external venue rejected the intent.
+    Rejected,
+    /// Submission may have happened but has not been reconciled.
+    Unknown,
+}
+
+/// A typed reason why one replay row cannot produce a PM envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayGapReason {
+    /// The stored record uses an unsupported envelope schema version.
+    UnsupportedSchemaVersion,
+    /// The raw frame no longer matches its stored digest.
+    RawIntegrityMismatch,
+    /// The normalized projection is invalid or no longer matches its digest.
+    NormalizedIntegrityMismatch,
+}
+
+/// A replayable record whose contents are missing or corrupt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayGap {
+    /// The scope that owns the missing or corrupt record.
+    pub scope: OwnerScope,
+    /// The source timestamp of the affected record.
+    pub source_timestamp_ms: i64,
+    /// The ingest sequence of the affected record.
+    pub ingest_sequence: i64,
+    /// The typed reason replay cannot emit a normalized fact.
+    pub reason: ReplayGapReason,
+}
+
+/// One item in a scoped PM replay page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayItem {
+    /// A lossless envelope that passed versioned integrity checks.
+    Envelope(PmEnvelope),
+    /// A typed gap for a missing or corrupt stored envelope.
+    Gap(ReplayGap),
+}
+
+/// A deterministic page of scoped PM replay records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayPage {
+    /// The ordered replay records.
+    pub items: Vec<ReplayItem>,
+    /// The cursor to continue after the final replay record.
+    pub next_cursor: Option<ReplayCursor>,
+}
+
+/// A durable PM envelope and causal-decision store.
 #[async_trait]
 pub trait TapeStore: Send + Sync {
-    /// Appends an event to the shared market tape.
-    async fn append_market(&self, envelope: &PmMarketEnvelope) -> Result<(), StoreError>;
+    /// Stores one lossless PM envelope or rejects a duplicate source identity.
+    async fn store_envelope(&self, envelope: &PmEnvelope) -> Result<(), StoreError>;
 
-    /// Appends an authenticated-account frame to the operator's local tape.
-    async fn append_account(&self, envelope: &PmAccountEnvelope) -> Result<(), StoreError>;
+    /// Reads one deterministic PM replay page in the supplied owner scope.
+    async fn read_envelopes(
+        &self,
+        scope: &OwnerScope,
+        after: Option<ReplayCursor>,
+        limit: NonZeroUsize,
+    ) -> Result<ReplayPage, StoreError>;
 
-    /// Appends a CEX reference frame to the shared reference tape.
-    async fn append_reference(&self, envelope: &CexReferenceEnvelope) -> Result<(), StoreError>;
+    /// Stores one normalized causal decision exactly once.
+    async fn store_decision(&self, decision: &CausalDecision) -> Result<(), StoreError>;
 
-    /// Appends one strategy decision for analytics.
-    async fn append_decision(&self, decision: &StrategyDecision) -> Result<(), StoreError>;
+    /// Stores an idempotent intent in its durable pending state.
+    async fn store_intent_pending(
+        &self,
+        identity: &CausalIdentity,
+        payload: &Value,
+    ) -> Result<(), StoreError>;
 
-    /// Returns at most `limit` market events in insertion order.
-    async fn market_events(&self, limit: NonZeroUsize) -> Result<Vec<StoredEvent>, StoreError>;
-
-    /// Returns at most `limit` user events in insertion order.
-    async fn user_events(&self, limit: NonZeroUsize) -> Result<Vec<StoredEvent>, StoreError>;
-
-    /// Returns at most `limit` CEX reference frames in insertion order.
-    async fn reference_events(&self, limit: NonZeroUsize) -> Result<Vec<StoredEvent>, StoreError>;
+    /// Transitions one existing pending intent to a terminal outcome exactly once.
+    async fn transition_intent(
+        &self,
+        identity: &CausalIdentity,
+        outcome: IntentOutcome,
+    ) -> Result<(), StoreError>;
 }

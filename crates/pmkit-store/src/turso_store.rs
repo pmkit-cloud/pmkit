@@ -1,29 +1,28 @@
-use std::{fmt, num::NonZeroUsize, path::Path};
+use std::{
+    fmt,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+};
 
 use async_trait::async_trait;
-use pmkit_book::Side;
-use pmkit_event::{CexReferenceEnvelope, PmAccountEnvelope, PmMarketEnvelope};
-use pmkit_exec::PlaceOrder;
-use pmkit_strategy::{Action, Actions};
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use crate::{StoreError, StoredEvent, StrategyDecision, TapeStore};
-
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS market_events (id INTEGER PRIMARY KEY, timestamp_ms INTEGER NOT NULL, payload TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS market_events_timestamp ON market_events(timestamp_ms);
-CREATE TABLE IF NOT EXISTS user_events (id INTEGER PRIMARY KEY, timestamp_ms INTEGER NOT NULL, payload TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS user_events_timestamp ON user_events(timestamp_ms);
-CREATE TABLE IF NOT EXISTS reference_events (id INTEGER PRIMARY KEY, timestamp_ms INTEGER NOT NULL, payload TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS reference_events_timestamp ON reference_events(timestamp_ms);
-CREATE TABLE IF NOT EXISTS strategy_decisions (id INTEGER PRIMARY KEY, run_id TEXT NOT NULL, strategy_id TEXT NOT NULL, market_id TEXT NOT NULL, timestamp_ms INTEGER NOT NULL, payload TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS strategy_decisions_lookup ON strategy_decisions(run_id, strategy_id, timestamp_ms);
-";
+use crate::{
+    CausalDecision, CausalIdentity, IntentOutcome, OwnerScope, PmEnvelope, ReplayCursor,
+    ReplayPage, StoreError, TapeStore,
+    integrity::{decode_row, sha256_hex},
+    local_files::{remove_database, restrict_permissions},
+    schema::{
+        INSERT_DECISION, INSERT_ENVELOPE, INSERT_PENDING_INTENT, READ_ENVELOPES, SCHEMA,
+        TRANSITION_PENDING_INTENT,
+    },
+};
 
 /// A local Turso-backed implementation of [`TapeStore`].
 pub struct TursoTapeStore {
     _database: turso::Database,
     connection: turso::Connection,
+    path: PathBuf,
 }
 
 impl fmt::Debug for TursoTapeStore {
@@ -35,225 +34,206 @@ impl fmt::Debug for TursoTapeStore {
 }
 
 impl TursoTapeStore {
-    /// Opens a local Turso database file and creates `PMKit`'s append-only tables.
+    /// Opens a local Turso database and creates `PMKit`'s owner-scoped tables.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] when the database cannot be opened or migrated.
+    /// Returns [`StoreError`] when the database cannot be opened, initialized, or secured.
     pub async fn open_local(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let database = turso::Builder::new_local(&path.as_ref().to_string_lossy())
+        let path = path.as_ref().to_path_buf();
+        let database = turso::Builder::new_local(&path.to_string_lossy())
             .build()
             .await?;
         let connection = database.connect()?;
         connection.execute_batch(SCHEMA).await?;
+        restrict_permissions(&path)?;
         Ok(Self {
             _database: database,
             connection,
+            path,
         })
+    }
+
+    /// Closes and removes the local database plus `SQLite` sidecar files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when a database file cannot be removed.
+    pub fn delete_database(&self) -> Result<(), StoreError> {
+        remove_database(&self.path)
     }
 }
 
 #[async_trait]
 impl TapeStore for TursoTapeStore {
-    async fn append_market(&self, envelope: &PmMarketEnvelope) -> Result<(), StoreError> {
-        append_event(
-            &self.connection,
-            "market_events",
-            envelope.metadata.source_time_ms,
-            pmkit_tape::market_envelope_json(envelope),
-        )
-        .await
-    }
-
-    async fn append_account(&self, envelope: &PmAccountEnvelope) -> Result<(), StoreError> {
-        append_event(
-            &self.connection,
-            "user_events",
-            envelope.metadata.source_time_ms,
-            pmkit_tape::account_envelope_json(envelope),
-        )
-        .await
-    }
-
-    async fn append_reference(&self, envelope: &CexReferenceEnvelope) -> Result<(), StoreError> {
-        append_event(
-            &self.connection,
-            "reference_events",
-            envelope.metadata.source_time_ms,
-            pmkit_tape::reference_envelope_json(envelope),
-        )
-        .await
-    }
-
-    async fn append_decision(&self, decision: &StrategyDecision) -> Result<(), StoreError> {
-        self.connection.execute(
-            "INSERT INTO strategy_decisions (run_id, strategy_id, market_id, timestamp_ms, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
-            (
-                decision.run.to_string(),
-                decision.strategy.to_string(),
-                decision.market.to_string(),
-                decision.timestamp_ms,
-                serde_json::to_string(&actions_json(&decision.actions))?,
-            ),
-        ).await?;
+    async fn store_envelope(&self, envelope: &PmEnvelope) -> Result<(), StoreError> {
+        let normalized_json =
+            serde_json::to_string(&envelope.normalized).map_err(|error| json_error(&error))?;
+        let written = self
+            .connection
+            .execute(
+                INSERT_ENVELOPE,
+                (
+                    envelope.scope.portfolio_id.to_string(),
+                    envelope.scope.run_id.to_string(),
+                    envelope.source_id.as_str(),
+                    envelope.connection_id.as_str(),
+                    envelope.source_timestamp_ms,
+                    envelope.ingest_sequence,
+                    i64::from(envelope.schema_version),
+                    envelope.receipt_timestamp_ms,
+                    envelope.venue_id.as_str(),
+                    envelope.config_hash.as_str(),
+                    envelope.raw_frame.as_slice(),
+                    sha256_hex(&envelope.raw_frame),
+                    normalized_json.as_str(),
+                    sha256_hex(normalized_json.as_bytes()),
+                ),
+            )
+            .await?;
+        if written == 0 {
+            return Err(StoreError::DuplicateSourceIdentity);
+        }
         Ok(())
     }
 
-    async fn market_events(&self, limit: NonZeroUsize) -> Result<Vec<StoredEvent>, StoreError> {
-        read_events(&self.connection, "market_events", limit).await
-    }
-
-    async fn user_events(&self, limit: NonZeroUsize) -> Result<Vec<StoredEvent>, StoreError> {
-        read_events(&self.connection, "user_events", limit).await
-    }
-
-    async fn reference_events(&self, limit: NonZeroUsize) -> Result<Vec<StoredEvent>, StoreError> {
-        read_events(&self.connection, "reference_events", limit).await
-    }
-}
-
-async fn append_event(
-    connection: &turso::Connection,
-    table: &str,
-    timestamp_ms: i64,
-    payload: Value,
-) -> Result<(), StoreError> {
-    let sql = format!("INSERT INTO {table} (timestamp_ms, payload) VALUES (?1, ?2)");
-    connection
-        .execute(sql, (timestamp_ms, serde_json::to_string(&payload)?))
-        .await?;
-    Ok(())
-}
-
-async fn read_events(
-    connection: &turso::Connection,
-    table: &str,
-    limit: NonZeroUsize,
-) -> Result<Vec<StoredEvent>, StoreError> {
-    let limit = i64::try_from(limit.get()).map_err(|_| StoreError::LimitTooLarge)?;
-    let sql = format!("SELECT timestamp_ms, payload FROM {table} ORDER BY id LIMIT ?1");
-    let mut rows = connection.query(sql, (limit,)).await?;
-    let mut events = Vec::new();
-    while let Some(row) = rows.next().await? {
-        events.push(StoredEvent {
-            timestamp_ms: row.get(0)?,
-            payload: serde_json::from_str(&row.get::<String>(1)?)?,
-        });
-    }
-    Ok(events)
-}
-
-fn actions_json(actions: &Actions) -> Value {
-    Value::Array(actions.as_slice().iter().map(action_json).collect())
-}
-
-fn action_json(action: &Action) -> Value {
-    match action {
-        Action::Place(order) => json!({ "kind": "place", "order": order_json(order) }),
-        Action::Cancel(order) => json!({ "kind": "cancel", "order_id": order.0.clone() }),
-        Action::ReplaceQuotes { cancel, place } => json!({
-            "kind": "replace_quotes",
-            "cancel": cancel.iter().map(|order| order.0.clone()).collect::<Vec<_>>(),
-            "place": place.iter().map(order_json).collect::<Vec<_>>(),
-        }),
-        Action::CancelAll => json!({ "kind": "cancel_all" }),
-    }
-}
-
-fn order_json(order: &PlaceOrder) -> Value {
-    json!({
-        "outcome": order.outcome.to_string(),
-        "side": side_json(order.side),
-        "price": order.price.to_string(),
-        "qty": order.qty.to_string(),
-        "post_only": order.post_only,
-    })
-}
-
-const fn side_json(side: Side) -> &'static str {
-    match side {
-        Side::Buy => "buy",
-        Side::Sell => "sell",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::TursoTapeStore;
-    use crate::{StrategyDecision, TapeStore};
-    use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
-    use pmkit_event::{
-        CexReferenceEnvelope, CexReferenceEvent, PmAccountEnvelope, PmAccountEvent,
-        PmMarketEnvelope, StreamMetadata,
-    };
-    use pmkit_market::{Asset, Exchange};
-    use pmkit_strategy::Actions;
-    use std::num::NonZeroUsize;
-
-    #[tokio::test]
-    async fn turso_records_separated_streams() -> Result<(), Box<dyn std::error::Error>> {
-        let store = TursoTapeStore::open_local(":memory:").await?;
-        let metadata = StreamMetadata {
-            schema_version: 1,
-            source_id: "source".into(),
-            source_time_ms: 7,
-            receipt_time_ms: 8,
-            connection_id: "connection".into(),
-            ingest_sequence: 9,
+    async fn read_envelopes(
+        &self,
+        scope: &OwnerScope,
+        after: Option<ReplayCursor>,
+        limit: NonZeroUsize,
+    ) -> Result<ReplayPage, StoreError> {
+        let cursor = match after {
+            Some(cursor) if cursor.scope != *scope => return Err(StoreError::ScopeMismatch),
+            Some(cursor) => Some(cursor),
+            None => None,
         };
-        store
-            .append_market(&PmMarketEnvelope {
-                metadata: metadata.clone(),
-                fact: pmkit_event::MarketEvent::Tick { timestamp_ms: 7 },
-            })
+        let limit = i64::try_from(limit.get()).map_err(|_| StoreError::LimitTooLarge)?;
+        let cursor_timestamp = cursor.as_ref().map(|value| value.source_timestamp_ms);
+        let cursor_sequence = cursor.as_ref().map_or(0, |value| value.ingest_sequence);
+        let mut rows = self
+            .connection
+            .query(
+                READ_ENVELOPES,
+                (
+                    scope.portfolio_id.to_string(),
+                    scope.run_id.to_string(),
+                    cursor_timestamp,
+                    cursor_sequence,
+                    limit,
+                ),
+            )
             .await?;
-        store
-            .append_account(&PmAccountEnvelope {
-                portfolio: PortfolioId::new("paper")?,
-                metadata: metadata.clone(),
-                fact: PmAccountEvent::OrderAck {
-                    strategy: None,
-                    order_id: "order".into(),
-                    timestamp_ms: 7,
-                },
-            })
-            .await?;
-        store
-            .append_reference(&CexReferenceEnvelope {
-                metadata,
-                fact: CexReferenceEvent::Trade {
-                    asset: Asset::Btc,
-                    exchange: Exchange::Binance,
-                    aggregate_trade_id: 1,
-                    price: 1.into(),
-                    qty: 2.into(),
-                    is_buyer_maker: false,
-                    timestamp_ms: 7,
-                },
-            })
-            .await?;
-        store
-            .append_decision(&StrategyDecision::new(
-                PortfolioId::new("paper")?,
-                RunId::new("run")?,
-                StrategyId::new("maker")?,
-                MarketId::new("btc-5m")?,
-                7,
-                Actions::cancel_all(),
-            ))
-            .await?;
+        let mut items = Vec::new();
+        let mut next_cursor = None;
+        while let Some(row) = rows.next().await? {
+            let source_timestamp_ms = row.get(0)?;
+            let ingest_sequence = row.get(1)?;
+            next_cursor = Some(ReplayCursor::new(
+                scope.clone(),
+                source_timestamp_ms,
+                ingest_sequence,
+            ));
+            items.push(decode_row(
+                &row,
+                scope,
+                source_timestamp_ms,
+                ingest_sequence,
+            ));
+        }
+        Ok(ReplayPage { items, next_cursor })
+    }
 
-        let limit = NonZeroUsize::new(1).ok_or("nonzero limit")?;
-        assert_eq!(store.market_events(limit).await?.len(), 1);
-        assert_eq!(
-            store.user_events(limit).await?[0].payload["portfolio"],
-            "paper"
-        );
-        assert_eq!(
-            store.reference_events(limit).await?[0].payload["payload"]["kind"],
-            "reference_trade"
-        );
-        drop(store);
+    async fn store_decision(&self, decision: &CausalDecision) -> Result<(), StoreError> {
+        let written = self
+            .connection
+            .execute(
+                INSERT_DECISION,
+                causal_params(
+                    &decision.identity,
+                    serde_json::to_string(&decision.payload).map_err(|error| json_error(&error))?,
+                ),
+            )
+            .await?;
+        if written == 0 {
+            return Err(StoreError::DuplicateCausalIdentity);
+        }
         Ok(())
+    }
+
+    async fn store_intent_pending(
+        &self,
+        identity: &CausalIdentity,
+        payload: &Value,
+    ) -> Result<(), StoreError> {
+        let written = self
+            .connection
+            .execute(
+                INSERT_PENDING_INTENT,
+                causal_params(
+                    identity,
+                    serde_json::to_string(payload).map_err(|error| json_error(&error))?,
+                ),
+            )
+            .await?;
+        if written == 0 {
+            return Err(StoreError::DuplicateCausalIdentity);
+        }
+        Ok(())
+    }
+
+    async fn transition_intent(
+        &self,
+        identity: &CausalIdentity,
+        outcome: IntentOutcome,
+    ) -> Result<(), StoreError> {
+        let written = self
+            .connection
+            .execute(
+                TRANSITION_PENDING_INTENT,
+                (
+                    outcome.as_sql(),
+                    identity.scope.portfolio_id.to_string(),
+                    identity.scope.run_id.to_string(),
+                    identity.correlation_id.as_str(),
+                    identity.source_timestamp_ms,
+                    identity.ingest_sequence,
+                ),
+            )
+            .await?;
+        if written == 0 {
+            return Err(StoreError::PendingIntentNotFound);
+        }
+        Ok(())
+    }
+}
+
+impl IntentOutcome {
+    const fn as_sql(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+fn causal_params(
+    identity: &CausalIdentity,
+    payload_json: String,
+) -> (String, String, &str, i64, i64, String) {
+    (
+        identity.scope.portfolio_id.to_string(),
+        identity.scope.run_id.to_string(),
+        identity.correlation_id.as_str(),
+        identity.source_timestamp_ms,
+        identity.ingest_sequence,
+        payload_json,
+    )
+}
+
+fn json_error(error: &serde_json::Error) -> StoreError {
+    StoreError::Storage {
+        message: error.to_string(),
     }
 }

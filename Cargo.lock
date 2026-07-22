@@ -3739,14 +3739,9 @@ name = "pmkit-store"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "pmkit-book",
  "pmkit-core",
- "pmkit-event",
- "pmkit-exec",
- "pmkit-market",
- "pmkit-strategy",
- "pmkit-tape",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "turso",

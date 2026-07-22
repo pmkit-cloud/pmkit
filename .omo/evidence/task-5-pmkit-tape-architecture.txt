@@ -1,0 +1,46 @@
+Todo 5: lossless PM Turso records and scoped queries
+
+Commands and results:
+
+$ cargo fmt --all -- --check
+PASS
+
+$ cargo clippy -p pmkit-store --all-targets -- -D warnings
+PASS: no issues found
+
+$ cargo test -p pmkit-store lossless_pm_envelope_round_trip
+PASS: 1 test passed, 2 filtered out
+
+$ cargo test -p pmkit-store duplicate_or_cross_owner_read_is_rejected
+PASS: 1 test passed, 2 filtered out
+
+$ cargo test -p pmkit-store
+PASS: 3 tests passed across 2 suites
+
+$ cargo build --workspace
+PASS
+
+$ cargo test --workspace
+PASS: 98 tests passed across 39 suites
+
+$ bash /Users/yovanoc/.cache/opencode/packages/oh-my-openagent@4.18.2/node_modules/oh-my-openagent/dist/skills/programming/scripts/rust/check-no-excuse-rules.sh crates/pmkit-store/src/lib.rs crates/pmkit-store/src/schema.rs crates/pmkit-store/src/integrity.rs crates/pmkit-store/src/local_files.rs crates/pmkit-store/src/turso_store.rs crates/pmkit-store/src/tests.rs
+PASS: no-excuse rules passed for 6 files
+
+$ git diff --check
+PASS
+
+Schema and identity summary:
+- PM envelopes are scoped by `(portfolio_id, run_id)` and deduplicated by
+  `(portfolio_id, run_id, source_id, connection_id, source_timestamp_ms, ingest_sequence)`.
+- Cursor pages are static parameterized queries ordered by
+  `(source_timestamp_ms, ingest_sequence)` within an owner scope.
+- Raw frame bytes and normalized JSON each store SHA-256 digests; unsupported
+  versions or invalid digests replay as typed `ReplayGap`s.
+- Causal decisions and durable pending intents share
+  `(portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence)`.
+- Pending intents transition exactly once to accepted, rejected, or unknown.
+- Local database files are owner-only on Unix and deletion removes database,
+  WAL, and SHM files; no CEX rows or credentials are persisted.
+
+Pure Rust LOC: lib 121, schema 73, integrity 70, local_files 34,
+turso_store 213, tests 131.
