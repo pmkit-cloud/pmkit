@@ -14,11 +14,19 @@ use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 
 mod binance;
+mod binance_cache;
+
+#[cfg(test)]
+/// Test-only Binance archive cache fixtures and local HTTP server.
+pub mod binance_cache_test_support;
+#[cfg(test)]
+mod binance_cache_tests;
 
 pub use binance::{
     BinanceAggTradeParseError, CexHistorySource, binance_history_source,
     parse_binance_agg_trade_live, parse_binance_vision_agg_trade_row,
 };
+pub use binance_cache::{BinanceArchiveLimits, CachePolicy, VerifiedBinanceArchiveCache};
 
 /// An unmodified PM public-market frame plus the metadata needed to audit it.
 #[derive(Debug, Clone)]

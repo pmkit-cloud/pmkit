@@ -16,13 +16,16 @@ categories.workspace = true
 async-trait = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util"] }
 pmkit-core = { path = "../pmkit-core" }
 pmkit-market = { path = "../pmkit-market" }
 pmkit-event = { path = "../pmkit-event" }
 pmkit-run = { path = "../pmkit-run" }
 serde_json = { workspace = true }
 rust_decimal = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+zip = { workspace = true }
 
 [lints]
 workspace = true

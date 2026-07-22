@@ -1,0 +1,32 @@
+Todo 4: verified bounded Binance archive cache
+
+Commands and results:
+
+$ cargo test -p pmkit-data verified_binance_cache_replays
+PASS: verified cache downloads, SHA-256 validates, replays the Task-2 `aggTrades` row, and validates the subsequent cache hit.
+
+$ cargo test -p pmkit-data corrupt_or_oversized_archive_is_replay_gap
+PASS: corrupt and quota-oversized archives return `DataSourceError::ReplayGap`; the pre-existing verified archive remains.
+
+$ cargo test -p pmkit-data concurrent_same_key_download_creates_one_artifact
+PASS: concurrent same-key replay requests make one checksum request and one ZIP request, then retain one ZIP artifact.
+
+$ cargo fmt --all -- --check
+PASS
+
+$ cargo test --workspace
+PASS: 104 tests passed across 39 suites
+
+$ cargo clippy --workspace --all-targets -- -D warnings
+PASS
+
+$ cargo build --workspace
+PASS
+
+$ git diff --check
+PASS
+
+Contract summary:
+- `VerifiedBinanceArchiveCache` streams checksum and ZIP transfers under a transfer cap, verifies SHA-256 before atomic sidecar/ZIP renames, and parses the sole CSV entry under independent ZIP and CSV caps.
+- Cache paths are derived only from the fixed Binance symbol and date key. Per-key async locks serialize same-archive work; quota/LRU state is separately serialized and initializes from the flat local cache directory.
+- `CachePolicy::Bounded` rejects an oversized verified candidate before any quota eviction. Retrieval, checksum, ZIP, CSV, and cache failures surface as typed `DataSourceError::ReplayGap`; CEX rows are never stored in Turso.
