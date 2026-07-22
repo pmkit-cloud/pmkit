@@ -2,15 +2,23 @@ use super::{
     BacktestReport, StartError, StrategyInstance, absorb_fills, instantiate_strategies,
     store_signal,
 };
+use crate::causal::{
+    ActionRiskVerdict, CausalRecorder, CexTradeMetrics, DecisionKind, DecisionSnapshot,
+};
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_book::OrderBookL2;
 use pmkit_data::ReplayQuery;
 use pmkit_event::{MarketEvent, SourceEnvelope, StrategyFact};
 use pmkit_sim::{MarketCategory, SimEngine};
 use pmkit_spec::BacktestRun;
-use pmkit_store::{OwnerScope, TapeStore};
+use pmkit_store::{CausalIdentity, OwnerScope, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
+use rust_decimal::Decimal;
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the backtest owns one ordered replay, sim, strategy, and recording loop"
+)]
 pub async fn drive(
     run: &BacktestRun,
     store: Option<&dyn TapeStore>,
@@ -78,7 +86,7 @@ pub async fn drive(
             };
             sim.update_book(market, *outcome, book.clone());
             fills += absorb_fills(&sim.drain_fills(), &mut positions);
-            fills += run_strategies(
+            let (added, actions_placed) = run_strategies(
                 &mut strategies,
                 market,
                 *outcome,
@@ -87,6 +95,22 @@ pub async fn drive(
                 *timestamp_ms,
                 &mut sim,
             );
+            fills += added;
+            if let Some(store) = store {
+                let identity = CausalIdentity {
+                    scope: scope.clone(),
+                    correlation_id: format!("{market:?}:{timestamp_ms}"),
+                    source_timestamp_ms: envelope.metadata.source_time_ms,
+                    ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
+                        .unwrap_or(i64::MAX),
+                };
+                record_decision(store, &identity, &book, actions_placed)
+                    .await
+                    .map_err(|source| StartError::Storage {
+                        run: run.id().clone(),
+                        source,
+                    })?;
+            }
         }
     }
 
@@ -117,8 +141,9 @@ fn run_strategies(
     positions: &mut Vec<pmkit_book::Position>,
     timestamp_ms: i64,
     sim: &mut SimEngine,
-) -> usize {
+) -> (usize, u32) {
     let mut fills = 0;
+    let mut actions_placed = 0_u32;
     for (registered_market, strategy) in &mut *strategies {
         if *registered_market != *market {
             continue;
@@ -140,10 +165,41 @@ fn run_strategies(
             for action in actions.as_slice() {
                 if let Action::Place(order) = action {
                     sim.submit(order, timestamp_ms);
+                    actions_placed = actions_placed.saturating_add(1);
                 }
             }
         }
         fills += absorb_fills(&sim.drain_fills(), positions);
     }
-    fills
+    (fills, actions_placed)
+}
+
+async fn record_decision(
+    store: &dyn TapeStore,
+    identity: &CausalIdentity,
+    book: &OrderBookL2,
+    actions_placed: u32,
+) -> Result<(), pmkit_store::StoreError> {
+    let snapshot = DecisionSnapshot::from_book(
+        book,
+        CexTradeMetrics {
+            last_price: None,
+            momentum: Decimal::ZERO,
+            volume: Decimal::ZERO,
+            cvd: Decimal::ZERO,
+            vwap: None,
+        },
+    );
+    let decision = if actions_placed == 0 {
+        DecisionKind::NoAction
+    } else {
+        DecisionKind::Actions(
+            (0..actions_placed)
+                .map(ActionRiskVerdict::accepted)
+                .collect(),
+        )
+    };
+    CausalRecorder::new(store)
+        .record_evaluation(identity, &snapshot, decision)
+        .await
 }

@@ -192,13 +192,13 @@ impl<'a, S: TapeStore + ?Sized> CausalRecorder<'a, S> {
     ///
     /// # Errors
     ///
-    /// Returns [`RecorderError::Store`] when the decision cannot be persisted.
+    /// Returns [`StoreError`] when the decision cannot be persisted.
     pub async fn record_evaluation(
         &self,
         identity: &CausalIdentity,
         snapshot: &DecisionSnapshot,
         decision: DecisionKind,
-    ) -> Result<(), RecorderError> {
+    ) -> Result<(), StoreError> {
         self.store
             .store_decision(&CausalDecision {
                 identity: identity.clone(),

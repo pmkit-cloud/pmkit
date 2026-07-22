@@ -11,6 +11,7 @@ use pmkit_money::Money;
 use pmkit_run::{EvidenceRequirement, RetrievalWait};
 use pmkit_runtime::StrategyRegistration;
 use pmkit_spec::{BacktestRun, ConservativeV1Config, ReplaySpec};
+use pmkit_store::{OwnerScope, TapeStore, TursoTapeStore};
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::time::Duration;
@@ -122,5 +123,53 @@ async fn wait_for_rejects_unknown_run() -> Result<(), Box<dyn std::error::Error>
     let result = app.wait_for(unknown.clone()).await;
 
     assert!(matches!(result, Err(RuntimeError::UnknownRun(run)) if run == unknown));
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
+async fn backtest_records_one_decision_per_book_event() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: a store-backed backtest over two scripted book events.
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("pmkit-bt-decisions-{suffix}.db"));
+    let store = Arc::new(TursoTapeStore::open_local(&path).await?);
+    let replay = ReplaySpec::new(
+        Arc::new(ScriptedHistory { ticks: vec![1, 2] }),
+        "2026-01-01T00:00:00Z".parse()?,
+        "2026-02-01T00:00:00Z".parse()?,
+        EvidenceRequirement::CorroboratedOnly,
+        RetrievalWait::ReturnPending,
+    );
+    let run = BacktestRun::new(
+        RunId::new("bt-rec")?,
+        PortfolioId::new("research")?,
+        replay,
+        Money::usdc(1_000),
+        risk()?,
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(BuyFactory),
+    ));
+
+    // When: the engine drives the backtest with durable storage configured.
+    Pmkit::builder(config()?)
+        .storage(store.clone())
+        .run(run)
+        .start()
+        .await?;
+
+    // Then: exactly one causal decision is recorded per book event, owner-scoped.
+    let scope = OwnerScope::new(PortfolioId::new("research")?, RunId::new("bt-rec")?);
+    let decisions = store.read_decisions(&scope).await?;
+    assert_eq!(decisions.len(), 2);
+    drop(store);
+    let _ = std::fs::remove_file(&path);
     Ok(())
 }
