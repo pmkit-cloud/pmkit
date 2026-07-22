@@ -305,3 +305,49 @@ async fn pending_and_unknown_intents_are_enumerated() -> Result<(), Box<dyn std:
     assert!(!path.exists());
     Ok(())
 }
+
+#[tokio::test]
+async fn decisions_are_read_in_canonical_order_and_owner_scoped()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: two decisions stored out of order in one owner scope.
+    let path = database_path("decisions")?;
+    let scope = owner_scope("paper")?;
+    let store = TursoTapeStore::open_local(&path).await?;
+    let later = CausalIdentity {
+        scope: scope.clone(),
+        correlation_id: "b".into(),
+        source_timestamp_ms: 2_000,
+        ingest_sequence: 2,
+    };
+    let earlier = CausalIdentity {
+        scope: scope.clone(),
+        correlation_id: "a".into(),
+        source_timestamp_ms: 1_000,
+        ingest_sequence: 1,
+    };
+    store
+        .store_decision(&CausalDecision {
+            identity: later,
+            payload: json!({"n": 2}),
+        })
+        .await?;
+    store
+        .store_decision(&CausalDecision {
+            identity: earlier,
+            payload: json!({"n": 1}),
+        })
+        .await?;
+
+    // When: decisions are read for the owner scope and a foreign scope.
+    let decisions = store.read_decisions(&scope).await?;
+    let foreign = store.read_decisions(&owner_scope("other")?).await?;
+
+    // Then: they come back in canonical order and never cross owner scopes.
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions[0].identity.correlation_id, "a");
+    assert_eq!(decisions[1].identity.correlation_id, "b");
+    assert!(foreign.is_empty());
+    store.delete_database()?;
+    assert!(!path.exists());
+    Ok(())
+}

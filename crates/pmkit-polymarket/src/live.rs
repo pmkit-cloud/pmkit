@@ -619,5 +619,14 @@ mod tests {
                 message: "fixture failure".into(),
             })
         }
+
+        async fn read_decisions(
+            &self,
+            _scope: &OwnerScope,
+        ) -> Result<Vec<pmkit_store::CausalDecision>, StoreError> {
+            Err(StoreError::Storage {
+                message: "fixture failure".into(),
+            })
+        }
     }
 }

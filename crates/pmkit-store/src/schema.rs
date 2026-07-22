@@ -147,3 +147,9 @@ SELECT portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequenc
 FROM durable_intents
 WHERE portfolio_id = ?1 AND run_id = ?2 AND state = 'unknown'
 ORDER BY source_timestamp_ms, ingest_sequence";
+
+pub const READ_DECISIONS: &str = "
+SELECT portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence, payload_json
+FROM causal_decisions
+WHERE portfolio_id = ?1 AND run_id = ?2
+ORDER BY source_timestamp_ms, ingest_sequence";

@@ -304,4 +304,7 @@ pub trait TapeStore: Send + Sync {
         &self,
         scope: &OwnerScope,
     ) -> Result<Vec<DurableIntent>, StoreError>;
+
+    /// Lists causal decisions recorded for one owner scope in canonical order.
+    async fn read_decisions(&self, scope: &OwnerScope) -> Result<Vec<CausalDecision>, StoreError>;
 }

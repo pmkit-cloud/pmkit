@@ -13,7 +13,7 @@ use crate::{
     integrity::{decode_row, sha256_hex},
     local_files::{remove_database, restrict_permissions},
     schema::{
-        INSERT_DECISION, INSERT_ENVELOPE, INSERT_PENDING_INTENT, READ_ENVELOPES,
+        INSERT_DECISION, INSERT_ENVELOPE, INSERT_PENDING_INTENT, READ_DECISIONS, READ_ENVELOPES,
         READ_PENDING_INTENTS, READ_UNKNOWN_INTENTS, SCHEMA, TRANSITION_PENDING_INTENT,
     },
 };
@@ -244,6 +244,42 @@ impl TapeStore for TursoTapeStore {
         scope: &OwnerScope,
     ) -> Result<Vec<DurableIntent>, StoreError> {
         read_intents_by_state(self, scope, READ_UNKNOWN_INTENTS).await
+    }
+
+    async fn read_decisions(&self, scope: &OwnerScope) -> Result<Vec<CausalDecision>, StoreError> {
+        let mut rows = self
+            .connection
+            .query(
+                READ_DECISIONS,
+                (scope.portfolio_id.to_string(), scope.run_id.to_string()),
+            )
+            .await?;
+        let mut decisions = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let portfolio_id: String = row.get(0)?;
+            let run_id: String = row.get(1)?;
+            let portfolio_id =
+                PortfolioId::new(portfolio_id).map_err(|error| StoreError::Storage {
+                    message: format!("invalid portfolio id in decision: {error}"),
+                })?;
+            let run_id = RunId::new(run_id).map_err(|error| StoreError::Storage {
+                message: format!("invalid run id in decision: {error}"),
+            })?;
+            let correlation_id: String = row.get(2)?;
+            let source_timestamp_ms: i64 = row.get(3)?;
+            let ingest_sequence: i64 = row.get(4)?;
+            let payload_json: String = row.get(5)?;
+            decisions.push(CausalDecision {
+                identity: CausalIdentity {
+                    scope: OwnerScope::new(portfolio_id, run_id),
+                    correlation_id,
+                    source_timestamp_ms,
+                    ingest_sequence,
+                },
+                payload: serde_json::from_str(&payload_json).map_err(|error| json_error(&error))?,
+            });
+        }
+        Ok(decisions)
     }
 }
 

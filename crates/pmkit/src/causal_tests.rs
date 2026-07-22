@@ -295,6 +295,13 @@ impl TapeStore for FailingStore {
     ) -> Result<Vec<pmkit_store::DurableIntent>, StoreError> {
         self.inner.read_unknown_intents(scope).await
     }
+
+    async fn read_decisions(
+        &self,
+        scope: &OwnerScope,
+    ) -> Result<Vec<pmkit_store::CausalDecision>, StoreError> {
+        self.inner.read_decisions(scope).await
+    }
 }
 
 #[tokio::test]
