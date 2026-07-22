@@ -7,7 +7,7 @@ use pmkit_market::Outcome;
 use pmkit_paper::PaperExecutor;
 use pmkit_sim::MarketCategory;
 use pmkit_spec::PaperRun;
-use pmkit_store::{OwnerScope, TapeStore};
+use pmkit_store::{CausalIdentity, OwnerScope, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
 use std::collections::HashSet;
 
@@ -19,6 +19,10 @@ fn drain_fills(rx: &mut tokio::sync::mpsc::Receiver<MarketEvent>) -> Vec<MarketE
     fills
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the paper run owns one ordered feed, executor, strategy, and recording loop"
+)]
 pub async fn drive(
     run: &PaperRun,
     store: Option<&dyn TapeStore>,
@@ -86,6 +90,7 @@ pub async fn drive(
             let fact = StrategyFact::Market(event.clone());
             let _ = paper.update_book(market, *outcome, book.clone()).await;
             fills += absorb_fills(&drain_fills(&mut fill_rx), &mut positions);
+            let mut actions_placed = 0_u32;
             for (registered_market, strategy) in &mut *strategies {
                 if *registered_market != *market {
                     continue;
@@ -101,10 +106,26 @@ pub async fn drive(
                     for action in actions.as_slice() {
                         if let Action::Place(order) = action {
                             let _ = paper.submit(order, *timestamp_ms).await;
+                            actions_placed = actions_placed.saturating_add(1);
                         }
                     }
                 }
                 fills += absorb_fills(&drain_fills(&mut fill_rx), &mut positions);
+            }
+            if let Some(store) = store {
+                let identity = CausalIdentity {
+                    scope: scope.clone(),
+                    correlation_id: format!("{market:?}:{timestamp_ms}"),
+                    source_timestamp_ms: envelope.metadata.source_time_ms,
+                    ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
+                        .unwrap_or(i64::MAX),
+                };
+                crate::causal::record_book_decision(store, &identity, &book, actions_placed)
+                    .await
+                    .map_err(|source| StartError::Storage {
+                        run: run.id().clone(),
+                        source,
+                    })?;
             }
         }
     }

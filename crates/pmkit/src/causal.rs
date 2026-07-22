@@ -328,6 +328,38 @@ impl<'a, S: TapeStore + ?Sized> CausalRecorder<'a, S> {
     }
 }
 
+/// Records one causal decision for a book event, with empty CEX metrics when no
+/// reference source is configured. Placed actions become accepted risk verdicts.
+pub(crate) async fn record_book_decision(
+    store: &dyn TapeStore,
+    identity: &CausalIdentity,
+    book: &OrderBookL2,
+    actions_placed: u32,
+) -> Result<(), StoreError> {
+    let snapshot = DecisionSnapshot::from_book(
+        book,
+        CexTradeMetrics {
+            last_price: None,
+            momentum: Decimal::ZERO,
+            volume: Decimal::ZERO,
+            cvd: Decimal::ZERO,
+            vwap: None,
+        },
+    );
+    let decision = if actions_placed == 0 {
+        DecisionKind::NoAction
+    } else {
+        DecisionKind::Actions(
+            (0..actions_placed)
+                .map(ActionRiskVerdict::accepted)
+                .collect(),
+        )
+    };
+    CausalRecorder::new(store)
+        .record_evaluation(identity, &snapshot, decision)
+        .await
+}
+
 fn decision_payload(snapshot: &DecisionSnapshot, decision: DecisionKind) -> Value {
     json!({
         "snapshot": snapshot_payload(snapshot),
