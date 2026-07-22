@@ -270,8 +270,11 @@ fn envelope_json(metadata: &StreamMetadata, payload: &serde_json::Value) -> serd
         "schema_version": metadata.schema_version,
         "source_id": metadata.source_id,
         "source_time_ms": metadata.source_time_ms,
+        "canonical_source_rank": metadata.canonical_source_rank,
         "receipt_time_ms": metadata.receipt_time_ms,
         "connection_id": metadata.connection_id,
+        "connection_epoch": metadata.connection_epoch,
+        "frame_sequence": metadata.frame_sequence,
         "ingest_sequence": metadata.ingest_sequence,
         "payload": payload,
     })
@@ -292,8 +295,11 @@ mod tests {
                 schema_version: 1,
                 source_id: "polymarket".into(),
                 source_time_ms: 1,
+                canonical_source_rank: 2,
                 receipt_time_ms: 2,
                 connection_id: "ws-1".into(),
+                connection_epoch: 3,
+                frame_sequence: 4,
                 ingest_sequence: 3,
             },
             fact: PmAccountEvent::OrderAck {
@@ -309,6 +315,9 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("\"kind\":\"order_ack\""));
         assert!(lines[0].contains("\"portfolio\":\"paper\""));
+        assert!(lines[0].contains("\"canonical_source_rank\":2"));
+        assert!(lines[0].contains("\"connection_epoch\":3"));
+        assert!(lines[0].contains("\"frame_sequence\":4"));
         assert!(lines[0].contains("\"ingest_sequence\":3"));
         Ok(())
     }

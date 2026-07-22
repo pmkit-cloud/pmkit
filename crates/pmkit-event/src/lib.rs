@@ -201,10 +201,16 @@ pub struct StreamMetadata {
     pub source_id: String,
     /// Source timestamp in milliseconds.
     pub source_time_ms: i64,
+    /// Deterministic source rank used for canonical PM replay.
+    pub canonical_source_rank: i64,
     /// Local receipt timestamp in milliseconds.
     pub receipt_time_ms: i64,
     /// Connection that delivered the frame.
     pub connection_id: String,
+    /// Monotonically increasing connection epoch for this source.
+    pub connection_epoch: i64,
+    /// Monotonically increasing frame number within the connection epoch.
+    pub frame_sequence: i64,
     /// Monotonic sequence within the connection.
     pub ingest_sequence: u64,
 }

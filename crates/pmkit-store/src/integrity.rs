@@ -9,6 +9,9 @@ pub fn decode_row(
     row: &turso::Row,
     scope: &OwnerScope,
     source_timestamp_ms: i64,
+    canonical_source_rank: i64,
+    connection_epoch: i64,
+    frame_sequence: i64,
     ingest_sequence: i64,
 ) -> ReplayItem {
     let gap = |reason| {
@@ -19,22 +22,22 @@ pub fn decode_row(
             reason,
         })
     };
-    let Ok(schema_version) = row.get::<i64>(2) else {
+    let Ok(schema_version) = row.get::<i64>(5) else {
         return gap(ReplayGapReason::UnsupportedSchemaVersion);
     };
     if schema_version != PM_ENVELOPE_VERSION {
         return gap(ReplayGapReason::UnsupportedSchemaVersion);
     }
     let (Ok(receipt_timestamp_ms), Ok(venue_id), Ok(config_hash), Ok(source_id), Ok(connection_id)) =
-        (row.get(3), row.get(4), row.get(5), row.get(6), row.get(7))
+        (row.get(6), row.get(7), row.get(8), row.get(9), row.get(10))
     else {
         return gap(ReplayGapReason::NormalizedIntegrityMismatch);
     };
     let (Ok(raw_frame), Ok(raw_sha256), Ok(normalized_json), Ok(normalized_sha256)) = (
-        row.get::<Vec<u8>>(8),
-        row.get::<String>(9),
-        row.get::<String>(10),
-        row.get::<String>(11),
+        row.get::<Vec<u8>>(11),
+        row.get::<String>(12),
+        row.get::<String>(13),
+        row.get::<String>(14),
     ) else {
         return gap(ReplayGapReason::RawIntegrityMismatch);
     };
@@ -61,6 +64,9 @@ pub fn decode_row(
         source_id,
         connection_id,
         source_timestamp_ms,
+        canonical_source_rank,
+        connection_epoch,
+        frame_sequence,
         receipt_timestamp_ms,
         ingest_sequence,
         raw_frame,

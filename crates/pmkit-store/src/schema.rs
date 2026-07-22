@@ -7,6 +7,9 @@ CREATE TABLE IF NOT EXISTS pm_envelopes (
     source_id TEXT NOT NULL,
     connection_id TEXT NOT NULL,
     source_timestamp_ms INTEGER NOT NULL,
+    canonical_source_rank INTEGER NOT NULL,
+    connection_epoch INTEGER NOT NULL,
+    frame_sequence INTEGER NOT NULL,
     ingest_sequence INTEGER NOT NULL,
     schema_version INTEGER NOT NULL,
     receipt_timestamp_ms INTEGER NOT NULL,
@@ -16,10 +19,13 @@ CREATE TABLE IF NOT EXISTS pm_envelopes (
     raw_sha256 TEXT NOT NULL,
     normalized_json TEXT NOT NULL,
     normalized_sha256 TEXT NOT NULL,
-    PRIMARY KEY (portfolio_id, run_id, source_id, connection_id, source_timestamp_ms, ingest_sequence)
+    PRIMARY KEY (portfolio_id, run_id, source_id, connection_id, source_timestamp_ms, connection_epoch, frame_sequence),
+    UNIQUE (portfolio_id, run_id, source_timestamp_ms, canonical_source_rank, connection_epoch, frame_sequence)
 );
 CREATE INDEX IF NOT EXISTS pm_envelopes_owner_cursor
-    ON pm_envelopes (portfolio_id, run_id, source_timestamp_ms, ingest_sequence);
+    ON pm_envelopes (
+        portfolio_id, run_id, source_timestamp_ms, canonical_source_rank, connection_epoch, frame_sequence
+    );
 CREATE TABLE IF NOT EXISTS causal_decisions (
     portfolio_id TEXT NOT NULL,
     run_id TEXT NOT NULL,
@@ -45,21 +51,21 @@ CREATE INDEX IF NOT EXISTS durable_intents_owner_pending
 
 pub const INSERT_ENVELOPE: &str = "
 INSERT INTO pm_envelopes (
-    portfolio_id, run_id, source_id, connection_id, source_timestamp_ms, ingest_sequence,
-    schema_version, receipt_timestamp_ms, venue_id, config_hash, raw_frame, raw_sha256,
-    normalized_json, normalized_sha256
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+    portfolio_id, run_id, source_id, connection_id, source_timestamp_ms, canonical_source_rank,
+    connection_epoch, frame_sequence, ingest_sequence, schema_version, receipt_timestamp_ms,
+    venue_id, config_hash, raw_frame, raw_sha256, normalized_json, normalized_sha256
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
 ON CONFLICT DO NOTHING";
 
 pub const READ_ENVELOPES: &str = "
-SELECT source_timestamp_ms, ingest_sequence, schema_version, receipt_timestamp_ms, venue_id,
-       config_hash, source_id, connection_id, raw_frame, raw_sha256, normalized_json,
-       normalized_sha256
+SELECT source_timestamp_ms, canonical_source_rank, connection_epoch, frame_sequence,
+       ingest_sequence, schema_version, receipt_timestamp_ms, venue_id, config_hash, source_id,
+       connection_id, raw_frame, raw_sha256, normalized_json, normalized_sha256
 FROM pm_envelopes
 WHERE portfolio_id = ?1 AND run_id = ?2
-  AND (?3 IS NULL OR source_timestamp_ms > ?3 OR (source_timestamp_ms = ?3 AND ingest_sequence > ?4))
-ORDER BY source_timestamp_ms, ingest_sequence
-LIMIT ?5";
+  AND (?3 IS NULL OR (source_timestamp_ms, canonical_source_rank, connection_epoch, frame_sequence) > (?3, ?4, ?5, ?6))
+ORDER BY source_timestamp_ms, canonical_source_rank, connection_epoch, frame_sequence
+LIMIT ?7";
 
 pub const INSERT_DECISION: &str = "
 INSERT INTO causal_decisions (

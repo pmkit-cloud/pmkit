@@ -73,12 +73,15 @@ impl TapeStore for TursoTapeStore {
             .connection
             .execute(
                 INSERT_ENVELOPE,
-                (
+                turso::params![
                     envelope.scope.portfolio_id.to_string(),
                     envelope.scope.run_id.to_string(),
                     envelope.source_id.as_str(),
                     envelope.connection_id.as_str(),
                     envelope.source_timestamp_ms,
+                    envelope.canonical_source_rank,
+                    envelope.connection_epoch,
+                    envelope.frame_sequence,
                     envelope.ingest_sequence,
                     i64::from(envelope.schema_version),
                     envelope.receipt_timestamp_ms,
@@ -88,7 +91,7 @@ impl TapeStore for TursoTapeStore {
                     sha256_hex(&envelope.raw_frame),
                     normalized_json.as_str(),
                     sha256_hex(normalized_json.as_bytes()),
-                ),
+                ],
             )
             .await?;
         if written == 0 {
@@ -110,7 +113,11 @@ impl TapeStore for TursoTapeStore {
         };
         let limit = i64::try_from(limit.get()).map_err(|_| StoreError::LimitTooLarge)?;
         let cursor_timestamp = cursor.as_ref().map(|value| value.source_timestamp_ms);
-        let cursor_sequence = cursor.as_ref().map_or(0, |value| value.ingest_sequence);
+        let cursor_source_rank = cursor
+            .as_ref()
+            .map_or(0, |value| value.canonical_source_rank);
+        let cursor_connection_epoch = cursor.as_ref().map_or(0, |value| value.connection_epoch);
+        let cursor_frame_sequence = cursor.as_ref().map_or(0, |value| value.frame_sequence);
         let mut rows = self
             .connection
             .query(
@@ -119,7 +126,9 @@ impl TapeStore for TursoTapeStore {
                     scope.portfolio_id.to_string(),
                     scope.run_id.to_string(),
                     cursor_timestamp,
-                    cursor_sequence,
+                    cursor_source_rank,
+                    cursor_connection_epoch,
+                    cursor_frame_sequence,
                     limit,
                 ),
             )
@@ -128,18 +137,27 @@ impl TapeStore for TursoTapeStore {
         let mut next_cursor = None;
         while let Some(row) = rows.next().await? {
             let source_timestamp_ms = row.get(0)?;
-            let ingest_sequence = row.get(1)?;
-            next_cursor = Some(ReplayCursor::new(
-                scope.clone(),
-                source_timestamp_ms,
-                ingest_sequence,
-            ));
-            items.push(decode_row(
+            let canonical_source_rank = row.get(1)?;
+            let connection_epoch = row.get(2)?;
+            let frame_sequence = row.get(3)?;
+            let ingest_sequence = row.get(4)?;
+            let item = decode_row(
                 &row,
                 scope,
                 source_timestamp_ms,
+                canonical_source_rank,
+                connection_epoch,
+                frame_sequence,
                 ingest_sequence,
-            ));
+            );
+            next_cursor = Some(ReplayCursor {
+                scope: scope.clone(),
+                source_timestamp_ms,
+                canonical_source_rank,
+                connection_epoch,
+                frame_sequence,
+            });
+            items.push(item);
         }
         Ok(ReplayPage { items, next_cursor })
     }

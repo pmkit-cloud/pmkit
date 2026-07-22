@@ -1,46 +1,49 @@
-Todo 5: lossless PM Turso records and scoped queries
+Todo 5 corrective storage slice: canonical PM replay order
 
 Commands and results:
 
 $ cargo fmt --all -- --check
 PASS
 
-$ cargo clippy -p pmkit-store --all-targets -- -D warnings
+$ cargo clippy --workspace --all-targets -- -D warnings
 PASS: no issues found
 
 $ cargo test -p pmkit-store lossless_pm_envelope_round_trip
-PASS: 1 test passed, 2 filtered out
+PASS: 1 test passed, 3 filtered out
 
-$ cargo test -p pmkit-store duplicate_or_cross_owner_read_is_rejected
-PASS: 1 test passed, 2 filtered out
+$ cargo test -p pmkit-store corrupt_pm_envelope_is_replay_gap_and_cursor_continues_canonically
+PASS: 1 test passed, 3 filtered out
 
 $ cargo test -p pmkit-store
-PASS: 3 tests passed across 2 suites
+PASS: 4 tests passed across 2 suites
 
-$ cargo build --workspace
+$ cargo check --workspace --all-targets
 PASS
 
 $ cargo test --workspace
-PASS: 98 tests passed across 39 suites
+PASS: 99 tests passed across 39 suites
 
-$ bash /Users/yovanoc/.cache/opencode/packages/oh-my-openagent@4.18.2/node_modules/oh-my-openagent/dist/skills/programming/scripts/rust/check-no-excuse-rules.sh crates/pmkit-store/src/lib.rs crates/pmkit-store/src/schema.rs crates/pmkit-store/src/integrity.rs crates/pmkit-store/src/local_files.rs crates/pmkit-store/src/turso_store.rs crates/pmkit-store/src/tests.rs
-PASS: no-excuse rules passed for 6 files
+$ bash /Users/yovanoc/.cache/opencode/packages/oh-my-openagent@4.18.2/node_modules/oh-my-openagent/dist/skills/programming/scripts/rust/check-no-excuse-rules.sh crates/pmkit-store/src/lib.rs crates/pmkit-store/src/schema.rs crates/pmkit-store/src/integrity.rs crates/pmkit-store/src/turso_store.rs crates/pmkit-store/src/tests.rs crates/pmkit-event/src/lib.rs crates/pmkit-tape/src/lib.rs crates/pmkit-data/src/binance.rs crates/pmkit/src/live_tape.rs
+PASS: no-excuse rules passed for 9 files
 
 $ git diff --check
 PASS
 
 Schema and identity summary:
 - PM envelopes are scoped by `(portfolio_id, run_id)` and deduplicated by
-  `(portfolio_id, run_id, source_id, connection_id, source_timestamp_ms, ingest_sequence)`.
-- Cursor pages are static parameterized queries ordered by
-  `(source_timestamp_ms, ingest_sequence)` within an owner scope.
+  source identity `(source_id, connection_id, source_timestamp_ms, connection_epoch, frame_sequence)`.
+- Canonical order is unique within an owner scope and cursor pages use static parameterized SQL
+  ordered and continued by `(source_timestamp_ms, canonical_source_rank, connection_epoch, frame_sequence)`.
+- `ingest_sequence` remains durable envelope metadata and is not part of the PM primary key,
+  canonical uniqueness constraint, replay `ORDER BY`, or replay cursor.
 - Raw frame bytes and normalized JSON each store SHA-256 digests; unsupported
-  versions or invalid digests replay as typed `ReplayGap`s.
+  versions or invalid digests replay as typed `ReplayGap`s. Corrupt rows still emit a canonical
+  continuation cursor.
 - Causal decisions and durable pending intents share
   `(portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence)`.
 - Pending intents transition exactly once to accepted, rejected, or unknown.
 - Local database files are owner-only on Unix and deletion removes database,
   WAL, and SHM files; no CEX rows or credentials are persisted.
 
-Pure Rust LOC: lib 121, schema 73, integrity 70, local_files 34,
-turso_store 213, tests 131.
+Fresh temporary file-backed databases prove canonical ordering independent of ingest sequence,
+cursor continuation, raw-frame integrity gaps, and whole-database deletion.

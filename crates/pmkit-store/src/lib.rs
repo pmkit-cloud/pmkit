@@ -78,18 +78,24 @@ pub struct ReplayCursor {
     pub scope: OwnerScope,
     /// The source timestamp of the last replayed record.
     pub source_timestamp_ms: i64,
-    /// The ingest sequence of the last replayed record.
-    pub ingest_sequence: i64,
+    /// The canonical source rank of the last replayed record.
+    pub canonical_source_rank: i64,
+    /// The connection epoch of the last replayed record.
+    pub connection_epoch: i64,
+    /// The frame sequence of the last replayed record.
+    pub frame_sequence: i64,
 }
 
 impl ReplayCursor {
     /// Creates a cursor from the final record on a replay page.
     #[must_use]
-    pub const fn new(scope: OwnerScope, source_timestamp_ms: i64, ingest_sequence: i64) -> Self {
+    pub fn from_envelope(envelope: &PmEnvelope) -> Self {
         Self {
-            scope,
-            source_timestamp_ms,
-            ingest_sequence,
+            scope: envelope.scope.clone(),
+            source_timestamp_ms: envelope.source_timestamp_ms,
+            canonical_source_rank: envelope.canonical_source_rank,
+            connection_epoch: envelope.connection_epoch,
+            frame_sequence: envelope.frame_sequence,
         }
     }
 }
@@ -111,6 +117,12 @@ pub struct PmEnvelope {
     pub connection_id: String,
     /// The upstream source timestamp in milliseconds.
     pub source_timestamp_ms: i64,
+    /// The source's deterministic rank in canonical PM replay order.
+    pub canonical_source_rank: i64,
+    /// The monotonically increasing epoch for the source connection.
+    pub connection_epoch: i64,
+    /// The monotonically increasing frame number within the connection epoch.
+    pub frame_sequence: i64,
     /// The local receipt timestamp in milliseconds.
     pub receipt_timestamp_ms: i64,
     /// The monotonically assigned ingest sequence.
