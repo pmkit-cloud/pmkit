@@ -134,11 +134,7 @@ impl HistoricalDataSource for PolymarketHistoricalData {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::significant_drop_tightening)]
-    use std::{
-        path::PathBuf,
-        sync::Arc,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::{path::PathBuf, sync::Arc};
 
     use pmkit_core::{MarketId, PortfolioId, RunId};
     use pmkit_data::{HistoricalDataSource, ReplayQuery, SourceSignal};
@@ -150,11 +146,10 @@ mod tests {
     use super::PolymarketHistoricalData;
     use crate::MarketTokens;
 
-    fn database_path() -> Result<PathBuf, std::time::SystemTimeError> {
-        Ok(std::env::temp_dir().join(format!(
-            "pmkit-polymarket-historical-{}.db",
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        )))
+    fn database_path() -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("pmkit-polymarket-historical.db");
+        Ok((dir, path))
     }
 
     fn scope() -> Result<OwnerScope, Box<dyn std::error::Error>> {
@@ -200,7 +195,7 @@ mod tests {
     async fn historical_replay_emits_market_signals_and_eof()
     -> Result<(), Box<dyn std::error::Error>> {
         // Given: one stored market envelope in the same scope.
-        let path = database_path()?;
+        let (_dir, path) = database_path()?;
         let store = std::sync::Arc::new(TursoTapeStore::open_local(&path).await?);
         let scope = scope()?;
         let market = envelope(
@@ -257,7 +252,7 @@ mod tests {
     #[tokio::test]
     async fn historical_replay_fails_on_corrupt_record() -> Result<(), Box<dyn std::error::Error>> {
         // Given: a stored market envelope whose integrity digest is corrupted.
-        let path = database_path()?;
+        let (_dir, path) = database_path()?;
         let store = std::sync::Arc::new(TursoTapeStore::open_local(&path).await?);
         let scope = scope()?;
         let market = envelope(

@@ -9,8 +9,10 @@ use crate::{
     ChainEvent, ChainId, ContractRegistry, TradeSide, TursoTapeStore, WalletQuery,
 };
 
-fn database_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("pmkit-chain-{name}.db"))
+fn database_path(name: &str) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join(format!("pmkit-chain-{name}.db"));
+    Ok((dir, path))
 }
 
 #[expect(
@@ -172,7 +174,7 @@ fn fixture_segment(
 #[tokio::test]
 async fn wallet_reconstruction_matches_canonical_logs() -> Result<(), Box<dyn std::error::Error>> {
     // Given: a typed Polygon fixture chain and a file-backed canonical store.
-    let path = database_path("reconstruction");
+    let (_dir, path) = database_path("reconstruction")?;
     let registry = ContractRegistry::polygon();
     let store = TursoTapeStore::open_local(&path).await?;
     let segment = fixture_segment(&registry, "0xblock2a", Decimal::from(100));
@@ -202,7 +204,7 @@ async fn wallet_reconstruction_matches_canonical_logs() -> Result<(), Box<dyn st
 #[tokio::test]
 async fn reorg_replaces_orphaned_wallet_events() -> Result<(), Box<dyn std::error::Error>> {
     // Given: a canonical segment whose block two will be orphaned.
-    let path = database_path("reorg-verified");
+    let (_dir, path) = database_path("reorg-verified")?;
     let registry = ContractRegistry::polygon();
     let store = TursoTapeStore::open_local(&path).await?;
     store
@@ -296,7 +298,7 @@ fn order_fills_preserve_maker_buy_and_sell_token_semantics() {
 async fn canonical_segments_reject_descending_and_unknown_ancestors()
 -> Result<(), Box<dyn std::error::Error>> {
     // Given: a stored canonical segment and replacement data with invalid source evidence.
-    let path = database_path("validation");
+    let (_dir, path) = database_path("validation")?;
     let registry = ContractRegistry::polygon();
     let store = TursoTapeStore::open_local(&path).await?;
     store
@@ -342,7 +344,7 @@ async fn canonical_segments_reject_descending_and_unknown_ancestors()
 async fn bounded_wallet_snapshot_reports_its_own_canonical_tip()
 -> Result<(), Box<dyn std::error::Error>> {
     // Given: canonical evidence extending past the requested block range.
-    let path = database_path("bounded-tip");
+    let (_dir, path) = database_path("bounded-tip")?;
     let registry = ContractRegistry::polygon();
     let store = TursoTapeStore::open_local(&path).await?;
     store

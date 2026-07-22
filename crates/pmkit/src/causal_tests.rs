@@ -1,9 +1,5 @@
 #![allow(clippy::significant_drop_tightening)]
-use std::{
-    path::PathBuf,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use pmkit_book::{OrderBookL2, Side};
@@ -21,9 +17,10 @@ use crate::causal::{
     ActionRiskVerdict, CausalRecorder, CexTradeMetrics, DecisionKind, DecisionSnapshot,
 };
 
-fn database_path(name: &str) -> Result<PathBuf, std::time::SystemTimeError> {
-    let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    Ok(std::env::temp_dir().join(format!("pmkit-causal-{name}-{suffix}.db")))
+fn database_path(name: &str) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join(format!("pmkit-causal-{name}.db"));
+    Ok((dir, path))
 }
 
 fn identity() -> Result<CausalIdentity, Box<dyn std::error::Error>> {
@@ -83,7 +80,7 @@ fn decision_causality_matches_all_modes() {
 async fn action_risk_and_outcomes_are_independent_and_linked()
 -> Result<(), Box<dyn std::error::Error>> {
     // Given: one decision with independently risked actions in a file-backed store.
-    let path = database_path("actions")?;
+    let (_dir, path) = database_path("actions")?;
     let store = TursoTapeStore::open_local(&path).await?;
     let event = identity()?;
     CausalRecorder::new(&store)
@@ -140,7 +137,7 @@ async fn action_risk_and_outcomes_are_independent_and_linked()
 async fn pending_store_failure_aborts_before_submission() -> Result<(), Box<dyn std::error::Error>>
 {
     // Given: a recorder whose pending-intent write fails.
-    let path = database_path("pending-failure")?;
+    let (_dir, path) = database_path("pending-failure")?;
     let submitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let store = FailingStore::new(
         TursoTapeStore::open_local(&path).await?,
@@ -173,7 +170,7 @@ async fn pending_store_failure_aborts_before_submission() -> Result<(), Box<dyn 
 async fn accepted_order_with_store_failure_is_reconciled() -> Result<(), Box<dyn std::error::Error>>
 {
     // Given: a pending intent and a transition write that fails after acceptance.
-    let path = database_path("restart")?;
+    let (_dir, path) = database_path("restart")?;
     let (intent, result) = {
         let store = FailingStore::new(
             TursoTapeStore::open_local(&path).await?,
@@ -308,7 +305,7 @@ impl TapeStore for FailingStore {
 async fn recorder_enumerates_pending_and_unknown_intents() -> Result<(), Box<dyn std::error::Error>>
 {
     // Given: one pending intent and one unknown-outcome intent in durable storage.
-    let path = database_path("enumerate")?;
+    let (_dir, path) = database_path("enumerate")?;
     let store = TursoTapeStore::open_local(&path).await?;
     let scope = OwnerScope::new(PortfolioId::new("portfolio")?, RunId::new("run")?);
     let event = CausalIdentity {

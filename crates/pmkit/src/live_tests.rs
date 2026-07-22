@@ -413,10 +413,8 @@ async fn live_run_cancel_all_requires_explicit_policy() -> Result<(), Box<dyn st
 async fn live_transport_failure_leaves_recoverable_pending_intent()
 -> Result<(), Box<dyn std::error::Error>> {
     // Given: a live run with durable storage and a venue whose submit is transport-uncertain.
-    let suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("pmkit-live-pending-{suffix}.db"));
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("pmkit-live-pending.db");
     let store = TursoTapeStore::open_local(&path).await?;
     let run = LiveRun::new(
         RunId::new("live-store-transport")?,
@@ -450,10 +448,8 @@ async fn live_transport_failure_leaves_recoverable_pending_intent()
 #[allow(clippy::significant_drop_tightening)]
 async fn live_run_records_a_decision_with_storage() -> Result<(), Box<dyn std::error::Error>> {
     // Given: a store-backed live run whose venue accepts the strategy's order.
-    let suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("pmkit-live-decision-{suffix}.db"));
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("pmkit-live-decision.db");
     let store = TursoTapeStore::open_local(&path).await?;
 
     // When: the live driver runs with storage configured.

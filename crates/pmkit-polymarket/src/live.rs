@@ -358,7 +358,6 @@ mod tests {
             Arc,
             atomic::{AtomicBool, Ordering},
         },
-        time::{SystemTime, UNIX_EPOCH},
     };
 
     use async_trait::async_trait;
@@ -398,11 +397,10 @@ mod tests {
         ))
     }
 
-    fn database_path() -> Result<PathBuf, std::time::SystemTimeError> {
-        Ok(std::env::temp_dir().join(format!(
-            "pmkit-polymarket-raw-{}.db",
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        )))
+    fn database_path() -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("pmkit-polymarket-raw.db");
+        Ok((dir, path))
     }
 
     #[test]
@@ -465,7 +463,7 @@ mod tests {
 
     #[tokio::test]
     async fn raw_frames_are_stored_before_adaptation() -> Result<(), Box<dyn std::error::Error>> {
-        let path = database_path()?;
+        let (_dir, path) = database_path()?;
         let store = Arc::new(TursoTapeStore::open_local(&path).await?);
         let adapter = RawPolymarketFrameAdapter::new(store.clone(), scope()?, "fixture");
         let text = br#"{ "event_type": "book" }"#.to_vec();
@@ -501,7 +499,7 @@ mod tests {
     #[tokio::test]
     async fn account_frame_with_mismatched_owner_is_rejected()
     -> Result<(), Box<dyn std::error::Error>> {
-        let path = database_path()?;
+        let (_dir, path) = database_path()?;
         let store = Arc::new(TursoTapeStore::open_local(&path).await?);
         let adapter = RawPolymarketFrameAdapter::new(store.clone(), scope()?, "fixture");
         let frame = RawPmAccountFrame {

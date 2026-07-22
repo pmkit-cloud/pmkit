@@ -1,9 +1,5 @@
 #![allow(clippy::significant_drop_tightening)]
-use std::{
-    num::NonZeroUsize,
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{num::NonZeroUsize, path::PathBuf};
 
 use pmkit_core::{PortfolioId, RunId};
 use serde_json::json;
@@ -13,9 +9,10 @@ use crate::{
     ReplayGapReason, ReplayItem, StoreError, TapeStore, TursoTapeStore,
 };
 
-fn database_path(name: &str) -> Result<PathBuf, std::time::SystemTimeError> {
-    let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    Ok(std::env::temp_dir().join(format!("pmkit-store-{name}-{suffix}.db")))
+fn database_path(name: &str) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join(format!("pmkit-store-{name}.db"));
+    Ok((dir, path))
 }
 
 fn owner_scope(name: &str) -> Result<OwnerScope, Box<dyn std::error::Error>> {
@@ -44,7 +41,7 @@ fn envelope(scope: OwnerScope, ingest_sequence: i64) -> PmEnvelope {
 #[tokio::test]
 async fn lossless_pm_envelope_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     // Given: a file-backed PM envelope owned by one portfolio/run.
-    let path = database_path("round-trip")?;
+    let (_dir, path) = database_path("round-trip")?;
     let scope = owner_scope("paper")?;
     let mut first = envelope(scope.clone(), 99);
     first.connection_epoch = 3;
@@ -88,7 +85,7 @@ async fn lossless_pm_envelope_round_trip() -> Result<(), Box<dyn std::error::Err
 #[tokio::test]
 async fn duplicate_or_cross_owner_read_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
     // Given: one envelope and a cursor for its owner scope.
-    let path = database_path("ownership")?;
+    let (_dir, path) = database_path("ownership")?;
     let scope = owner_scope("paper")?;
     let other_scope = owner_scope("other")?;
     let stored = envelope(scope.clone(), 7);
@@ -120,7 +117,7 @@ async fn duplicate_or_cross_owner_read_is_rejected() -> Result<(), Box<dyn std::
 async fn corrupt_pm_envelope_is_replay_gap_and_cursor_continues_canonically()
 -> Result<(), Box<dyn std::error::Error>> {
     // Given: two canonically ordered PM envelopes in a fresh file-backed database.
-    let path = database_path("integrity")?;
+    let (_dir, path) = database_path("integrity")?;
     let scope = owner_scope("paper")?;
     let mut corrupt = envelope(scope.clone(), 99);
     corrupt.connection_epoch = 1;
@@ -173,7 +170,7 @@ async fn corrupt_pm_envelope_is_replay_gap_and_cursor_continues_canonically()
 async fn causal_decision_and_pending_intent_are_idempotent()
 -> Result<(), Box<dyn std::error::Error>> {
     // Given: one causal identity in a portfolio/run scope.
-    let path = database_path("causal")?;
+    let (_dir, path) = database_path("causal")?;
     let identity = CausalIdentity {
         scope: owner_scope("paper")?,
         correlation_id: "intent-1".into(),
@@ -225,7 +222,7 @@ async fn causal_decision_and_pending_intent_are_idempotent()
 #[tokio::test]
 async fn pending_and_unknown_intents_are_enumerated() -> Result<(), Box<dyn std::error::Error>> {
     // Given: two pending intents and one intent that transitioned to unknown.
-    let path = database_path("intents")?;
+    let (_dir, path) = database_path("intents")?;
     let scope = owner_scope("paper")?;
     let store = TursoTapeStore::open_local(&path).await?;
     let pending_a = CausalIdentity {
@@ -310,7 +307,7 @@ async fn pending_and_unknown_intents_are_enumerated() -> Result<(), Box<dyn std:
 async fn decisions_are_read_in_canonical_order_and_owner_scoped()
 -> Result<(), Box<dyn std::error::Error>> {
     // Given: two decisions stored out of order in one owner scope.
-    let path = database_path("decisions")?;
+    let (_dir, path) = database_path("decisions")?;
     let scope = owner_scope("paper")?;
     let store = TursoTapeStore::open_local(&path).await?;
     let later = CausalIdentity {

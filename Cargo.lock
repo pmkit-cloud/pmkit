@@ -3607,6 +3607,7 @@ dependencies = [
  "pmkit-tape",
  "rust_decimal",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
@@ -3748,6 +3749,7 @@ dependencies = [
  "polymarket_client_sdk_v2",
  "rust_decimal",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "turso",
@@ -3810,6 +3812,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
  "turso",

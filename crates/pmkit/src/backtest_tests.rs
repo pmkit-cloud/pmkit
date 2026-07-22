@@ -130,10 +130,8 @@ async fn wait_for_rejects_unknown_run() -> Result<(), Box<dyn std::error::Error>
 #[allow(clippy::significant_drop_tightening)]
 async fn backtest_records_one_decision_per_book_event() -> Result<(), Box<dyn std::error::Error>> {
     // Given: a store-backed backtest over two scripted book events.
-    let suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("pmkit-bt-decisions-{suffix}.db"));
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("pmkit-bt-decisions.db");
     let store = Arc::new(TursoTapeStore::open_local(&path).await?);
     let replay = ReplaySpec::new(
         Arc::new(ScriptedHistory { ticks: vec![1, 2] }),
