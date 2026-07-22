@@ -5,7 +5,6 @@ use std::{
 
 #[derive(Debug, Default)]
 pub(super) struct QuotaState {
-    loaded: bool,
     total_bytes: u64,
     next_use: u64,
     entries: HashMap<PathBuf, CacheEntry>,
@@ -20,14 +19,6 @@ struct CacheEntry {
 impl QuotaState {
     pub(super) const fn total_bytes(&self) -> u64 {
         self.total_bytes
-    }
-
-    pub(super) const fn is_loaded(&self) -> bool {
-        self.loaded
-    }
-
-    pub(super) const fn set_loaded(&mut self) {
-        self.loaded = true;
     }
 
     pub(super) fn insert(&mut self, path: PathBuf, bytes: u64) {
@@ -62,5 +53,11 @@ impl QuotaState {
             .filter(|(path, _)| path.as_path() != kept)
             .min_by_key(|(_, entry)| entry.used)
             .map(|(path, _)| path.clone())
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.total_bytes = 0;
+        self.next_use = 0;
+        self.entries.clear();
     }
 }

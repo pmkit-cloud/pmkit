@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use chrono::NaiveDate;
 use pmkit_event::CexReferenceEvent;
@@ -63,7 +63,6 @@ pub struct VerifiedBinanceArchiveCache {
     pub(super) limits: BinanceArchiveLimits,
     pub(super) client: reqwest::Client,
     pub(super) base_url: Arc<str>,
-    key_locks: Arc<Mutex<HashMap<ArchiveKey, Arc<Mutex<()>>>>>,
     quota: Arc<Mutex<binance_cache_state::QuotaState>>,
 }
 
@@ -107,7 +106,6 @@ impl VerifiedBinanceArchiveCache {
             limits,
             client: reqwest::Client::new(),
             base_url: Arc::from(base_url.trim_end_matches('/')),
-            key_locks: Arc::new(Mutex::new(HashMap::new())),
             quota: Arc::new(Mutex::new(binance_cache_state::QuotaState::default())),
         }
     }
@@ -141,6 +139,14 @@ impl ArchiveKey {
     pub(super) fn filename(self) -> String {
         format!(
             "{}-aggTrades-{}.zip",
+            self.symbol(),
+            self.date.format("%Y-%m-%d")
+        )
+    }
+
+    pub(super) fn lock_filename(self) -> String {
+        format!(
+            "{}-aggTrades-{}.lock",
             self.symbol(),
             self.date.format("%Y-%m-%d")
         )

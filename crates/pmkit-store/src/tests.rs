@@ -1,3 +1,4 @@
+#![allow(clippy::significant_drop_tightening)]
 use std::{
     num::NonZeroUsize,
     path::PathBuf,
@@ -79,7 +80,7 @@ async fn lossless_pm_envelope_round_trip() -> Result<(), Box<dyn std::error::Err
     );
     assert_eq!(second_page.items, vec![ReplayItem::Envelope(third)]);
     store.delete_database()?;
-    drop(store);
+
     assert!(!path.exists());
     Ok(())
 }
@@ -111,7 +112,7 @@ async fn duplicate_or_cross_owner_read_is_rejected() -> Result<(), Box<dyn std::
     ));
     assert!(matches!(cross_owner, Err(StoreError::ScopeMismatch)));
     store.delete_database()?;
-    drop(store);
+
     Ok(())
 }
 
@@ -164,7 +165,7 @@ async fn corrupt_pm_envelope_is_replay_gap_and_cursor_continues_canonically()
     ));
     assert_eq!(second_page.items, vec![ReplayItem::Envelope(intact)]);
     store.delete_database()?;
-    drop(store);
+
     Ok(())
 }
 
@@ -216,6 +217,91 @@ async fn causal_decision_and_pending_intent_are_idempotent()
         Err(StoreError::PendingIntentNotFound)
     ));
     store.delete_database()?;
-    drop(store);
+    assert!(!path.exists());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_and_unknown_intents_are_enumerated() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: two pending intents and one intent that transitioned to unknown.
+    let path = database_path("intents")?;
+    let scope = owner_scope("paper")?;
+    let store = TursoTapeStore::open_local(&path).await?;
+    let pending_a = CausalIdentity {
+        scope: scope.clone(),
+        correlation_id: "pending-a".into(),
+        source_timestamp_ms: 1_000,
+        ingest_sequence: 1,
+    };
+    let pending_b = CausalIdentity {
+        scope: scope.clone(),
+        correlation_id: "pending-b".into(),
+        source_timestamp_ms: 1_001,
+        ingest_sequence: 2,
+    };
+    let unknown = CausalIdentity {
+        scope: scope.clone(),
+        correlation_id: "unknown".into(),
+        source_timestamp_ms: 1_002,
+        ingest_sequence: 3,
+    };
+    store
+        .store_decision(&CausalDecision {
+            identity: pending_a.clone(),
+            payload: json!({"a": 1}),
+        })
+        .await?;
+    store
+        .store_intent_pending(&pending_a, &json!({"a": 1}))
+        .await?;
+    store
+        .store_decision(&CausalDecision {
+            identity: pending_b.clone(),
+            payload: json!({"b": 2}),
+        })
+        .await?;
+    store
+        .store_intent_pending(&pending_b, &json!({"b": 2}))
+        .await?;
+    store
+        .store_decision(&CausalDecision {
+            identity: unknown.clone(),
+            payload: json!({"u": 3}),
+        })
+        .await?;
+    store
+        .store_intent_pending(&unknown, &json!({"u": 3}))
+        .await?;
+    store
+        .transition_intent(&unknown, IntentOutcome::Unknown)
+        .await?;
+
+    // When: pending and unknown intents are enumerated.
+    let pending = store.read_pending_intents(&scope).await?;
+    let unknowns = store.read_unknown_intents(&scope).await?;
+
+    // Then: pending contains the two still-pending intents; unknown contains the terminal one.
+    assert_eq!(pending.len(), 2);
+    assert!(
+        pending
+            .iter()
+            .any(|intent| intent.identity.correlation_id == "pending-a")
+    );
+    assert!(
+        pending
+            .iter()
+            .any(|intent| intent.identity.correlation_id == "pending-b")
+    );
+    assert!(
+        pending
+            .iter()
+            .all(|intent| intent.identity.correlation_id != "unknown")
+    );
+    assert_eq!(unknowns.len(), 1);
+    assert_eq!(unknowns[0].identity.correlation_id, "unknown");
+
+    store.delete_database()?;
+    assert!(!path.exists());
     Ok(())
 }

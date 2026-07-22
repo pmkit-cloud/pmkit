@@ -1,3 +1,4 @@
+#![allow(clippy::significant_drop_tightening)]
 use std::{
     path::PathBuf,
     sync::Arc,
@@ -14,6 +15,7 @@ use pmkit_store::{
     ReplayPage, StoreError, TapeStore, TursoTapeStore,
 };
 use rust_decimal::Decimal;
+use serde_json::json;
 
 use crate::causal::{
     ActionRiskVerdict, CausalRecorder, CexTradeMetrics, DecisionKind, DecisionSnapshot,
@@ -130,7 +132,6 @@ async fn action_risk_and_outcomes_are_independent_and_linked()
         Err(StoreError::PendingIntentNotFound)
     ));
     store.delete_database()?;
-    drop(store);
     assert!(!path.exists());
     Ok(())
 }
@@ -206,7 +207,6 @@ async fn accepted_order_with_store_failure_is_reconciled() -> Result<(), Box<dyn
             ))
         ));
         reopened.delete_database()?;
-        drop(reopened);
         assert!(!path.exists());
     }
     Ok(())
@@ -281,4 +281,70 @@ impl TapeStore for FailingStore {
         }
         self.inner.transition_intent(identity, outcome).await
     }
+
+    async fn read_pending_intents(
+        &self,
+        scope: &OwnerScope,
+    ) -> Result<Vec<pmkit_store::DurableIntent>, StoreError> {
+        self.inner.read_pending_intents(scope).await
+    }
+
+    async fn read_unknown_intents(
+        &self,
+        scope: &OwnerScope,
+    ) -> Result<Vec<pmkit_store::DurableIntent>, StoreError> {
+        self.inner.read_unknown_intents(scope).await
+    }
+}
+
+#[tokio::test]
+async fn recorder_enumerates_pending_and_unknown_intents() -> Result<(), Box<dyn std::error::Error>>
+{
+    // Given: one pending intent and one unknown-outcome intent in durable storage.
+    let path = database_path("enumerate")?;
+    let store = TursoTapeStore::open_local(&path).await?;
+    let scope = OwnerScope::new(PortfolioId::new("portfolio")?, RunId::new("run")?);
+    let event = CausalIdentity {
+        scope: scope.clone(),
+        correlation_id: "event-enum".into(),
+        source_timestamp_ms: 1_000,
+        ingest_sequence: 7,
+    };
+    CausalRecorder::new(&store)
+        .record_evaluation(
+            &event,
+            &snapshot(),
+            DecisionKind::Actions(vec![
+                ActionRiskVerdict::accepted(0),
+                ActionRiskVerdict::accepted(1),
+            ]),
+        )
+        .await?;
+
+    let pending = CausalRecorder::new(&store).intent(&event, 0, &order()?);
+    let unknown = CausalRecorder::new(&store).intent(&event, 1, &order()?);
+    store
+        .store_intent_pending(&pending.identity, &json!({"kind": "place"}))
+        .await?;
+    store
+        .store_intent_pending(&unknown.identity, &json!({"kind": "place"}))
+        .await?;
+    store
+        .transition_intent(&unknown.identity, IntentOutcome::Unknown)
+        .await?;
+
+    // When: the recorder enumerates pending and unknown intents.
+    let recorder = CausalRecorder::new(&store);
+    let pending_intents = recorder.pending_intents(&scope).await?;
+    let unknown_intents = recorder.unknown_intents(&scope).await?;
+
+    // Then: only the still-pending intent and only the unknown-outcome intent are returned.
+    assert_eq!(pending_intents.len(), 1);
+    assert_eq!(pending_intents[0].identity.correlation_id, "event-enum:0");
+    assert_eq!(unknown_intents.len(), 1);
+    assert_eq!(unknown_intents[0].identity.correlation_id, "event-enum:1");
+
+    store.delete_database()?;
+    assert!(!path.exists());
+    Ok(())
 }

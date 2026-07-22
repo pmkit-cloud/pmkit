@@ -13,11 +13,14 @@ use polymarket_client_sdk_v2::types::U256;
 use rust_decimal::Decimal;
 
 mod execution;
+mod historical;
 mod live;
 
 pub use execution::PolymarketExecutor;
+pub use historical::PolymarketHistoricalData;
 pub use live::{
     PolymarketFrameAdapter, PolymarketLiveData, RawFrameAdapterError, RawPolymarketFrameAdapter,
+    parse_market_frame,
 };
 
 /// Maps a neutral `PMKit` [`Side`] to the Polymarket venue side.
@@ -115,9 +118,14 @@ pub fn venue_order_inputs(order: &PlaceOrder, tokens: &MarketTokens) -> Option<V
 
 #[cfg(test)]
 mod tests {
-    use super::{from_venue_side, to_venue_side};
+    use super::{MarketTokens, from_venue_side, to_venue_side, venue_order_inputs};
     use pmkit_book::Side;
+    use pmkit_core::{EmptyIdError, MarketId};
+    use pmkit_exec::PlaceOrder;
+    use pmkit_market::Outcome;
     use polymarket_client_sdk_v2::clob::types::Side as VenueSide;
+    use polymarket_client_sdk_v2::types::U256;
+    use rust_decimal::Decimal;
 
     #[test]
     fn side_round_trips() {
@@ -129,13 +137,6 @@ mod tests {
     fn unknown_venue_side_is_none() {
         assert_eq!(from_venue_side(VenueSide::Unknown), None);
     }
-
-    use super::{MarketTokens, venue_order_inputs};
-    use pmkit_core::{EmptyIdError, MarketId};
-    use pmkit_exec::PlaceOrder;
-    use pmkit_market::Outcome;
-    use polymarket_client_sdk_v2::types::U256;
-    use rust_decimal::Decimal;
 
     #[test]
     fn tokens_resolve_both_directions() -> Result<(), EmptyIdError> {

@@ -52,6 +52,9 @@ pub enum RawFrameAdapterError {
         #[source]
         source: serde_json::Error,
     },
+    /// The raw frame's portfolio does not match the adapter's owner scope.
+    #[error("account frame portfolio does not match adapter scope")]
+    ScopeMismatch,
     /// The post-storage adapter could not produce a normalized fact.
     #[error(transparent)]
     Adapt(#[from] DataSourceError),
@@ -149,6 +152,9 @@ impl RawPolymarketFrameAdapter {
     {
         let normalized = serde_json::from_slice(&frame.text)
             .map_err(|source| RawFrameAdapterError::Json { source })?;
+        if frame.portfolio != self.scope.portfolio_id {
+            return Err(RawFrameAdapterError::ScopeMismatch);
+        }
         self.store
             .store_envelope(&PmEnvelope {
                 schema_version: frame.metadata.schema_version,
@@ -297,6 +303,45 @@ fn trade_event(market: MarketId, outcome: Outcome, update: &LastTradePrice) -> O
     })
 }
 
+/// Parses a raw Polymarket market frame into a neutral market event.
+///
+/// # Errors
+///
+/// Returns [`DataSourceError::ReplayGap`] when the frame is not a recognized market shape.
+pub fn parse_market_frame(
+    raw: &[u8],
+    tokens: &MarketTokens,
+) -> Result<MarketEvent, DataSourceError> {
+    let raw_text = std::str::from_utf8(raw).map_err(|_| DataSourceError::ReplayGap {
+        message: "raw frame is not valid UTF-8".into(),
+    })?;
+    if let Ok(update) = serde_json::from_str::<BookUpdate>(raw_text) {
+        let outcome =
+            tokens
+                .outcome(&update.asset_id)
+                .ok_or_else(|| DataSourceError::ReplayGap {
+                    message: "unknown market asset id".into(),
+                })?;
+        return Ok(book_event(tokens.market().clone(), outcome, update));
+    }
+    if let Ok(update) = serde_json::from_str::<LastTradePrice>(raw_text) {
+        let outcome =
+            tokens
+                .outcome(&update.asset_id)
+                .ok_or_else(|| DataSourceError::ReplayGap {
+                    message: "unknown market asset id".into(),
+                })?;
+        return trade_event(tokens.market().clone(), outcome, &update).ok_or_else(|| {
+            DataSourceError::ReplayGap {
+                message: "incomplete last trade price".into(),
+            }
+        });
+    }
+    Err(DataSourceError::ReplayGap {
+        message: "unrecognized Polymarket market frame".into(),
+    })
+}
+
 fn data_error(error: &SdkError) -> DataSourceError {
     DataSourceError::Unavailable {
         message: error.to_string(),
@@ -305,6 +350,7 @@ fn data_error(error: &SdkError) -> DataSourceError {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::significant_drop_tightening)]
     use std::{
         num::NonZeroUsize,
         path::PathBuf,
@@ -318,8 +364,9 @@ mod tests {
     use async_trait::async_trait;
     use pmkit_book::Side;
     use pmkit_core::{MarketId, PortfolioId, RunId};
-    use pmkit_data::RawPmMarketFrame;
-    use pmkit_event::{MarketEvent, StreamMetadata};
+    use pmkit_data::{RawPmAccountFrame, RawPmMarketFrame};
+    use pmkit_event::{MarketEvent, PmAccountEvent, StreamMetadata};
+
     use pmkit_market::Outcome;
     use pmkit_store::{
         CausalDecision, CausalIdentity, IntentOutcome, OwnerScope, PmEnvelope, ReplayCursor,
@@ -397,6 +444,24 @@ mod tests {
         assert_eq!(timestamp_ms, 43);
         Ok(())
     }
+    #[test]
+    fn parse_market_frame_accepts_book_update_json() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::MarketTokens;
+        use polymarket_client_sdk_v2::types::U256;
+
+        let tokens = MarketTokens::new(
+            pmkit_core::MarketId::new("btc-5m")?,
+            U256::from(1_u64),
+            U256::from(2_u64),
+        );
+        let raw = br#"{"asset_id":"1","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"42","bids":[{"price":"0.49","size":"2"}],"asks":[{"price":"0.51","size":"3"}]}"#;
+        let event = super::parse_market_frame(raw, &tokens)?;
+        let pmkit_event::MarketEvent::BookUpdate { timestamp_ms, .. } = event else {
+            return Err("expected book update".into());
+        };
+        assert_eq!(timestamp_ms, 42);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn raw_frames_are_stored_before_adaptation() -> Result<(), Box<dyn std::error::Error>> {
@@ -426,8 +491,43 @@ mod tests {
         assert_eq!(stored.raw_frame, text);
         drop(adapter);
         drop(page);
-        store.delete_database()?;
-        drop(store);
+        Arc::try_unwrap(store)
+            .map_err(|_| "store still referenced")?
+            .delete_database()?;
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn account_frame_with_mismatched_owner_is_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = database_path()?;
+        let store = Arc::new(TursoTapeStore::open_local(&path).await?);
+        let adapter = RawPolymarketFrameAdapter::new(store.clone(), scope()?, "fixture");
+        let frame = RawPmAccountFrame {
+            portfolio: PortfolioId::new("bob")?,
+            metadata: metadata(9),
+            text: br#"{"event_type":"order_ack"}"#.to_vec(),
+        };
+        let result = adapter
+            .account(frame, |_| {
+                Ok(PmAccountEvent::OrderAck {
+                    strategy: None,
+                    order_id: "order-1".into(),
+                    timestamp_ms: 42,
+                })
+            })
+            .await;
+        assert!(matches!(result, Err(RawFrameAdapterError::ScopeMismatch)));
+        let page = store
+            .read_envelopes(&scope()?, None, NonZeroUsize::MIN)
+            .await?;
+        assert!(page.items.is_empty());
+        drop(adapter);
+        Arc::try_unwrap(store)
+            .map_err(|_| "store still referenced")?
+            .delete_database()?;
+        assert!(!path.exists());
         Ok(())
     }
 
@@ -497,6 +597,24 @@ mod tests {
             _identity: &CausalIdentity,
             _outcome: IntentOutcome,
         ) -> Result<(), StoreError> {
+            Err(StoreError::Storage {
+                message: "fixture failure".into(),
+            })
+        }
+
+        async fn read_pending_intents(
+            &self,
+            _scope: &OwnerScope,
+        ) -> Result<Vec<pmkit_store::DurableIntent>, StoreError> {
+            Err(StoreError::Storage {
+                message: "fixture failure".into(),
+            })
+        }
+
+        async fn read_unknown_intents(
+            &self,
+            _scope: &OwnerScope,
+        ) -> Result<Vec<pmkit_store::DurableIntent>, StoreError> {
             Err(StoreError::Storage {
                 message: "fixture failure".into(),
             })

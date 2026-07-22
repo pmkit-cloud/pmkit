@@ -200,6 +200,15 @@ pub struct CausalDecision {
     pub payload: Value,
 }
 
+/// A durable pending or terminal intent read back for recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableIntent {
+    /// The identity shared by the decision and the intent record.
+    pub identity: CausalIdentity,
+    /// The normalized intent payload.
+    pub payload: Value,
+}
+
 /// A terminal outcome for a previously durable pending intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntentOutcome {
@@ -283,4 +292,16 @@ pub trait TapeStore: Send + Sync {
         identity: &CausalIdentity,
         outcome: IntentOutcome,
     ) -> Result<(), StoreError>;
+
+    /// Lists durable intents still in the pending state for one owner scope.
+    async fn read_pending_intents(
+        &self,
+        scope: &OwnerScope,
+    ) -> Result<Vec<DurableIntent>, StoreError>;
+
+    /// Lists durable intents whose terminal outcome is unknown for one owner scope.
+    async fn read_unknown_intents(
+        &self,
+        scope: &OwnerScope,
+    ) -> Result<Vec<DurableIntent>, StoreError>;
 }

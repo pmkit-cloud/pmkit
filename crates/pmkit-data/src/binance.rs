@@ -65,6 +65,8 @@ pub enum BinanceAggTradeParseError {
     InvalidVisionRow,
 }
 
+const VISION_MICROSECOND_THRESHOLD: i64 = 1_735_689_600_000_000;
+
 #[derive(Debug, Clone, Copy)]
 struct BinanceAggTradeFields {
     asset: Asset,
@@ -159,7 +161,12 @@ pub fn parse_binance_vision_agg_trade_row(
 const fn binance_trade_from_fields(
     fields: BinanceAggTradeFields,
 ) -> Result<CexReferenceEvent, BinanceAggTradeParseError> {
-    if fields.timestamp_ms < 0 {
+    let timestamp_ms = if fields.timestamp_ms >= VISION_MICROSECOND_THRESHOLD {
+        fields.timestamp_ms / 1_000
+    } else {
+        fields.timestamp_ms
+    };
+    if timestamp_ms < 0 {
         return Err(BinanceAggTradeParseError::InvalidTimestamp);
     }
 
@@ -170,7 +177,7 @@ const fn binance_trade_from_fields(
         price: fields.price,
         qty: fields.qty,
         is_buyer_maker: fields.is_buyer_maker,
-        timestamp_ms: fields.timestamp_ms,
+        timestamp_ms,
     })
 }
 
@@ -198,7 +205,7 @@ mod tests {
         parse_binance_vision_agg_trade_row,
     };
     use crate::DataSourceError;
-    use pmkit_event::{CexReferenceEnvelope, StreamMetadata};
+    use pmkit_event::{CexReferenceEnvelope, CexReferenceEvent, StreamMetadata};
     use pmkit_market::{Asset, Exchange};
 
     #[test]
@@ -274,5 +281,27 @@ mod tests {
             ),
             Err(BinanceAggTradeParseError::InvalidTimestamp)
         ));
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn post_2025_vision_microsecond_timestamp_matches_live_millis()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Given: a live event with a 2025 millisecond timestamp and a Vision row
+        // whose official archive encodes the same instant in microseconds.
+        let live = parse_binance_agg_trade_live(
+            r#"{"e":"aggTrade","a":7,"p":"0.42","q":"1","T":1735689600123,"m":false}"#,
+            Asset::Btc,
+        )?;
+        let history =
+            parse_binance_vision_agg_trade_row("7,0.42,1,5,6,1735689600123000,false", Asset::Btc)?;
+
+        // Then: both sources produce the same normalized timestamp.
+        assert_eq!(live, history);
+        let CexReferenceEvent::Trade { timestamp_ms, .. } = history else {
+            panic!("expected trade event");
+        };
+        assert_eq!(timestamp_ms, 1_735_689_600_123);
+        Ok(())
     }
 }

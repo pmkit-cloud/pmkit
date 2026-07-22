@@ -26,6 +26,7 @@ rust_decimal = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 zip = { workspace = true }
+fslock = { workspace = true }
 
 [lints]
 workspace = true

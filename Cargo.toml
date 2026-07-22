@@ -25,6 +25,7 @@ chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 sha2 = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+fslock = "0.2"
 
 [workspace.lints.rust]
 missing_debug_implementations = "deny"
@@ -44,3 +45,10 @@ panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 unwrap_used = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[profile.dev]
+opt-level = 0

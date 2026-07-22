@@ -135,3 +135,15 @@ pub const READ_CANONICAL_TIP: &str = "
 SELECT block_number, block_hash FROM canonical_chain_logs
 WHERE chain_id = ?1
 ORDER BY block_number DESC, transaction_index DESC, log_index DESC LIMIT 1";
+
+pub const READ_PENDING_INTENTS: &str = "
+SELECT portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence, payload_json
+FROM durable_intents
+WHERE portfolio_id = ?1 AND run_id = ?2 AND state = 'pending'
+ORDER BY source_timestamp_ms, ingest_sequence";
+
+pub const READ_UNKNOWN_INTENTS: &str = "
+SELECT portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence, payload_json
+FROM durable_intents
+WHERE portfolio_id = ?1 AND run_id = ?2 AND state = 'unknown'
+ORDER BY source_timestamp_ms, ingest_sequence";

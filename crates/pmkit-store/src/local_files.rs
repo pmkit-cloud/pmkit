@@ -20,9 +20,14 @@ pub fn restrict_permissions(path: &Path) -> Result<(), StoreError> {
 }
 
 pub fn remove_database(path: &Path) -> Result<(), StoreError> {
-    fs::remove_file(path).map_err(|error| io_error(&error))?;
+    let main_result = fs::remove_file(path);
     remove_sidecar(path, "-wal")?;
-    remove_sidecar(path, "-shm")
+    remove_sidecar(path, "-shm")?;
+    match main_result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error(&error)),
+    }
 }
 
 fn remove_sidecar(path: &Path, suffix: &str) -> Result<(), StoreError> {

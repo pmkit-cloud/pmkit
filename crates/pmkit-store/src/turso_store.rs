@@ -8,19 +8,19 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::{
-    CausalDecision, CausalIdentity, IntentOutcome, OwnerScope, PmEnvelope, ReplayCursor,
-    ReplayPage, StoreError, TapeStore,
+    CausalDecision, CausalIdentity, DurableIntent, IntentOutcome, OwnerScope, PmEnvelope,
+    PortfolioId, ReplayCursor, ReplayPage, RunId, StoreError, TapeStore,
     integrity::{decode_row, sha256_hex},
     local_files::{remove_database, restrict_permissions},
     schema::{
-        INSERT_DECISION, INSERT_ENVELOPE, INSERT_PENDING_INTENT, READ_ENVELOPES, SCHEMA,
-        TRANSITION_PENDING_INTENT,
+        INSERT_DECISION, INSERT_ENVELOPE, INSERT_PENDING_INTENT, READ_ENVELOPES,
+        READ_PENDING_INTENTS, READ_UNKNOWN_INTENTS, SCHEMA, TRANSITION_PENDING_INTENT,
     },
 };
 
 /// A local Turso-backed implementation of [`TapeStore`].
 pub struct TursoTapeStore {
-    _database: turso::Database,
+    database: turso::Database,
     pub(crate) connection: turso::Connection,
     path: PathBuf,
 }
@@ -48,7 +48,7 @@ impl TursoTapeStore {
         connection.execute_batch(SCHEMA).await?;
         restrict_permissions(&path)?;
         Ok(Self {
-            _database: database,
+            database,
             connection,
             path,
         })
@@ -59,8 +59,15 @@ impl TursoTapeStore {
     /// # Errors
     ///
     /// Returns [`StoreError`] when a database file cannot be removed.
-    pub fn delete_database(&self) -> Result<(), StoreError> {
-        remove_database(&self.path)
+    pub fn delete_database(self) -> Result<(), StoreError> {
+        let Self {
+            database,
+            connection,
+            path,
+        } = self;
+        drop(connection);
+        drop(database);
+        remove_database(&path)
     }
 }
 
@@ -224,6 +231,20 @@ impl TapeStore for TursoTapeStore {
         }
         Ok(())
     }
+
+    async fn read_pending_intents(
+        &self,
+        scope: &OwnerScope,
+    ) -> Result<Vec<DurableIntent>, StoreError> {
+        read_intents_by_state(self, scope, READ_PENDING_INTENTS).await
+    }
+
+    async fn read_unknown_intents(
+        &self,
+        scope: &OwnerScope,
+    ) -> Result<Vec<DurableIntent>, StoreError> {
+        read_intents_by_state(self, scope, READ_UNKNOWN_INTENTS).await
+    }
 }
 
 impl IntentOutcome {
@@ -234,6 +255,45 @@ impl IntentOutcome {
             Self::Unknown => "unknown",
         }
     }
+}
+
+async fn read_intents_by_state(
+    store: &TursoTapeStore,
+    scope: &OwnerScope,
+    sql: &str,
+) -> Result<Vec<DurableIntent>, StoreError> {
+    let mut rows = store
+        .connection
+        .query(
+            sql,
+            (scope.portfolio_id.to_string(), scope.run_id.to_string()),
+        )
+        .await?;
+    let mut intents = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let portfolio_id: String = row.get(0)?;
+        let run_id: String = row.get(1)?;
+        let portfolio_id = PortfolioId::new(portfolio_id).map_err(|error| StoreError::Storage {
+            message: format!("invalid portfolio id in durable intent: {error}"),
+        })?;
+        let run_id = RunId::new(run_id).map_err(|error| StoreError::Storage {
+            message: format!("invalid run id in durable intent: {error}"),
+        })?;
+        let correlation_id: String = row.get(2)?;
+        let source_timestamp_ms: i64 = row.get(3)?;
+        let ingest_sequence: i64 = row.get(4)?;
+        let payload_json: String = row.get(5)?;
+        intents.push(DurableIntent {
+            identity: CausalIdentity {
+                scope: OwnerScope::new(portfolio_id, run_id),
+                correlation_id,
+                source_timestamp_ms,
+                ingest_sequence,
+            },
+            payload: serde_json::from_str(&payload_json).map_err(|error| json_error(&error))?,
+        });
+    }
+    Ok(intents)
 }
 
 fn causal_params(

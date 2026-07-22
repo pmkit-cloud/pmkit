@@ -4,7 +4,9 @@ use std::future::Future;
 
 use pmkit_book::OrderBookL2;
 use pmkit_exec::{ExecError, OrderId, PlaceOrder};
-use pmkit_store::{CausalDecision, CausalIdentity, IntentOutcome, StoreError, TapeStore};
+use pmkit_store::{
+    CausalDecision, CausalIdentity, IntentOutcome, OwnerScope, StoreError, TapeStore,
+};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -125,6 +127,14 @@ pub struct OrderIntent {
     /// The durable identity that links the external order to its decision.
     pub identity: CausalIdentity,
     payload: Value,
+}
+
+impl OrderIntent {
+    /// Reconstructs an intent from its durable identity and payload.
+    #[must_use]
+    pub const fn from_parts(identity: CausalIdentity, payload: Value) -> Self {
+        Self { identity, payload }
+    }
 }
 
 /// The result of an accepted venue submission.
@@ -276,6 +286,48 @@ impl<'a, S: TapeStore + ?Sized> CausalRecorder<'a, S> {
             .transition_intent(&intent.identity, outcome)
             .await?;
         Ok(())
+    }
+
+    /// Lists durable intents still pending for one owner scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecorderError::Store`] when the durable query fails.
+    pub async fn pending_intents(
+        &self,
+        scope: &OwnerScope,
+    ) -> Result<Vec<OrderIntent>, RecorderError> {
+        self.store
+            .read_pending_intents(scope)
+            .await
+            .map(|intents| {
+                intents
+                    .into_iter()
+                    .map(|intent| OrderIntent::from_parts(intent.identity, intent.payload))
+                    .collect()
+            })
+            .map_err(RecorderError::Store)
+    }
+
+    /// Lists durable intents whose terminal outcome is unknown for one owner scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecorderError::Store`] when the durable query fails.
+    pub async fn unknown_intents(
+        &self,
+        scope: &OwnerScope,
+    ) -> Result<Vec<OrderIntent>, RecorderError> {
+        self.store
+            .read_unknown_intents(scope)
+            .await
+            .map(|intents| {
+                intents
+                    .into_iter()
+                    .map(|intent| OrderIntent::from_parts(intent.identity, intent.payload))
+                    .collect()
+            })
+            .map_err(RecorderError::Store)
     }
 }
 

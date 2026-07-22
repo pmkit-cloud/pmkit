@@ -1,3 +1,4 @@
+#![allow(clippy::significant_drop_tightening)]
 use std::path::PathBuf;
 
 use rust_decimal::Decimal;
@@ -193,7 +194,8 @@ async fn wallet_reconstruction_matches_canonical_logs() -> Result<(), Box<dyn st
     assert_eq!(snapshot.trades.len(), 1);
     assert_eq!(snapshot.activity.len(), 3);
     store.delete_database()?;
-    drop(store);
+    assert!(!path.exists());
+
     Ok(())
 }
 
@@ -230,7 +232,8 @@ async fn reorg_replaces_orphaned_wallet_events() -> Result<(), Box<dyn std::erro
     );
     assert_eq!(snapshot.collateral_balance, Decimal::from(74));
     store.delete_database()?;
-    drop(store);
+    assert!(!path.exists());
+
     Ok(())
 }
 
