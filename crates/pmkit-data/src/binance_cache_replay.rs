@@ -40,7 +40,7 @@ impl VerifiedBinanceArchiveCache {
         Ok(records)
     }
 
-    async fn lock_key(&self, key: ArchiveKey) -> Result<fslock::LockFile, DataSourceError> {
+    async fn lock_key(&self, key: ArchiveKey) -> Result<std::fs::File, DataSourceError> {
         let locks_dir = self.root.join(".locks");
         tokio::fs::create_dir_all(&locks_dir)
             .await
@@ -48,7 +48,12 @@ impl VerifiedBinanceArchiveCache {
         let lock_path = locks_dir.join(key.lock_filename());
         let lock_path_clone = lock_path.clone();
         spawn_blocking(move || {
-            let mut lock = fslock::LockFile::open(&lock_path_clone)
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path_clone)
                 .map_err(|error| super::binance_cache_io::gap(error.to_string()))?;
             lock.lock()
                 .map_err(|error| super::binance_cache_io::gap(error.to_string()))?;

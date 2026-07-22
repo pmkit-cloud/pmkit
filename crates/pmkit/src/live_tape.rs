@@ -106,13 +106,13 @@ impl LiveTape {
             fact,
         };
         self.ingest_sequence += 1;
-        if let Err(source) = tape.append(&envelope) {
-            if self.policy == Some(TapePolicy::Required) {
-                return Err(StartError::Tape {
-                    run: run.id().clone(),
-                    source,
-                });
-            }
+        if let Err(source) = tape.append(&envelope)
+            && self.policy == Some(TapePolicy::Required)
+        {
+            return Err(StartError::Tape {
+                run: run.id().clone(),
+                source,
+            });
         }
         Ok(())
     }
@@ -121,13 +121,13 @@ impl LiveTape {
         let Some(tape) = &mut self.tape else {
             return Ok(());
         };
-        if let Err(source) = tape.flush() {
-            if self.policy == Some(TapePolicy::Required) {
-                return Err(StartError::Tape {
-                    run: run.id().clone(),
-                    source,
-                });
-            }
+        if let Err(source) = tape.flush()
+            && self.policy == Some(TapePolicy::Required)
+        {
+            return Err(StartError::Tape {
+                run: run.id().clone(),
+                source,
+            });
         }
         Ok(())
     }
