@@ -11,6 +11,7 @@ use pmkit_runtime::{LiveOrderPolicy, RuntimeConfig};
 use pmkit_spec::LiveRun;
 use pmkit_store::{CausalIdentity, OwnerScope, StoreError, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
+use rust_decimal::Decimal;
 use std::collections::HashSet;
 
 #[path = "live_risk.rs"]
@@ -247,6 +248,7 @@ pub async fn drive_with_store(
                 let fact = StrategyFact::Market(event.clone());
                 let portfolio_unrealized_pnl =
                     risk_state.update_book(market, *outcome, &book, &limits);
+                let mut verdicts: Vec<crate::causal::ActionRiskVerdict> = Vec::new();
                 for (registered_market, strategy) in &mut *strategies {
                     if *registered_market != *market {
                         continue;
@@ -266,6 +268,10 @@ pub async fn drive_with_store(
                                     open_orders = reconcile_open_orders(run, runtime).await?;
                                 }
                                 if open_orders.len() >= max_open_orders {
+                                    verdicts.push(crate::causal::ActionRiskVerdict::rejected(
+                                        u32::try_from(action_index).unwrap_or(u32::MAX),
+                                        "open order capacity",
+                                    ));
                                     rejected += 1;
                                     continue;
                                 }
@@ -277,6 +283,10 @@ pub async fn drive_with_store(
                                         portfolio_unrealized_pnl,
                                     )
                                 {
+                                    verdicts.push(crate::causal::ActionRiskVerdict::rejected(
+                                        u32::try_from(action_index).unwrap_or(u32::MAX),
+                                        "risk gate",
+                                    ));
                                     rejected += 1;
                                     continue;
                                 }
@@ -289,6 +299,9 @@ pub async fn drive_with_store(
                                     )
                                     .unwrap_or(i64::MAX),
                                 };
+                                verdicts.push(crate::causal::ActionRiskVerdict::accepted(
+                                    u32::try_from(action_index).unwrap_or(u32::MAX),
+                                ));
                                 let placement = place_order(
                                     store,
                                     executor.as_ref(),
@@ -323,6 +336,37 @@ pub async fn drive_with_store(
                             }
                         }
                     }
+                }
+                if let Some(store) = store {
+                    let identity = CausalIdentity {
+                        scope: scope.clone(),
+                        correlation_id: format!("{market:?}:{timestamp_ms}"),
+                        source_timestamp_ms: envelope.metadata.source_time_ms,
+                        ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
+                            .unwrap_or(i64::MAX),
+                    };
+                    let snapshot = crate::causal::DecisionSnapshot::from_book(
+                        &book,
+                        crate::causal::CexTradeMetrics {
+                            last_price: None,
+                            momentum: Decimal::ZERO,
+                            volume: Decimal::ZERO,
+                            cvd: Decimal::ZERO,
+                            vwap: None,
+                        },
+                    );
+                    let decision = if verdicts.is_empty() {
+                        crate::causal::DecisionKind::NoAction
+                    } else {
+                        crate::causal::DecisionKind::Actions(verdicts)
+                    };
+                    crate::causal::CausalRecorder::new(store)
+                        .record_evaluation(&identity, &snapshot, decision)
+                        .await
+                        .map_err(|source| StartError::Storage {
+                            run: run.id().clone(),
+                            source,
+                        })?;
                 }
             }
             MarketEvent::Fill { .. } => {

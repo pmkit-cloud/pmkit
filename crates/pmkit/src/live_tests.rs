@@ -445,3 +445,25 @@ async fn live_transport_failure_leaves_recoverable_pending_intent()
     store.delete_database()?;
     Ok(())
 }
+
+#[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
+async fn live_run_records_a_decision_with_storage() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: a store-backed live run whose venue accepts the strategy's order.
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("pmkit-live-decision-{suffix}.db"));
+    let store = TursoTapeStore::open_local(&path).await?;
+
+    // When: the live driver runs with storage configured.
+    let result = live::drive_with_store(&live_run()?, &config()?, Some(&store)).await;
+
+    // Then: exactly one causal decision is recorded for the single book event.
+    assert!(result.is_ok());
+    let scope = OwnerScope::new(PortfolioId::new("alice")?, RunId::new("live")?);
+    let decisions = store.read_decisions(&scope).await?;
+    assert_eq!(decisions.len(), 1);
+    store.delete_database()?;
+    Ok(())
+}
