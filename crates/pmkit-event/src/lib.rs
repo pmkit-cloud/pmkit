@@ -224,6 +224,8 @@ pub struct StreamMetadata {
 pub struct PmMarketEnvelope {
     /// Preserved transport metadata.
     pub metadata: StreamMetadata,
+    /// Byte-identical text frame received from the venue before adaptation.
+    pub raw_frame: Vec<u8>,
     /// Normalized PM market fact.
     pub fact: MarketEvent,
 }
@@ -235,6 +237,8 @@ pub struct PmAccountEnvelope {
     pub portfolio: PortfolioId,
     /// Preserved transport metadata.
     pub metadata: StreamMetadata,
+    /// Byte-identical text frame received from the venue before adaptation.
+    pub raw_frame: Vec<u8>,
     /// Normalized PM account fact.
     pub fact: PmAccountEvent,
 }

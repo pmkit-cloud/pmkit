@@ -1,12 +1,19 @@
-use super::{BacktestReport, StartError, StrategyInstance, absorb_fills, instantiate_strategies};
+use super::{
+    BacktestReport, StartError, StrategyInstance, absorb_fills, instantiate_strategies,
+    store_signal,
+};
 use pmkit_book::OrderBookL2;
 use pmkit_data::ReplayQuery;
 use pmkit_event::{MarketEvent, SourceEnvelope, StrategyFact};
 use pmkit_sim::{MarketCategory, SimEngine};
 use pmkit_spec::BacktestRun;
+use pmkit_store::{OwnerScope, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
 
-pub async fn drive(run: &BacktestRun) -> Result<BacktestReport, StartError> {
+pub async fn drive(
+    run: &BacktestRun,
+    store: Option<&dyn TapeStore>,
+) -> Result<BacktestReport, StartError> {
     let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
 
     let markets = strategies
@@ -29,8 +36,15 @@ pub async fn drive(run: &BacktestRun) -> Result<BacktestReport, StartError> {
     let mut positions = Vec::new();
     let mut events_processed = 0_usize;
     let mut fills = 0_usize;
+    let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
 
     while let Some(signal) = rx.recv().await {
+        store_signal(store, &scope, &signal)
+            .await
+            .map_err(|source| StartError::Storage {
+                run: run.id().clone(),
+                source,
+            })?;
         let SourceEnvelope::PmMarket(envelope) = (match signal {
             pmkit_data::SourceSignal::Data(envelope) => *envelope,
             pmkit_data::SourceSignal::Watermark(_) | pmkit_data::SourceSignal::Eof => continue,

@@ -33,8 +33,8 @@ pub use binance_cache::{BinanceArchiveLimits, CachePolicy, VerifiedBinanceArchiv
 pub struct RawPmMarketFrame {
     /// Preserved transport metadata.
     pub metadata: StreamMetadata,
-    /// Raw provider payload before venue adaptation.
-    pub payload: serde_json::Value,
+    /// Byte-identical provider text before venue adaptation.
+    pub text: Vec<u8>,
 }
 
 /// An unmodified PM authenticated-account frame plus its transport metadata.
@@ -44,8 +44,8 @@ pub struct RawPmAccountFrame {
     pub portfolio: PortfolioId,
     /// Preserved transport metadata.
     pub metadata: StreamMetadata,
-    /// Raw provider payload before venue adaptation.
-    pub payload: serde_json::Value,
+    /// Byte-identical provider text before venue adaptation.
+    pub text: Vec<u8>,
 }
 
 /// A source of raw PM public-market frames.
@@ -128,6 +128,7 @@ impl SourceSignal {
                 frame_sequence: source_time_ms,
                 ingest_sequence: 0,
             },
+            raw_frame: Vec::new(),
             fact,
         })))
     }

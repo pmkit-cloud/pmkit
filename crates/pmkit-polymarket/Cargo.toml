@@ -23,10 +23,12 @@ pmkit-data = { path = "../pmkit-data" }
 pmkit-event = { path = "../pmkit-event" }
 pmkit-market = { path = "../pmkit-market" }
 pmkit-exec = { path = "../pmkit-exec" }
+pmkit-store = { path = "../pmkit-store" }
 polymarket-client-sdk-v2 = { version = "0.6.0-canary.1", package = "polymarket_client_sdk_v2", features = ["clob", "ws"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 
 [lints]
 workspace = true

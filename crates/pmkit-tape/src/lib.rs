@@ -302,6 +302,7 @@ mod tests {
                 frame_sequence: 4,
                 ingest_sequence: 3,
             },
+            raw_frame: Vec::new(),
             fact: PmAccountEvent::OrderAck {
                 strategy: None,
                 order_id: "order-1".into(),

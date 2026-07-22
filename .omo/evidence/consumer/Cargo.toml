@@ -1,0 +1,22 @@
+[package]
+name = "pmkit-todo7-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+async-trait = "0.1"
+pmkit = { path = "../../../crates/pmkit" }
+pmkit-book = { path = "../../../crates/pmkit-book" }
+pmkit-core = { path = "../../../crates/pmkit-core" }
+pmkit-data = { path = "../../../crates/pmkit-data" }
+pmkit-event = { path = "../../../crates/pmkit-event" }
+pmkit-exec = { path = "../../../crates/pmkit-exec" }
+pmkit-market = { path = "../../../crates/pmkit-market" }
+pmkit-polymarket = { path = "../../../crates/pmkit-polymarket" }
+pmkit-store = { path = "../../../crates/pmkit-store" }
+rust_decimal = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }

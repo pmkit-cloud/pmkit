@@ -26,6 +26,7 @@ fn pm(timestamp_ms: i64, sequence: i64) -> Result<SourceSignal, Box<dyn std::err
     Ok(SourceSignal::Data(Box::new(SourceEnvelope::PmMarket(
         PmMarketEnvelope {
             metadata: metadata("pm", timestamp_ms, 1, sequence),
+            raw_frame: Vec::new(),
             fact: MarketEvent::BookUpdate {
                 market: MarketId::new("btc-5m")?,
                 outcome: Outcome::Up,

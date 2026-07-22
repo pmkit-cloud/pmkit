@@ -102,6 +102,7 @@ impl LiveTape {
                 frame_sequence: 0,
                 ingest_sequence: self.ingest_sequence,
             },
+            raw_frame: Vec::new(),
             fact,
         };
         self.ingest_sequence += 1;

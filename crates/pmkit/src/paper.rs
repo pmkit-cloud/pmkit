@@ -1,4 +1,4 @@
-use super::{PaperReport, StartError, absorb_fills, instantiate_strategies};
+use super::{PaperReport, StartError, absorb_fills, instantiate_strategies, store_signal};
 use pmkit_book::OrderBookL2;
 use pmkit_event::{MarketEvent, SourceEnvelope, StrategyFact};
 use pmkit_exec::Executor;
@@ -6,6 +6,7 @@ use pmkit_market::Outcome;
 use pmkit_paper::PaperExecutor;
 use pmkit_sim::MarketCategory;
 use pmkit_spec::PaperRun;
+use pmkit_store::{OwnerScope, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
 use std::collections::HashSet;
 
@@ -17,7 +18,10 @@ fn drain_fills(rx: &mut tokio::sync::mpsc::Receiver<MarketEvent>) -> Vec<MarketE
     fills
 }
 
-pub async fn drive(run: &PaperRun) -> Result<PaperReport, StartError> {
+pub async fn drive(
+    run: &PaperRun,
+    store: Option<&dyn TapeStore>,
+) -> Result<PaperReport, StartError> {
     let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
 
     let (fill_tx, mut fill_rx) = tokio::sync::mpsc::channel(1024);
@@ -42,8 +46,15 @@ pub async fn drive(run: &PaperRun) -> Result<PaperReport, StartError> {
     let mut positions = Vec::new();
     let mut events_processed = 0_usize;
     let mut fills = 0_usize;
+    let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
 
     while let Some(signal) = event_rx.recv().await {
+        store_signal(store, &scope, &signal)
+            .await
+            .map_err(|source| StartError::Storage {
+                run: run.id().clone(),
+                source,
+            })?;
         let SourceEnvelope::PmMarket(envelope) = (match signal {
             pmkit_data::SourceSignal::Data(envelope) => *envelope,
             pmkit_data::SourceSignal::Watermark(_) | pmkit_data::SourceSignal::Eof => continue,

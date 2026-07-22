@@ -12,18 +12,21 @@ mod backtest;
 pub mod causal;
 /// Deterministic envelope-aware source merging.
 pub mod feed;
-mod live;
+pub(crate) mod live;
 mod paper;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use pmkit_core::{MarketId, RunId};
-use pmkit_event::MarketEvent;
+use pmkit_data::SourceSignal;
+use pmkit_event::{MarketEvent, SourceEnvelope};
 use pmkit_exec::ExecError;
 use pmkit_manifest::build_manifest;
 use pmkit_run::LiveConsent;
 use pmkit_runtime::{RuntimeConfig, StrategyRegistration};
 use pmkit_spec::RunSpec;
+use pmkit_store::{OwnerScope, PmEnvelope, StoreError, TapeStore};
 use pmkit_strategy::Strategy;
 use thiserror::Error;
 
@@ -111,6 +114,14 @@ pub enum StartError {
         /// The underlying filesystem failure.
         source: std::io::Error,
     },
+    /// Configured durable PM storage failed.
+    #[error("storage failed for run {run}: {source}")]
+    Storage {
+        /// The run whose durable storage failed.
+        run: RunId,
+        /// The underlying store failure.
+        source: StoreError,
+    },
 }
 
 /// A failure raised while interacting with a started runtime.
@@ -133,16 +144,29 @@ impl Pmkit {
             config,
             runs: Vec::new(),
             consent: None,
+            store: None,
         }
     }
 }
 
 /// Collects runs before starting the engine.
-#[derive(Debug)]
 pub struct PmkitBuilder {
     config: RuntimeConfig,
     runs: Vec<RunSpec>,
     consent: Option<LiveConsent>,
+    store: Option<Arc<dyn TapeStore>>,
+}
+
+impl std::fmt::Debug for PmkitBuilder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PmkitBuilder")
+            .field("config", &self.config)
+            .field("runs", &self.runs)
+            .field("consent", &self.consent)
+            .field("store", &self.store.as_ref().map(|_| "configured"))
+            .finish()
+    }
 }
 
 impl PmkitBuilder {
@@ -160,6 +184,13 @@ impl PmkitBuilder {
         self
     }
 
+    /// Opts every configured run into durable PM-envelope and causal-decision storage.
+    #[must_use]
+    pub fn storage(mut self, store: Arc<dyn TapeStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
     /// Validates the topology and drives every run to completion.
     ///
     /// # Errors
@@ -172,6 +203,7 @@ impl PmkitBuilder {
             config,
             runs,
             consent,
+            store,
         } = self;
 
         let mut seen = HashSet::new();
@@ -189,18 +221,18 @@ impl PmkitBuilder {
             let manifest_id = run_id_of(&spec).clone();
             match spec {
                 RunSpec::Backtest(run) => {
-                    let report = backtest::drive(&run).await?;
+                    let report = backtest::drive(&run, store.as_deref()).await?;
                     reports.insert(run.id().clone(), RunReport::Backtest(report));
                 }
                 RunSpec::Paper(run) => {
-                    let report = paper::drive(&run).await?;
+                    let report = paper::drive(&run, store.as_deref()).await?;
                     reports.insert(run.id().clone(), RunReport::Paper(report));
                 }
                 RunSpec::Live(run) => {
                     if consent.is_none() {
                         return Err(StartError::LiveConsentMissing(run.id().clone()));
                     }
-                    let report = live::drive(&run, &config).await?;
+                    let report = live::drive_with_store(&run, &config, store.as_deref()).await?;
                     reports.insert(run.id().clone(), RunReport::Live(report));
                 }
             }
@@ -264,6 +296,63 @@ fn run_id_of(spec: &RunSpec) -> &RunId {
         RunSpec::Paper(run) => run.id(),
         RunSpec::Live(run) => run.id(),
     }
+}
+
+async fn store_signal(
+    store: Option<&dyn TapeStore>,
+    scope: &OwnerScope,
+    signal: &SourceSignal,
+) -> Result<(), StoreError> {
+    let Some(store) = store else {
+        return Ok(());
+    };
+    let envelope = match signal {
+        SourceSignal::Data(envelope) => match envelope.as_ref() {
+            SourceEnvelope::PmMarket(envelope) => PmEnvelope {
+                schema_version: envelope.metadata.schema_version,
+                scope: scope.clone(),
+                venue_id: "polymarket".into(),
+                config_hash: "runtime".into(),
+                source_id: envelope.metadata.source_id.clone(),
+                connection_id: envelope.metadata.connection_id.clone(),
+                source_timestamp_ms: envelope.metadata.source_time_ms,
+                canonical_source_rank: envelope.metadata.canonical_source_rank,
+                connection_epoch: envelope.metadata.connection_epoch,
+                frame_sequence: envelope.metadata.frame_sequence,
+                receipt_timestamp_ms: envelope.metadata.receipt_time_ms,
+                ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence).map_err(
+                    |_| StoreError::Storage {
+                        message: "PM ingest sequence exceeds storage range".into(),
+                    },
+                )?,
+                raw_frame: envelope.raw_frame.clone(),
+                normalized: pmkit_tape::market_envelope_json(envelope),
+            },
+            SourceEnvelope::PmAccount(envelope) => PmEnvelope {
+                schema_version: envelope.metadata.schema_version,
+                scope: scope.clone(),
+                venue_id: "polymarket".into(),
+                config_hash: "runtime".into(),
+                source_id: envelope.metadata.source_id.clone(),
+                connection_id: envelope.metadata.connection_id.clone(),
+                source_timestamp_ms: envelope.metadata.source_time_ms,
+                canonical_source_rank: envelope.metadata.canonical_source_rank,
+                connection_epoch: envelope.metadata.connection_epoch,
+                frame_sequence: envelope.metadata.frame_sequence,
+                receipt_timestamp_ms: envelope.metadata.receipt_time_ms,
+                ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence).map_err(
+                    |_| StoreError::Storage {
+                        message: "PM ingest sequence exceeds storage range".into(),
+                    },
+                )?,
+                raw_frame: envelope.raw_frame.clone(),
+                normalized: pmkit_tape::account_envelope_json(envelope),
+            },
+            SourceEnvelope::CexReference(_) => return Ok(()),
+        },
+        SourceSignal::Watermark(_) | SourceSignal::Eof => return Ok(()),
+    };
+    store.store_envelope(&envelope).await
 }
 
 fn absorb_fills(fills: &[MarketEvent], positions: &mut Vec<pmkit_book::Position>) -> usize {

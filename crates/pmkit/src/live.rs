@@ -1,10 +1,14 @@
-use super::{LiveReport, StartError, StrategyInstance, instantiate_strategies};
+use super::{
+    LiveReport, StartError, StrategyInstance, instantiate_strategies,
+    store_signal as persist_signal,
+};
 use pmkit_book::OrderBookL2;
 use pmkit_event::{MarketEvent, SourceEnvelope, StrategyFact};
 use pmkit_exec::{ExecError, OrderId};
 use pmkit_market::Outcome;
 use pmkit_runtime::{LiveOrderPolicy, RuntimeConfig};
 use pmkit_spec::LiveRun;
+use pmkit_store::{OwnerScope, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
 use std::collections::HashSet;
 
@@ -121,7 +125,34 @@ fn report(run: &LiveRun, counts: [usize; 3]) -> LiveReport {
     }
 }
 
+#[cfg(test)]
 pub async fn drive(run: &LiveRun, runtime: &RuntimeConfig) -> Result<LiveReport, StartError> {
+    drive_with_store(run, runtime, None).await
+}
+
+async fn store_signal(
+    run: &LiveRun,
+    store: Option<&dyn TapeStore>,
+    scope: &OwnerScope,
+    signal: &pmkit_data::SourceSignal,
+) -> Result<(), StartError> {
+    persist_signal(store, scope, signal)
+        .await
+        .map_err(|source| StartError::Storage {
+            run: run.id().clone(),
+            source,
+        })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the live run owns one ordered risk, tape, storage, and shutdown lifecycle"
+)]
+pub async fn drive_with_store(
+    run: &LiveRun,
+    runtime: &RuntimeConfig,
+    store: Option<&dyn TapeStore>,
+) -> Result<LiveReport, StartError> {
     let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
     let executor = run.executor().clone();
     let limits = run.risk().clone();
@@ -129,12 +160,14 @@ pub async fn drive(run: &LiveRun, runtime: &RuntimeConfig) -> Result<LiveReport,
     let max_open_orders = usize::try_from(limits.max_open_orders.get()).unwrap_or(usize::MAX);
     let mut event_rx = subscribe(run, &strategies);
     let mut tape = LiveTape::open(run, runtime)?;
+    let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
 
     let mut risk_state = LiveRiskState::default();
     let mut events_processed = 0_usize;
     let mut fills = 0_usize;
     let mut rejected = 0_usize;
     while let Some(signal) = event_rx.recv().await {
+        store_signal(run, store, &scope, &signal).await?;
         let Some(event) = market_event(signal) else {
             continue;
         };
@@ -220,7 +253,23 @@ pub async fn drive(run: &LiveRun, runtime: &RuntimeConfig) -> Result<LiveReport,
         }
     }
 
-    tape.finish(run, runtime, &open_orders).await?;
+    finish(
+        run,
+        runtime,
+        &open_orders,
+        &mut tape,
+        [events_processed, fills, rejected],
+    )
+    .await
+}
 
-    Ok(report(run, [events_processed, fills, rejected]))
+async fn finish(
+    run: &LiveRun,
+    runtime: &RuntimeConfig,
+    open_orders: &HashSet<OrderId>,
+    tape: &mut LiveTape,
+    counts: [usize; 3],
+) -> Result<LiveReport, StartError> {
+    tape.finish(run, runtime, open_orders).await?;
+    Ok(report(run, counts))
 }
