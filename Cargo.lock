@@ -3602,6 +3602,7 @@ dependencies = [
  "pmkit-runtime",
  "pmkit-sim",
  "pmkit-spec",
+ "pmkit-store",
  "pmkit-strategy",
  "pmkit-tape",
  "rust_decimal",

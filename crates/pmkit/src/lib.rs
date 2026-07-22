@@ -8,6 +8,8 @@
 //! risk gate with bounded execution-state reconciliation and optional tapes.
 
 mod backtest;
+/// Portable causal decision snapshots and durable execution recording.
+pub mod causal;
 /// Deterministic envelope-aware source merging.
 pub mod feed;
 mod live;
@@ -301,6 +303,8 @@ fn instantiate_strategies(
 
 #[cfg(test)]
 mod backtest_tests;
+#[cfg(test)]
+mod causal_tests;
 #[cfg(test)]
 mod feed_tests;
 #[cfg(test)]
