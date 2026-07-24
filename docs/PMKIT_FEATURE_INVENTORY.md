@@ -145,7 +145,7 @@ repository, not the long-term target.
   `momentum`, and `inventory_aware`, each self-checking against a deterministic
   scenario.
 
-**Crate:** `pmkit-strategy`.
+**Crates:** `pmkit-strategy`, `pmkit-strategy-testkit`.
 
 ### Deliberately absent
 
@@ -156,7 +156,9 @@ repository, not the long-term target.
 
 ### Candidate additions
 
-- Strategy metrics/test helpers.
+- Strategy metrics helpers (deterministic book/fact/fill builders, a
+  single-market harness, and action assertions now ship in
+  `pmkit-strategy-testkit`).
 
 ## 8. Execution and simulation
 
@@ -602,8 +604,11 @@ behavioral test and documentation update.
   `inventory_aware` (position-skewed buy/reduce) live in
   `crates/pmkit-strategy/examples/`, each a self-checking executable that
   asserts its produced `Actions` against a deterministic scenario.
-- [ ] **P2-7: add strategy test utilities.** Deterministic books, facts, fills,
-  and action assertions.
+- [x] **P2-7: add strategy test utilities.** `pmkit-strategy-testkit` ships
+  deterministic builders (`book`, `tick`, `last_trade`, `reference_trade`,
+  `account_fill`, `position`), a single-market `Harness` that drives a strategy
+  and returns its `Actions`, and action assertions (`assert_no_actions`,
+  `assert_placed`, `assert_cancels_all`, `placed_orders`).
 - [ ] **P2-8: add run cancellation and event subscriptions.** Expose lifecycle
   state without leaking executor or storage internals.
 - [ ] **P2-9: add typed CLI only after API stabilizes.** No dynamic plugin or
@@ -655,5 +660,7 @@ behavioral test and documentation update.
 - P2-6 adds three self-checking example strategies (`market_maker`, `momentum`,
   `inventory_aware`), each run via `cargo run -p pmkit-strategy --example <name>`
   and asserting its `Actions` against a deterministic scenario.
-- P0-1 through P0-5, P1-1 through P1-16, and P2-1 through P2-6 were resolved
-  after review; P2-7 onward remains open.
+- P2-7 adds `pmkit-strategy-testkit` (6 tests) driving a sample strategy through
+  the harness with the builders and asserting via the action helpers.
+- P0-1 through P0-5, P1-1 through P1-16, and P2-1 through P2-7 were resolved
+  after review; P2-8 onward remains open.

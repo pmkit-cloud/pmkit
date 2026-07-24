@@ -1,0 +1,25 @@
+[package]
+name = "pmkit-strategy-testkit"
+description = "Deterministic test utilities for PMKit strategies: book/fact/fill builders, a single-market harness, and action assertions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rust_decimal = { workspace = true }
+pmkit-core = { path = "../pmkit-core" }
+pmkit-book = { path = "../pmkit-book" }
+pmkit-event = { path = "../pmkit-event" }
+pmkit-exec = { path = "../pmkit-exec" }
+pmkit-market = { path = "../pmkit-market" }
+pmkit-strategy = { path = "../pmkit-strategy" }
+
+[lints]
+workspace = true
