@@ -13,7 +13,7 @@ use pmkit_core::MarketId;
 use pmkit_event::MarketEvent;
 use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
 use pmkit_market::Outcome;
-use pmkit_sim::{MarketCategory, SimEngine};
+use pmkit_sim::{MarketCategory, SimEngine, SimulationConfig};
 use tokio::sync::mpsc::Sender;
 
 /// An executor that simulates fills instead of routing to a venue.
@@ -34,6 +34,20 @@ impl PaperExecutor {
     ) -> Self {
         Self {
             engine: Mutex::new(SimEngine::new(id_prefix, 0, category)),
+            fills,
+        }
+    }
+
+    /// Creates a paper executor with explicit simulation inputs.
+    #[must_use]
+    pub fn with_config(
+        fills: Sender<MarketEvent>,
+        id_prefix: impl Into<String>,
+        category: MarketCategory,
+        config: SimulationConfig,
+    ) -> Self {
+        Self {
+            engine: Mutex::new(SimEngine::with_config(id_prefix, 0, category, config)),
             fills,
         }
     }
