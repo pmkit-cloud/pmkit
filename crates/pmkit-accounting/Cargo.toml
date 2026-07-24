@@ -1,0 +1,24 @@
+[package]
+name = "pmkit-accounting"
+description = "Chain- and venue-independent PMKit portfolio accounting."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+pmkit-book = { path = "../pmkit-book" }
+pmkit-core = { path = "../pmkit-core" }
+pmkit-money = { path = "../pmkit-money" }
+pmkit-market = { path = "../pmkit-market" }
+rust_decimal = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
