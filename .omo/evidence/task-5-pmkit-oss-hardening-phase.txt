@@ -1,0 +1,81 @@
+Task 5: Capture reproducibility provenance in the manifest
+Date: 2026-07-24
+
+RED
+$ cargo test -p pmkit-manifest
+error[E0432]: unresolved imports `super::GitProvenance`, `super::Provenance`,
+`super::VersionedManifest`, `super::build_manifest_with_provenance`
+Result: expected failure before implementation.
+
+FOCUSED PACKAGE GATE
+$ cargo test -p pmkit-manifest
+running 6 tests
+test tests::backtest_manifest_captures_topology ... ok
+test tests::manifest_v1_round_trip ... ok
+test tests::manifest_v2_round_trip ... ok
+test tests::provenance_captured ... ok
+test tests::provenance_absent_git_is_deterministic ... ok
+test tests::manifest_rejects_unsupported_and_malformed ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+Exit: 0
+
+LOCKFILE DIGEST CHECK
+$ shasum -a 256 Cargo.lock
+3268e3cebe3d2536bb2d93c4e175e23953e56c8ba27a2381ff66b065b06dc4df  Cargo.lock
+Generated provenance.rs embedded the same digest.
+Exit: 0
+
+FULL GATE SUITE
+The primary worktree contained unrelated concurrent pmkit-api/event/store edits,
+so the exact task patch was applied to a clean detached worktree at fdfed38.
+
+$ cargo test -p pmkit-manifest
+test result: ok. 6 passed; 0 failed
+Exit: 0
+
+$ cargo fmt --all -- --check
+Exit: 0
+
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+Finished `dev` profile successfully with no warnings or errors.
+Exit: 0
+
+$ cargo test --workspace
+All workspace unit, integration, and doc tests passed.
+Exit: 0
+
+$ cargo doc --workspace --no-deps
+Generated workspace documentation for pmkit and 23 other crates.
+Exit: 0
+
+$ git diff --check
+Exit: 0
+
+Temporary verification worktree was reversed and removed after the gates.
+
+FINAL CURRENT-MAIN RERUN
+After concurrent todos committed, the same exact suite was rerun in the primary
+worktree against current `main`.
+
+$ cargo test -p pmkit-manifest
+test result: ok. 6 passed; 0 failed
+Exit: 0
+
+$ cargo fmt --all -- --check
+Exit: 0
+
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+Finished successfully with no warnings or errors.
+Exit: 0
+
+$ cargo test --workspace
+All workspace unit, integration, and doc tests passed, including 39 pmkit-store
+tests and 7 pmkit-api tests.
+Exit: 0
+
+$ cargo doc --workspace --no-deps
+Generated workspace documentation for pmkit and 23 other crates.
+Exit: 0
+
+$ git diff --check
+Exit: 0
