@@ -141,7 +141,9 @@ repository, not the long-term target.
 - Immutable `StrategyContext` containing fact, market, book, positions, and time.
 - Actions: place, cancel, replace quotes, cancel all.
 - Strategy and factory error types.
-- Minimal `threshold_taker` example.
+- Executable example strategies: `threshold_taker`, `market_maker`,
+  `momentum`, and `inventory_aware`, each self-checking against a deterministic
+  scenario.
 
 **Crate:** `pmkit-strategy`.
 
@@ -154,9 +156,6 @@ repository, not the long-term target.
 
 ### Candidate additions
 
-- Example market maker.
-- Example momentum strategy.
-- Example inventory-aware strategy.
 - Strategy metrics/test helpers.
 
 ## 8. Execution and simulation
@@ -598,8 +597,11 @@ behavioral test and documentation update.
 
 ### P2: SDK ergonomics
 
-- [ ] **P2-6: add standard strategy examples.** Market maker, momentum, and
-  inventory-aware examples with executable tests.
+- [x] **P2-6: add standard strategy examples.** `market_maker` (two-sided
+  requote around mid), `momentum` (CEX-reference-driven taker), and
+  `inventory_aware` (position-skewed buy/reduce) live in
+  `crates/pmkit-strategy/examples/`, each a self-checking executable that
+  asserts its produced `Actions` against a deterministic scenario.
 - [ ] **P2-7: add strategy test utilities.** Deterministic books, facts, fills,
   and action assertions.
 - [ ] **P2-8: add run cancellation and event subscriptions.** Expose lifecycle
@@ -650,5 +652,8 @@ behavioral test and documentation update.
 - P2-5 locks raw-evidence immutability with a reopen-and-append archive test
   (7 archive tests) proving committed segments stay byte- and checksum-identical
   while new records append; secondary-file compaction is deferred.
-- P0-1 through P0-5, P1-1 through P1-16, and P2-1 through P2-5 were resolved
-  after review; the P2 storage track is complete.
+- P2-6 adds three self-checking example strategies (`market_maker`, `momentum`,
+  `inventory_aware`), each run via `cargo run -p pmkit-strategy --example <name>`
+  and asserting its `Actions` against a deterministic scenario.
+- P0-1 through P0-5, P1-1 through P1-16, and P2-1 through P2-6 were resolved
+  after review; P2-7 onward remains open.
