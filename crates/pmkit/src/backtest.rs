@@ -233,3 +233,162 @@ fn run_strategies(
     }
     (fills, actions_placed)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        Pmkit, RunReport, StartError,
+        test_support::{config, risk},
+    };
+    use async_trait::async_trait;
+    use pmkit_core::{MarketId, PortfolioId, RunId};
+    use pmkit_data::{DataSourceError, HistoricalDataSource, SourceSignal};
+    use pmkit_event::MarketEvent;
+    use pmkit_market::Outcome;
+    use pmkit_money::Money;
+    use pmkit_run::{EvidenceRequirement, RetrievalWait};
+    use pmkit_spec::{BacktestRun, ConservativeV1Config, ReplaySpec};
+    use rust_decimal::Decimal;
+    use std::{num::NonZeroUsize, sync::Arc, time::Duration};
+    use tokio::sync::{Barrier, mpsc::Sender};
+
+    struct RendezvousHistory {
+        barrier: Option<Arc<Barrier>>,
+    }
+
+    #[async_trait]
+    impl HistoricalDataSource for RendezvousHistory {
+        async fn replay(
+            &self,
+            _query: crate::ReplayQuery,
+            sink: Sender<SourceSignal>,
+        ) -> Result<(), DataSourceError> {
+            if let Some(barrier) = &self.barrier {
+                barrier.wait().await;
+            }
+            sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
+                market: MarketId::new("btc-5m").map_err(|_| DataSourceError::NotAvailable)?,
+                outcome: Outcome::Up,
+                bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+                asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
+                timestamp_ms: 1,
+            }))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+            sink.send(SourceSignal::Watermark(i64::MAX))
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)?;
+            sink.send(SourceSignal::Eof)
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)
+        }
+    }
+
+    fn run(
+        id: &str,
+        barrier: Option<Arc<Barrier>>,
+    ) -> Result<BacktestRun, Box<dyn std::error::Error>> {
+        let replay = ReplaySpec::new(
+            Arc::new(RendezvousHistory { barrier }),
+            "2026-01-01T00:00:00Z".parse()?,
+            "2026-02-01T00:00:00Z".parse()?,
+            EvidenceRequirement::CorroboratedOnly,
+            RetrievalWait::ReturnPending,
+        );
+        Ok(BacktestRun::new(
+            RunId::new(id)?,
+            PortfolioId::new("research")?,
+            replay,
+            Money::usdc(1_000),
+            risk()?,
+            ConservativeV1Config {
+                activation_latency: Duration::ZERO,
+                maker_queue_ahead_bps: 0,
+                slippage_bps: 0,
+                market_impact_bps: 0,
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn concurrent_equals_sequential() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: identical two-run topologies with sequential and parallel limits.
+        let sequential = Pmkit::builder(config()?)
+            .run(run("a", None)?)
+            .run(run("b", None)?)
+            .start()
+            .await?;
+        let mut parallel_config = config()?;
+        parallel_config.backtest_concurrency = NonZeroUsize::new(2).ok_or("nonzero concurrency")?;
+        let barrier = Arc::new(Barrier::new(2));
+
+        // When: both parallel sources must rendezvous before either can finish.
+        let parallel = tokio::time::timeout(
+            Duration::from_secs(1),
+            Pmkit::builder(parallel_config)
+                .run(run("a", Some(Arc::clone(&barrier)))?)
+                .run(run("b", Some(barrier))?)
+                .start(),
+        )
+        .await??;
+
+        // Then: every report is identical regardless of scheduling concurrency.
+        for id in [RunId::new("a")?, RunId::new("b")?] {
+            let (
+                Some(RunReport::Backtest(sequential_report)),
+                Some(RunReport::Backtest(parallel_report)),
+            ) = (sequential.report(&id), parallel.report(&id))
+            else {
+                return Err("expected matching backtest reports".into());
+            };
+            assert_eq!(sequential_report.run, parallel_report.run);
+            assert_eq!(
+                sequential_report.events_processed,
+                parallel_report.events_processed
+            );
+            assert_eq!(sequential_report.fills, parallel_report.fills);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_run_id_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: two independent backtests sharing one run identity.
+        let duplicate = RunId::new("duplicate")?;
+
+        // When: the topology is validated before scheduling work.
+        let result = Pmkit::builder(config()?)
+            .run(run("duplicate", None)?)
+            .run(run("duplicate", None)?)
+            .start()
+            .await;
+
+        // Then: duplicate detection remains fail-fast.
+        assert!(matches!(
+            result,
+            Err(StartError::DuplicateRunId(run)) if run == duplicate
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_are_exposed_in_submission_order() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: run submission order that differs from lexical order.
+        let app = Pmkit::builder(config()?)
+            .run(run("zeta", None)?)
+            .run(run("alpha", None)?)
+            .start()
+            .await?;
+
+        // When: reports are listed through the ordered public surface.
+        let reports = app.reports_ordered();
+
+        // Then: task completion and hash iteration cannot change submission order.
+        let run_ids: Vec<_> = reports
+            .into_iter()
+            .map(|(run, _report)| run.to_string())
+            .collect();
+        assert_eq!(run_ids, ["zeta", "alpha"]);
+        Ok(())
+    }
+}

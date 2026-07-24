@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinSet};
 
 use pmkit_core::{MarketId, RunId, StrategyId};
 use pmkit_data::SourceSignal;
@@ -104,6 +104,9 @@ pub enum StartError {
     /// Two runs shared the same [`RunId`].
     #[error("duplicate run id: {0}")]
     DuplicateRunId(RunId),
+    /// A backtest task could not be joined safely.
+    #[error("backtest task failed: {0}")]
+    BacktestTask(#[source] tokio::task::JoinError),
     /// A strategy factory failed during instantiation.
     #[error("strategy init failed for run {run}: {source}")]
     StrategyInit {
@@ -312,7 +315,6 @@ impl PmkitBuilder {
     /// Returns [`StartError`] on a duplicate run id or a strategy that fails to
     /// initialise.
     pub async fn start(self) -> Result<AppHandle, StartError> {
-        // ponytail: backtest_concurrency is accepted but v0 runs sequentially.
         let Self {
             config,
             runs,
@@ -324,30 +326,44 @@ impl PmkitBuilder {
         let control = RunControl { cancel, subscriber };
 
         let mut seen = HashSet::new();
+        let mut report_order = Vec::with_capacity(runs.len());
         for spec in &runs {
             let id = run_id_of(spec);
             if !seen.insert(id.clone()) {
                 return Err(StartError::DuplicateRunId(id.clone()));
             }
+            report_order.push(id.clone());
         }
 
         let mut reports = HashMap::new();
         let mut manifests = HashMap::new();
+        let mut backtests = JoinSet::new();
         for spec in runs {
             let manifest = build_manifest(&spec, &config);
             let manifest_id = run_id_of(&spec).clone();
             match spec {
                 RunSpec::Backtest(run) => {
-                    let report =
-                        backtest::drive_with_control(&run, store.as_deref(), &control).await?;
-                    reports.insert(run.id().clone(), RunReport::Backtest(report));
+                    if backtests.len() >= config.backtest_concurrency.get() {
+                        collect_backtest_report(&mut backtests, &mut reports).await?;
+                    }
+                    let store = store.clone();
+                    let control = control.clone();
+                    backtests.spawn(async move {
+                        backtest::drive_with_control(&run, store.as_deref(), &control).await
+                    });
                 }
                 RunSpec::Paper(run) => {
+                    while !backtests.is_empty() {
+                        collect_backtest_report(&mut backtests, &mut reports).await?;
+                    }
                     let report =
                         paper::drive_with_control(&run, store.as_deref(), &control).await?;
                     reports.insert(run.id().clone(), RunReport::Paper(report));
                 }
                 RunSpec::Live(run) => {
+                    while !backtests.is_empty() {
+                        collect_backtest_report(&mut backtests, &mut reports).await?;
+                    }
                     if consent.is_none() {
                         return Err(StartError::LiveConsentMissing(run.id().clone()));
                     }
@@ -358,18 +374,35 @@ impl PmkitBuilder {
             }
             manifests.insert(manifest_id, manifest);
         }
+        while !backtests.is_empty() {
+            collect_backtest_report(&mut backtests, &mut reports).await?;
+        }
         Ok(AppHandle {
             reports,
+            report_order,
             manifests,
             config,
         })
     }
 }
 
+async fn collect_backtest_report(
+    backtests: &mut JoinSet<Result<BacktestReport, StartError>>,
+    reports: &mut HashMap<RunId, RunReport>,
+) -> Result<(), StartError> {
+    let Some(joined) = backtests.join_next().await else {
+        return Ok(());
+    };
+    let report = joined.map_err(StartError::BacktestTask)??;
+    reports.insert(report.run.clone(), RunReport::Backtest(report));
+    Ok(())
+}
+
 /// Handle to a started engine, holding each run's terminal report.
 #[derive(Debug)]
 pub struct AppHandle {
     reports: HashMap<RunId, RunReport>,
+    report_order: Vec<RunId>,
     manifests: HashMap<RunId, serde_json::Value>,
     config: RuntimeConfig,
 }
@@ -395,6 +428,15 @@ impl AppHandle {
     #[must_use]
     pub fn report(&self, run: &RunId) -> Option<&RunReport> {
         self.reports.get(run)
+    }
+
+    /// Returns all reports in run submission order.
+    #[must_use]
+    pub fn reports_ordered(&self) -> Vec<(&RunId, &RunReport)> {
+        self.report_order
+            .iter()
+            .filter_map(|run| self.reports.get_key_value(run))
+            .collect()
     }
 
     /// Returns the reproducibility manifest for `run`, if it exists.
