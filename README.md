@@ -39,6 +39,7 @@ changes until `0.1.0` stabilizes.
 | [`pmkit-store`](crates/pmkit-store) | Durable Turso-backed `TapeStore` for lossless PM envelopes, causal decisions, and idempotent order intents. |
 | [`pmkit`](crates/pmkit) | Orchestration engine: `Pmkit` builder, `AppHandle`, deterministic feed merge, causal recording, and the backtest/paper/live drivers. |
 | [`pmkit-polymarket`](crates/pmkit-polymarket) | Polymarket venue adapter: live WebSocket data, authenticated CLOB execution, raw frame interception, and neutral/venue mapping. |
+| [`pmkit-collector`](crates/pmkit-collector) | Reliable OSS raw-frame collector: reconnect, subscription sharding, bounded-channel backpressure, heartbeat, and graceful shutdown over a `RawTapeSink`, with a `tokio-tungstenite` transport. |
 
 The public SDK stays exchange-neutral; venue specifics (Polymarket signing,
 slugs, condition IDs) live behind the adapter, never in the core.

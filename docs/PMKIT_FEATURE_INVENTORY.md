@@ -277,8 +277,12 @@ repository, not the long-term target.
 - Canonical chain log/checkpoint storage.
 - Reorg replacement segments.
 - Storage opt-in; CEX events are not stored.
+- Reliable raw-frame collector (`pmkit-collector`): transport-agnostic
+  reconnect with fresh per-epoch connection identity, subscription sharding,
+  bounded-channel backpressure, heartbeats, and graceful drain/flush over the
+  v1 `RawTapeSink`, with a concrete `tokio-tungstenite` transport.
 
-**Crates:** `pmkit-tape`, `pmkit-store`.
+**Crates:** `pmkit-tape`, `pmkit-store`, `pmkit-collector`.
 
 ### Gaps
 
@@ -551,8 +555,14 @@ behavioral test and documentation update.
   and the exact raw text frame. Graceful flush and fail-closed crash-tail
   recovery are specified in `docs/PMKIT_RAW_TAPE_FORMAT.md` and locked by the
   raw-tape contract tests.
-- [ ] **P2-2: build the OSS collector.** WebSocket reconnect, subscription
-  sharding, bounded channels, backpressure, heartbeat, and graceful shutdown.
+- [x] **P2-2: build the OSS collector.** `pmkit-collector` drives an injected
+  transport, preserving every text frame into the v1 `RawTapeSink` without
+  dropping evidence. It reconnects with a fresh `connection_id` per epoch under
+  a bounded reconnect budget, shards subscriptions one connection each, applies
+  backpressure through one bounded channel, heartbeats each connection, and on
+  shutdown drains buffered frames and flushes. `WebSocketTransport` is the
+  concrete `tokio-tungstenite` implementation; object-store durability stays in
+  P2-3.
 - [ ] **P2-3: define durable object-store sink.** S3 multipart uploads, retry,
   atomic manifests, checksums, and recovery after process loss.
 - [ ] **P2-4: evaluate Parquet separately.** Add columnar derivation only after
@@ -584,7 +594,7 @@ behavioral test and documentation update.
 
 ## Review evidence
 
-- `cargo test --workspace`: 161 tests passed.
+- `cargo test --workspace`: 168 tests passed.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `cargo doc --workspace --no-deps`: passed.
 - `pmkit-store` P1-1 focused tests: 13 passed.
@@ -596,5 +606,12 @@ behavioral test and documentation update.
 - P2-1 raw-tape tests cover schema version, connection identity, receipt time,
   exact raw text, newline framing, legacy-version rejection, crash-tail
   recovery, malformed complete records, and flush forwarding.
-- P0-1 through P0-5, P1-1 through P1-16, and P2-1 were fixed after review;
-  P2-2 onward remains open.
+- P2-2 collector tests cover subscription sharding, reconnect with a fresh
+  connection identity after clean close and error, bounded-channel backpressure
+  preserving every frame in order, periodic heartbeats, graceful drain/flush on
+  shutdown, fail-closed reconnect-budget exhaustion, and a real
+  `tokio-tungstenite` transport collecting a frame from a local server. The
+  `cargo run -p pmkit-collector --example collect` surface prints a reconnecting
+  run's tape.
+- P0-1 through P0-5, P1-1 through P1-16, and P2-1 through P2-2 were fixed after
+  review; P2-3 onward remains open.

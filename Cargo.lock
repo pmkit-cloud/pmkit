@@ -3647,6 +3647,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmkit-collector"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "pmkit-tape",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "pmkit-core"
 version = "0.1.0"
 
