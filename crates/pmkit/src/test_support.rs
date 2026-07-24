@@ -56,7 +56,11 @@ pub fn risk() -> Result<RiskLimits, Box<dyn std::error::Error>> {
     Ok(RiskLimits {
         max_order_notional: Money::usdc(100),
         max_position_notional: Money::usdc(1_000),
+        max_portfolio_notional: Money::usdc(5_000),
+        max_market_notional: Money::usdc(2_000),
+        max_strategy_notional: Money::usdc(1_000),
         max_open_orders: NonZeroU32::new(10).ok_or("nonzero")?,
         max_loss: Money::usdc(500),
+        max_daily_loss: Money::usdc(500),
     })
 }

@@ -20,7 +20,7 @@ mod paper;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use pmkit_core::{MarketId, RunId};
+use pmkit_core::{MarketId, RunId, StrategyId};
 use pmkit_data::SourceSignal;
 use pmkit_event::{MarketEvent, SourceEnvelope};
 use pmkit_exec::ExecError;
@@ -33,7 +33,11 @@ use pmkit_strategy::Strategy;
 use thiserror::Error;
 
 /// A registered strategy instance keyed by its exact market.
-type StrategyInstance = (MarketId, Box<dyn Strategy>);
+struct StrategyInstance {
+    market: MarketId,
+    id: StrategyId,
+    strategy: Box<dyn Strategy>,
+}
 
 pub use pmkit_data::ReplayQuery;
 
@@ -132,6 +136,9 @@ pub enum StartError {
         /// The underlying store failure.
         source: StoreError,
     },
+    /// A persisted portfolio kill switch blocked live execution.
+    #[error("portfolio kill switch is active for live run {0}")]
+    KillSwitchActive(RunId),
 }
 
 /// A failure raised while interacting with a started runtime.
@@ -395,7 +402,11 @@ fn instantiate_strategies(
                     run: run.clone(),
                     source,
                 })?;
-        strategies.push((registration.market().clone(), strategy));
+        strategies.push(StrategyInstance {
+            market: registration.market().clone(),
+            id: registration.id().clone(),
+            strategy,
+        });
     }
     Ok(strategies)
 }

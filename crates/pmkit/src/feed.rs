@@ -227,7 +227,7 @@ impl MergedFeed {
                     match signal {
                         SourceSignal::Data(envelope) => {
                             let envelope = *envelope;
-                            let key = envelope.canonical_key().ok_or_else(|| replay_gap("CEX BBO is not strategy input"))?;
+                            let key = envelope.canonical_key();
                             if state.watermark.is_some_and(|watermark| key.timestamp_ms() <= watermark) { return abort(&mut tasks, replay_gap("late record")).await; }
                             queued.push(Reverse(QueuedFact { key, fact: merged_fact(envelope) }));
                         }
@@ -295,7 +295,11 @@ async fn release_safe(
     states: &HashMap<String, SourceState>,
     output: &mpsc::Sender<MergedFact>,
 ) -> Result<(), DataSourceError> {
-    let watermark = states.values().filter_map(|state| state.watermark).min();
+    let watermark = states
+        .values()
+        .map(|state| state.watermark)
+        .collect::<Option<Vec<_>>>()
+        .and_then(|watermarks| watermarks.into_iter().min());
     while watermark.is_some_and(|watermark| {
         queued
             .peek()
