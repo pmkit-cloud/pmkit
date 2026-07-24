@@ -43,3 +43,39 @@ downgrade path.
 
 Object-store durability, checksums, and process-loss upload recovery belong to
 P2-3 and do not change this record format.
+
+## Object-store durability plane (P2-3)
+
+`pmkit-archive` durably retains raw records without changing the record format
+above. Records are buffered into fixed-size **segments** of newline-delimited
+v1 records and uploaded through an S3-shaped multipart `ObjectStore`: initiate,
+upload parts, then complete. Each part and each full segment carries a SHA-256
+checksum.
+
+A segment becomes durable only once the atomic `manifest.json` references it.
+The manifest is the sole source of truth: it lists every committed segment with
+its checksum and record count and is written last, as a single atomic object
+(`put`). A segment whose multipart upload completes but whose manifest commit
+never lands is ignored on recovery and never counted as durable.
+
+## Manifest schema and recovery
+
+The manifest is `{"schema_version":1,"segments":[{"key","sha256_hex",
+"records"}]}`. Readers reject any other `schema_version` with a fail-closed
+corruption error; they never guess an unknown shape.
+
+On restart, recovery reads the manifest, re-reads every committed segment and
+verifies its checksum (a mismatch or missing segment fails closed), then aborts
+any dangling multipart uploads left by the dead process. Recovery therefore
+never overstates durability and never resurrects partial uploads.
+
+## Compatibility and rollback
+
+A change to the manifest or segment shape follows
+`docs/PMKIT_STORAGE_COMPATIBILITY.md`: bump `schema_version`, add a migration or
+explicit incompatibility error, add old/new fixtures, and preserve committed
+segment checksums as immutable evidence. Rollback means retaining the previous
+manifest and segments; committed segment objects are immutable and are never
+rewritten in place. The concrete S3 client that implements `ObjectStore` is a
+separate product-infrastructure project and does not change this plane's
+contract.

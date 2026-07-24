@@ -1,0 +1,28 @@
+[package]
+name = "pmkit-archive"
+description = "Durable object-store retention plane for PMKit raw tape evidence: multipart segment uploads, atomic manifests, checksums, retry, and process-loss recovery."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+pmkit-tape = { path = "../pmkit-tape" }
+
+[lints]
+workspace = true

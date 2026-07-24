@@ -282,7 +282,7 @@ repository, not the long-term target.
   bounded-channel backpressure, heartbeats, and graceful drain/flush over the
   v1 `RawTapeSink`, with a concrete `tokio-tungstenite` transport.
 
-**Crates:** `pmkit-tape`, `pmkit-store`, `pmkit-collector`.
+**Crates:** `pmkit-tape`, `pmkit-store`, `pmkit-collector`, `pmkit-archive`.
 
 ### Gaps
 
@@ -295,7 +295,10 @@ repository, not the long-term target.
 
 ### Deliberately absent
 
-- S3 storage.
+- Concrete S3 client. The durable object-store *contract* (multipart segments,
+  atomic manifest, checksums, process-loss recovery) is OSS in `pmkit-archive`
+  with an `FsObjectStore` reference; the real S3 adapter that implements
+  `ObjectStore` belongs to the separate product-infrastructure project.
 - Parquet retention plane.
 - Long-term cloud archive policy.
 - WebSocket discovery daemon.
@@ -563,8 +566,14 @@ behavioral test and documentation update.
   shutdown drains buffered frames and flushes. `WebSocketTransport` is the
   concrete `tokio-tungstenite` implementation; object-store durability stays in
   P2-3.
-- [ ] **P2-3: define durable object-store sink.** S3 multipart uploads, retry,
-  atomic manifests, checksums, and recovery after process loss.
+- [x] **P2-3: define durable object-store sink.** `pmkit-archive` defines the
+  durability contract: an S3-shaped multipart `ObjectStore`, an atomic
+  schema-versioned `Manifest` that is the sole source of durability truth,
+  SHA-256 checksums per part and segment, bounded retry on transient failures,
+  and process-loss recovery that verifies committed segments, aborts dangling
+  uploads, and fails closed on corruption or version mismatch. `FsObjectStore`
+  is the filesystem reference; a concrete S3 client stays in the separate
+  product-infrastructure project.
 - [ ] **P2-4: evaluate Parquet separately.** Add columnar derivation only after
   raw durability and replay recovery are proven.
 - [ ] **P2-5: add retention/compaction.** Keep raw evidence immutable; derive and
@@ -594,7 +603,7 @@ behavioral test and documentation update.
 
 ## Review evidence
 
-- `cargo test --workspace`: 168 tests passed.
+- `cargo test --workspace`: 174 tests passed.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `cargo doc --workspace --no-deps`: passed.
 - `pmkit-store` P1-1 focused tests: 13 passed.
@@ -613,5 +622,10 @@ behavioral test and documentation update.
   `tokio-tungstenite` transport collecting a frame from a local server. The
   `cargo run -p pmkit-collector --example collect` surface prints a reconnecting
   run's tape.
-- P0-1 through P0-5, P1-1 through P1-16, and P2-1 through P2-2 were fixed after
-  review; P2-3 onward remains open.
+- P2-3 archive tests cover multipart segment round-trip and recovery, checksum
+  tamper fail-closed, process-loss abort of dangling uploads, manifest-is-sole-
+  truth for an orphan completed segment, unsupported-manifest-version rejection,
+  and transient-put retry. The `cargo run -p pmkit-archive --example durable`
+  surface writes, closes, reopens, and recovers durable evidence.
+- P0-1 through P0-5, P1-1 through P1-16, and P2-1 through P2-3 were fixed after
+  review; P2-4 onward remains open.

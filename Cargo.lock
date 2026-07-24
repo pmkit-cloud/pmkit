@@ -3639,6 +3639,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmkit-archive"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pmkit-tape",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "pmkit-book"
 version = "0.1.0"
 dependencies = [

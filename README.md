@@ -40,6 +40,7 @@ changes until `0.1.0` stabilizes.
 | [`pmkit`](crates/pmkit) | Orchestration engine: `Pmkit` builder, `AppHandle`, deterministic feed merge, causal recording, and the backtest/paper/live drivers. |
 | [`pmkit-polymarket`](crates/pmkit-polymarket) | Polymarket venue adapter: live WebSocket data, authenticated CLOB execution, raw frame interception, and neutral/venue mapping. |
 | [`pmkit-collector`](crates/pmkit-collector) | Reliable OSS raw-frame collector: reconnect, subscription sharding, bounded-channel backpressure, heartbeat, and graceful shutdown over a `RawTapeSink`, with a `tokio-tungstenite` transport. |
+| [`pmkit-archive`](crates/pmkit-archive) | Durable object-store retention plane: S3-shaped multipart segment uploads, atomic checksummed manifests, retry, and process-loss recovery, with a filesystem reference store. |
 
 The public SDK stays exchange-neutral; venue specifics (Polymarket signing,
 slugs, condition IDs) live behind the adapter, never in the core.
