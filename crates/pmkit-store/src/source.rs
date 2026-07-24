@@ -1,18 +1,12 @@
 use async_trait::async_trait;
-use thiserror::Error;
 
 use crate::{CanonicalLogSegment, ChainCheckpoint};
 
-/// Error returned by a canonical-log source before durable ingestion.
-#[derive(Debug, Error)]
-pub enum ChainSourceError {
-    /// The source cannot produce a canonical segment.
-    #[error("canonical log source failed: {message}")]
-    Unavailable {
-        /// Source-specific detail.
-        message: String,
-    },
-}
+pub use crate::raw::{
+    BlockHead, ChainSourceError, FinalizedBlockCoverage, FinalizedBlockRange,
+    FinalizedProviderHead, FinalizedRawLogBatch, FinalizedRawLogProvider, ProviderIdentity,
+    RawLogIdentity, RawRpcLog, agree_on_finalized_heads,
+};
 
 /// A trait-first source of parsed canonical logs; no RPC client is implied.
 #[async_trait]
