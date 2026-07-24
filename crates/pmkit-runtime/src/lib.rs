@@ -21,10 +21,18 @@ pub struct RiskLimits {
     pub max_order_notional: Money,
     /// Maximum notional held in one position.
     pub max_position_notional: Money,
+    /// Maximum marked notional across the portfolio.
+    pub max_portfolio_notional: Money,
+    /// Maximum marked and reserved notional in one market.
+    pub max_market_notional: Money,
+    /// Maximum reserved notional attributable to one strategy.
+    pub max_strategy_notional: Money,
     /// Maximum number of simultaneously open orders.
     pub max_open_orders: NonZeroU32,
     /// Maximum tolerated loss before the portfolio is killed.
     pub max_loss: Money,
+    /// Maximum daily portfolio loss before new orders are rejected.
+    pub max_daily_loss: Money,
 }
 
 /// What the runtime does with live orders during shutdown.
@@ -191,8 +199,12 @@ mod tests {
         let limits = RiskLimits {
             max_order_notional: Money::usdc(100),
             max_position_notional: Money::usdc(1_000),
+            max_portfolio_notional: Money::usdc(5_000),
+            max_market_notional: Money::usdc(2_000),
+            max_strategy_notional: Money::usdc(1_000),
             max_open_orders: NonZeroU32::new(10).ok_or("nonzero orders")?,
             max_loss: Money::usdc(500),
+            max_daily_loss: Money::usdc(500),
         };
         assert!(limits.max_loss < limits.max_position_notional);
 
