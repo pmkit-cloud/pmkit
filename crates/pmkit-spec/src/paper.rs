@@ -2,7 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use pmkit_core::{PortfolioId, RunId};
-use pmkit_data::LiveDataSource;
+use pmkit_data::{LiveAccountDataSource, LiveCexDataSource, LiveDataSource};
 use pmkit_money::Money;
 use pmkit_runtime::{RiskLimits, StrategyRegistration};
 
@@ -15,6 +15,8 @@ pub struct PaperRun {
     initial_cash: Money,
     risk: RiskLimits,
     market_data: Arc<dyn LiveDataSource>,
+    account_data: Option<Arc<dyn LiveAccountDataSource>>,
+    reference_data: Option<Arc<dyn LiveCexDataSource>>,
     simulation: ConservativeV1Config,
     strategies: Vec<StrategyRegistration>,
 }
@@ -36,9 +38,25 @@ impl PaperRun {
             initial_cash,
             risk,
             market_data,
+            account_data: None,
+            reference_data: None,
             simulation,
             strategies: Vec::new(),
         }
+    }
+
+    /// Adds an optional live CEX reference source for parity-aware runs.
+    #[must_use]
+    pub fn reference_data(mut self, source: Arc<dyn LiveCexDataSource>) -> Self {
+        self.reference_data = Some(source);
+        self
+    }
+
+    /// Adds an optional authenticated PM account source.
+    #[must_use]
+    pub fn account_data(mut self, source: Arc<dyn LiveAccountDataSource>) -> Self {
+        self.account_data = Some(source);
+        self
     }
 
     /// Registers a strategy for this run.
@@ -78,6 +96,18 @@ impl PaperRun {
         &self.market_data
     }
 
+    /// Returns the optional live CEX reference source.
+    #[must_use]
+    pub const fn reference_data_ref(&self) -> Option<&Arc<dyn LiveCexDataSource>> {
+        self.reference_data.as_ref()
+    }
+
+    /// Returns the optional authenticated PM account source.
+    #[must_use]
+    pub const fn account_data_ref(&self) -> Option<&Arc<dyn LiveAccountDataSource>> {
+        self.account_data.as_ref()
+    }
+
     /// Returns the fill-model configuration.
     #[must_use]
     pub const fn simulation(&self) -> &ConservativeV1Config {
@@ -100,6 +130,14 @@ impl fmt::Debug for PaperRun {
             .field("initial_cash", &self.initial_cash)
             .field("risk", &self.risk)
             .field("simulation", &self.simulation)
+            .field(
+                "reference_data",
+                &self.reference_data.as_ref().map(|_| "configured"),
+            )
+            .field(
+                "account_data",
+                &self.account_data.as_ref().map(|_| "configured"),
+            )
             .field("strategies", &self.strategies)
             .finish_non_exhaustive()
     }
@@ -124,6 +162,9 @@ mod tests {
             Arc::new(NoLive),
             ConservativeV1Config {
                 activation_latency: Duration::from_millis(100),
+                maker_queue_ahead_bps: 0,
+                slippage_bps: 0,
+                market_impact_bps: 0,
             },
         );
         assert!(matches!(

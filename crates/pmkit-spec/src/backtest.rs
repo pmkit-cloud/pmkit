@@ -115,6 +115,9 @@ mod tests {
             risk()?,
             ConservativeV1Config {
                 activation_latency: Duration::from_millis(50),
+                maker_queue_ahead_bps: 0,
+                slippage_bps: 0,
+                market_impact_bps: 0,
             },
         )
         .strategy(StrategyRegistration::new(
