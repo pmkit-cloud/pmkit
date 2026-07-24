@@ -4,24 +4,27 @@ use super::{
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_book::OrderBookL2;
-use pmkit_event::{MarketEvent, SourceEnvelope, StrategyFact};
-use pmkit_exec::{ExecError, Executor, OrderId, PlaceOrder};
+use pmkit_event::{MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
+use pmkit_exec::{ExecError, Executor, OrderId, OrderStatus, PlaceOrder};
 use pmkit_market::Outcome;
 use pmkit_runtime::{LiveOrderPolicy, RuntimeConfig};
 use pmkit_spec::LiveRun;
 use pmkit_store::{CausalIdentity, OwnerScope, StoreError, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
-use rust_decimal::Decimal;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[path = "live_risk.rs"]
 mod live_risk;
 #[path = "live_tape.rs"]
 mod live_tape;
-use live_risk::LiveRiskState;
 #[cfg(test)]
 pub use live_risk::mark_positions;
-pub use live_risk::passes_risk;
+use live_risk::{LiveRiskState, PortfolioRiskExposure, passes_aggregated_risk};
+#[cfg(test)]
+pub use live_risk::{
+    PortfolioRiskExposure as TestRiskExposure,
+    passes_aggregated_risk as test_passes_aggregated_risk, passes_risk,
+};
 use live_tape::LiveTape;
 
 async fn initial_open_orders(
@@ -60,6 +63,77 @@ async fn reconcile_open_orders(
     Ok(snapshot.open_orders.into_iter().collect())
 }
 
+async fn recover_intents(
+    run: &LiveRun,
+    runtime: &RuntimeConfig,
+    store: &dyn TapeStore,
+    scope: &OwnerScope,
+) -> Result<(), StartError> {
+    let recorder = crate::causal::CausalRecorder::new(store);
+    let mut intents =
+        recorder
+            .pending_intents(scope)
+            .await
+            .map_err(|source| StartError::Storage {
+                run: run.id().clone(),
+                source: match source {
+                    crate::causal::RecorderError::Store(source) => source,
+                    _ => StoreError::Storage {
+                        message: source.to_string(),
+                    },
+                },
+            })?;
+    intents.extend(recorder.unknown_intents(scope).await.map_err(|source| {
+        StartError::Storage {
+            run: run.id().clone(),
+            source: match source {
+                crate::causal::RecorderError::Store(source) => source,
+                _ => StoreError::Storage {
+                    message: source.to_string(),
+                },
+            },
+        }
+    })?);
+    for intent in intents {
+        let Some(order_id) = intent.venue_order_id() else {
+            continue;
+        };
+        let Ok(status) = tokio::time::timeout(
+            runtime.shutdown.reconciliation_timeout,
+            run.executor().query_status(&order_id),
+        )
+        .await
+        else {
+            continue;
+        };
+        let Ok(status) = status else {
+            continue;
+        };
+        let outcome = match status {
+            OrderStatus::Open | OrderStatus::Accepted => Some(pmkit_store::IntentOutcome::Accepted),
+            OrderStatus::Rejected | OrderStatus::Cancelled => {
+                Some(pmkit_store::IntentOutcome::Rejected)
+            }
+            OrderStatus::Unknown => None,
+        };
+        if let Some(outcome) = outcome {
+            recorder
+                .reconcile(&intent, outcome)
+                .await
+                .map_err(|source| StartError::Storage {
+                    run: run.id().clone(),
+                    source: match source {
+                        crate::causal::RecorderError::Store(source) => source,
+                        _ => StoreError::Storage {
+                            message: source.to_string(),
+                        },
+                    },
+                })?;
+        }
+    }
+    Ok(())
+}
+
 async fn shutdown_orders(
     run: &LiveRun,
     runtime: &RuntimeConfig,
@@ -90,18 +164,32 @@ async fn shutdown_orders(
 fn sources(run: &LiveRun, strategies: &[StrategyInstance]) -> Vec<SourceTaskDefinition> {
     let mut subscribed = HashSet::new();
     let mut sources = Vec::new();
-    for (market, _) in strategies {
-        if !subscribed.insert(market.clone()) {
+    for instance in strategies {
+        if !subscribed.insert(instance.market.clone()) {
             continue;
         }
         for outcome in [Outcome::Up, Outcome::Down] {
             let source = run.market_data().clone();
-            let market = market.clone();
+            let market = instance.market.clone();
             let name = format!("pm:{market:?}:{outcome:?}");
             sources.push(SourceTaskDefinition::new(name, move |sink| async move {
                 source.subscribe(market, outcome, sink).await
             }));
         }
+    }
+    if let Some(reference) = run.reference_data_ref() {
+        let reference = reference.clone();
+        sources.push(SourceTaskDefinition::new("cex", move |sink| async move {
+            reference.subscribe_reference(sink).await
+        }));
+    }
+    if let Some(account) = run.account_data_ref() {
+        let account = account.clone();
+        let portfolio = run.portfolio().clone();
+        sources.push(SourceTaskDefinition::new(
+            "pm-account",
+            move |sink| async move { account.subscribe_account(portfolio, sink).await },
+        ));
     }
     sources
 }
@@ -142,6 +230,12 @@ enum PlaceFailure {
     Storage(StoreError),
 }
 
+struct Reservation {
+    strategy: pmkit_core::StrategyId,
+    market: pmkit_core::MarketId,
+    notional: rust_decimal::Decimal,
+}
+
 /// Places one order, routing through durable causal recording when storage is configured.
 async fn place_order(
     store: Option<&dyn TapeStore>,
@@ -159,7 +253,7 @@ async fn place_order(
         };
     };
     let recorder = crate::causal::CausalRecorder::new(store);
-    let intent = recorder.intent(decision, action_index, order);
+    let intent = recorder.intent(decision, action_index, now_ms, order);
     match recorder
         .submit(&intent, || executor.submit(order, now_ms))
         .await
@@ -188,34 +282,34 @@ pub async fn drive_with_store(
     let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
     let executor = run.executor().clone();
     let limits = run.risk().clone();
+    let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
+    if let Some(store) = store
+        && store
+            .kill_state(run.portfolio())
+            .await
+            .map_err(|source| StartError::Storage {
+                run: run.id().clone(),
+                source,
+            })?
+    {
+        return Err(StartError::KillSwitchActive(run.id().clone()));
+    }
     let mut open_orders = initial_open_orders(run, runtime).await?;
     let max_open_orders = usize::try_from(limits.max_open_orders.get()).unwrap_or(usize::MAX);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1024);
     let feed = MergedFeed::from_tasks(FeedMode::Live, sources(run, &strategies), None);
     let merge = tokio::spawn(async move { feed.forward(event_tx).await });
     let mut tape = LiveTape::open(run, runtime)?;
-    let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
     if let Some(store) = store {
-        store
-            .read_pending_intents(&scope)
-            .await
-            .map_err(|source| StartError::Storage {
-                run: run.id().clone(),
-                source,
-            })?;
-        store
-            .read_unknown_intents(&scope)
-            .await
-            .map_err(|source| StartError::Storage {
-                run: run.id().clone(),
-                source,
-            })?;
+        recover_intents(run, runtime, store, &scope).await?;
     }
 
     let mut risk_state = LiveRiskState::default();
+    let mut reservations: HashMap<String, Reservation> = HashMap::new();
     let mut events_processed = 0_usize;
     let mut fills = 0_usize;
     let mut rejected = 0_usize;
+    let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     while let Some(merged) = event_rx.recv().await {
         store_signal(
             run,
@@ -224,6 +318,23 @@ pub async fn drive_with_store(
             &pmkit_data::SourceSignal::Data(Box::new(merged.source.clone())),
         )
         .await?;
+        if let SourceEnvelope::CexReference(envelope) = &merged.source {
+            cex_metrics.observe(&envelope.fact);
+            continue;
+        }
+        if let SourceEnvelope::PmAccount(envelope) = &merged.source {
+            tape.append_account(run, envelope)?;
+            match &envelope.fact {
+                PmAccountEvent::Fill { order_id, .. }
+                | PmAccountEvent::OrderCancelled { order_id, .. }
+                | PmAccountEvent::OrderRejected { order_id, .. } => {
+                    reservations.remove(order_id);
+                    open_orders.remove(&OrderId(order_id.clone()));
+                }
+                PmAccountEvent::OrderAck { .. } | PmAccountEvent::OrderStatus { .. } => {}
+            }
+            continue;
+        }
         let SourceEnvelope::PmMarket(envelope) = merged.source else {
             continue;
         };
@@ -248,9 +359,20 @@ pub async fn drive_with_store(
                 let fact = StrategyFact::Market(event.clone());
                 let portfolio_unrealized_pnl =
                     risk_state.update_book(market, *outcome, &book, &limits);
+                if risk_state.loss_breached
+                    && let Some(store) = store
+                {
+                    store
+                        .set_kill_state(run.portfolio(), true)
+                        .await
+                        .map_err(|source| StartError::Storage {
+                            run: run.id().clone(),
+                            source,
+                        })?;
+                }
                 let mut verdicts: Vec<crate::causal::ActionRiskVerdict> = Vec::new();
-                for (registered_market, strategy) in &mut *strategies {
-                    if *registered_market != *market {
+                for instance in &mut *strategies {
+                    if instance.market != *market {
                         continue;
                     }
                     let market_positions = risk_state.positions(market);
@@ -261,7 +383,7 @@ pub async fn drive_with_store(
                         positions: market_positions,
                         now: LogicalTimestamp::from_millis(*timestamp_ms),
                     };
-                    if let Ok(actions) = strategy.on_event(context) {
+                    if let Ok(actions) = instance.strategy.on_event(context) {
                         for (action_index, action) in actions.as_slice().iter().enumerate() {
                             if let Action::Place(order) = action {
                                 if open_orders.len() >= max_open_orders {
@@ -275,13 +397,40 @@ pub async fn drive_with_store(
                                     rejected += 1;
                                     continue;
                                 }
+                                let reserved_portfolio: rust_decimal::Decimal = reservations
+                                    .values()
+                                    .map(|reservation| reservation.notional)
+                                    .sum();
+                                let reserved_market: rust_decimal::Decimal = reservations
+                                    .values()
+                                    .filter(|reservation| reservation.market == *market)
+                                    .map(|reservation| reservation.notional)
+                                    .sum();
+                                let reserved_strategy: rust_decimal::Decimal = reservations
+                                    .values()
+                                    .filter(|reservation| reservation.strategy == instance.id)
+                                    .map(|reservation| reservation.notional)
+                                    .sum();
+                                let exposure = portfolio_unrealized_pnl.map(|daily_pnl| {
+                                    PortfolioRiskExposure {
+                                        portfolio_notional: risk_state.portfolio_notional()
+                                            + reserved_portfolio,
+                                        market_notional: risk_state.market_notional(market)
+                                            + reserved_market,
+                                        strategy_notional: reserved_strategy,
+                                        daily_pnl,
+                                        open_orders: open_orders.len(),
+                                    }
+                                });
                                 if risk_state.loss_breached
-                                    || !passes_risk(
-                                        order,
-                                        &limits,
-                                        market_positions,
-                                        portfolio_unrealized_pnl,
-                                    )
+                                    || exposure.is_none_or(|exposure| {
+                                        !passes_aggregated_risk(
+                                            order,
+                                            &limits,
+                                            market_positions,
+                                            exposure,
+                                        )
+                                    })
                                 {
                                     verdicts.push(crate::causal::ActionRiskVerdict::rejected(
                                         u32::try_from(action_index).unwrap_or(u32::MAX),
@@ -313,6 +462,14 @@ pub async fn drive_with_store(
                                 .await;
                                 match placement {
                                     Ok(Some(order_id)) => {
+                                        reservations.insert(
+                                            order_id.0.clone(),
+                                            Reservation {
+                                                strategy: instance.id.clone(),
+                                                market: market.clone(),
+                                                notional: order.qty * order.price,
+                                            },
+                                        );
                                         open_orders.insert(order_id);
                                     }
                                     Ok(None) => {}
@@ -345,16 +502,8 @@ pub async fn drive_with_store(
                         ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
                             .unwrap_or(i64::MAX),
                     };
-                    let snapshot = crate::causal::DecisionSnapshot::from_book(
-                        &book,
-                        crate::causal::CexTradeMetrics {
-                            last_price: None,
-                            momentum: Decimal::ZERO,
-                            volume: Decimal::ZERO,
-                            cvd: Decimal::ZERO,
-                            vwap: None,
-                        },
-                    );
+                    let snapshot =
+                        crate::causal::DecisionSnapshot::from_book(&book, cex_metrics.snapshot());
                     let decision = if verdicts.is_empty() {
                         crate::causal::DecisionKind::NoAction
                     } else {

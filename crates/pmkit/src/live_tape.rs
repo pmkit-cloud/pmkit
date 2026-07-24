@@ -117,6 +117,25 @@ impl LiveTape {
         Ok(())
     }
 
+    pub(super) fn append_account(
+        &mut self,
+        run: &LiveRun,
+        envelope: &PmAccountEnvelope,
+    ) -> Result<(), StartError> {
+        let Some(tape) = &mut self.tape else {
+            return Ok(());
+        };
+        if let Err(source) = tape.append(envelope)
+            && self.policy == Some(TapePolicy::Required)
+        {
+            return Err(StartError::Tape {
+                run: run.id().clone(),
+                source,
+            });
+        }
+        Ok(())
+    }
+
     pub(super) fn flush(&mut self, run: &LiveRun) -> Result<(), StartError> {
         let Some(tape) = &mut self.tape else {
             return Ok(());
