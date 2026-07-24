@@ -172,13 +172,13 @@ repository, not the long-term target.
   - makers rest;
   - later crossing updates fill makers;
   - simulated IDs, cancels, and fills.
+- Queue position, latency, slippage, market impact, and partial-fill models. (P1-14/15/16)
 - Paper executor using the same executor boundary without venue calls.
 
 **Crates:** `pmkit-exec`, `pmkit-sim`, `pmkit-paper`.
 
 ### Gaps
 
-- Queue position, latency, slippage, market impact, and partial-fill models.
 - Configurable simulation fee/latency models.
 - Persistent paper-account state.
 
@@ -201,7 +201,7 @@ repository, not the long-term target.
 ### Partial
 
 - Authenticated account subscription and typed lifecycle mapping now exist;
-  complete venue reconciliation and settlement mapping remain.
+  complete venue reconciliation and settlement mapping remain. Cancel/reject already exist as `PmAccountEvent::OrderCancelled`/`PmAccountEvent::OrderRejected` (`crates/pmkit-event/src/lib.rs:130`).
 
 ### Gaps
 
@@ -222,6 +222,8 @@ repository, not the long-term target.
   - position notional;
   - open orders;
   - max loss.
+- Daily loss limits. (P1-12)
+- Runtime kill switch. (P1-13)
 - Startup, reconciliation, and tape-flush timeouts.
 - Shutdown policy: leave, cancel owned, cancel all explicitly.
 - Strategy name/version/config revision metadata.
@@ -230,9 +232,7 @@ repository, not the long-term target.
 
 ### Gaps
 
-- Runtime kill switch.
 - Per-market/per-strategy limits.
-- Daily loss limits.
 - Rate limits.
 - Persistent risk state.
 
@@ -295,7 +295,7 @@ repository, not the long-term target.
   project; raw evidence is immutable and is never compacted or deleted in OSS).
 - Encryption.
 - Multi-process writer guarantees.
-- Venue order-ID persistence tied to a real status-query consumer.
+- Venue order-ID recovery remains partial: a generic consumer exists, but no concrete Polymarket status query does yet.
 
 ### Deliberately absent
 
@@ -329,11 +329,11 @@ Those belong in a separate reliability-focused collector/storage project.
 
 **Crates:** `pmkit-store`, `pmkit-api`.
 
-### Not implemented
+### Partial
 
-- Real RPC ingestion.
+- Real RPC ingestion is partial: `JsonRpcFinalizedProvider` already exists in `crates/pmkit-store/src/rpc.rs`, but the concrete Polymarket ingest path is not wired up.
 - Etherscan ingestion/backfills.
-- ABI decoding from live RPC logs.
+- ABI decoding from live RPC logs is partial: the ERC-20 `Transfer` decoder already exists in `crates/pmkit-store/src/decoder.rs`, but full live-log decoding is not complete.
 - Finality tracking.
 - Multi-provider failover.
 - RPC consistency checks.
