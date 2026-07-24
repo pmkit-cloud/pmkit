@@ -36,7 +36,7 @@ changes until `0.1.0` stabilizes.
 | [`pmkit-paper`](crates/pmkit-paper) | `PaperExecutor` implementing the executor trait over the sim engine. |
 | [`pmkit-spec`](crates/pmkit-spec) | Run specs: `BacktestRun`/`PaperRun`/`LiveRun`/`RunSpec`/`ReplaySpec`. |
 | [`pmkit-tape`](crates/pmkit-tape) | Local JSON-lines user-tape sink for market events and envelope serialization. |
-| [`pmkit-store`](crates/pmkit-store) | Durable Turso-backed `TapeStore` for lossless PM envelopes, causal decisions, and idempotent order intents. |
+| [`pmkit-store`](crates/pmkit-store) | Durable Turso-backed `TapeStore` for lossless PM envelopes, causal decisions, and idempotent order intents, plus versioned replay-bundle export. |
 | [`pmkit`](crates/pmkit) | Orchestration engine: `Pmkit` builder, `AppHandle`, deterministic feed merge, causal recording, and the backtest/paper/live drivers. |
 | [`pmkit-polymarket`](crates/pmkit-polymarket) | Polymarket venue adapter: live WebSocket data, authenticated CLOB execution, raw frame interception, and neutral/venue mapping. |
 | [`pmkit-collector`](crates/pmkit-collector) | Reliable OSS raw-frame collector: reconnect, subscription sharding, bounded-channel backpressure, heartbeat, and graceful shutdown over a `RawTapeSink`, with a `tokio-tungstenite` transport. |

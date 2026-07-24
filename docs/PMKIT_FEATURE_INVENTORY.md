@@ -348,15 +348,18 @@ Those belong in a separate reliability-focused collector/storage project.
 - Replay window and evidence policy.
 - Retrieval policy.
 - No credentials in manifests.
+- Replay bundle export (`pmkit-store::export_replay_bundle`): a versioned JSON
+  artifact bundling the manifest, every PM envelope (raw frame plus normalized
+  fact) in canonical order, every causal decision, and the verified CEX archive
+  checksums, failing closed on any replay gap or corrupt frame.
 
-**Crate:** `pmkit-manifest`.
+**Crates:** `pmkit-manifest`, `pmkit-store`.
 
 ### Gaps
 
 - Manifest schema versioning.
 - Git commit and dependency-lock capture.
 - Artifact hashes.
-- Replay bundle export.
 
 ## 15. Explicit non-features
 
@@ -622,8 +625,11 @@ behavioral test and documentation update.
   stabilizes the CLI must be typed-only: no generic `pmkit run strategy-name`
   entry point, no dynamic plugin protocol, and no untyped YAML/TOML config, per
   the §15 non-features. No code or dependency added.
-- [ ] **P2-10: add replay bundle export.** Include manifest, raw PM evidence,
-  normalized facts, decisions, and cache checksums.
+- [x] **P2-10: add replay bundle export.** `pmkit-store::export_replay_bundle`
+  assembles a versioned JSON bundle from the run manifest, every durable PM
+  envelope (raw frame plus normalized fact) in canonical order, every causal
+  decision, and the caller's verified CEX archive checksums. It paginates the
+  store and fails closed on any replay gap or non-UTF-8 raw frame.
 
 ### Review gate for every task
 
@@ -676,5 +682,9 @@ behavioral test and documentation update.
   `Started` then `Completed`).
 - P2-9 is a documented deferral: no code or dependency; the typed CLI is gated
   on API stabilization and must stay typed-only when added.
-- P0-1 through P0-5, P1-1 through P1-16, and P2-1 through P2-9 were resolved
-  after review; P2-10 remains open.
+- P2-10 adds `export_replay_bundle` (pmkit-store tests cover a bundle carrying
+  manifest, PM evidence, decisions, and cache checksums, plus a fail-closed
+  corrupt-evidence case; `cargo run -p pmkit-store --example replay_bundle`
+  prints a real bundle).
+- P0-1 through P0-5, P1-1 through P1-16, and P2-1 through P2-10 were resolved
+  after review; the entire P0/P1/P2 backlog is complete.

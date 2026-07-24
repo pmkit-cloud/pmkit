@@ -5,8 +5,9 @@ use pmkit_core::{PortfolioId, RunId};
 use serde_json::json;
 
 use crate::{
-    CausalDecision, CausalIdentity, IntentOutcome, OwnerScope, PmEnvelope, ReplayCursor,
-    ReplayGapReason, ReplayItem, StoreError, TapeStore, TursoTapeStore,
+    CacheChecksum, CausalDecision, CausalIdentity, IntentOutcome, OwnerScope, PmEnvelope,
+    ReplayCursor, ReplayGapReason, ReplayItem, StoreError, TapeStore, TursoTapeStore,
+    export_replay_bundle,
 };
 
 fn database_path(name: &str) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
@@ -363,6 +364,85 @@ async fn portfolio_kill_state_survives_restart() -> Result<(), Box<dyn std::erro
     assert!(store.kill_state(&portfolio).await?);
     store.set_kill_state(&portfolio, false).await?;
     assert!(!store.kill_state(&portfolio).await?);
+    store.delete_database()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn replay_bundle_gathers_manifest_evidence_and_decisions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, path) = database_path("bundle")?;
+    let scope = owner_scope("paper")?;
+    let stored = envelope(scope.clone(), 1);
+    let identity = CausalIdentity {
+        scope: scope.clone(),
+        correlation_id: "intent-1".into(),
+        source_timestamp_ms: 1_000,
+        ingest_sequence: 1,
+    };
+    let store = TursoTapeStore::open_local(&path).await?;
+    store.store_envelope(&stored).await?;
+    store
+        .store_decision(&CausalDecision {
+            identity,
+            payload: json!({"kind": "quote"}),
+        })
+        .await?;
+
+    let manifest = json!({"mode": "backtest", "run": "run"});
+    let checksums = [CacheChecksum {
+        key: "BTCUSDT-aggTrades-2026-01-01.zip".into(),
+        sha256_hex: "abc123".into(),
+    }];
+    let bundle = export_replay_bundle(&store, &scope, &manifest, &checksums).await?;
+
+    assert_eq!(bundle["schema_version"], 1);
+    assert_eq!(bundle["manifest"], manifest);
+    assert_eq!(bundle["scope"]["run"], "run");
+    let evidence = bundle["pm_evidence"]
+        .as_array()
+        .ok_or("pm_evidence array")?;
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0]["source_id"], "market-channel");
+    assert_eq!(evidence[0]["normalized"]["price"], "0.42");
+    let decisions = bundle["decisions"].as_array().ok_or("decisions array")?;
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0]["correlation_id"], "intent-1");
+    let cache = bundle["cache_checksums"].as_array().ok_or("cache array")?;
+    assert_eq!(cache.len(), 1);
+    assert_eq!(cache[0]["sha256_hex"], "abc123");
+    store.delete_database()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn replay_bundle_fails_closed_on_corrupt_evidence() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_dir, path) = database_path("bundle-corrupt")?;
+    let scope = owner_scope("paper")?;
+    let corrupt = envelope(scope.clone(), 1);
+    let store = TursoTapeStore::open_local(&path).await?;
+    store.store_envelope(&corrupt).await?;
+    drop(store);
+
+    // Corrupt the stored raw-frame digest outside the store.
+    let database = turso::Builder::new_local(&path.to_string_lossy())
+        .build()
+        .await?;
+    let connection = database.connect()?;
+    connection
+        .execute(
+            "UPDATE pm_envelopes SET raw_sha256 = ?1 WHERE ingest_sequence = ?2",
+            ("corrupt", corrupt.ingest_sequence),
+        )
+        .await?;
+    drop(connection);
+    drop(database);
+
+    let store = TursoTapeStore::open_local(&path).await?;
+    let manifest = json!({"mode": "backtest"});
+    let result = export_replay_bundle(&store, &scope, &manifest, &[]).await;
+    assert!(matches!(result, Err(StoreError::Storage { .. })));
     store.delete_database()?;
     Ok(())
 }

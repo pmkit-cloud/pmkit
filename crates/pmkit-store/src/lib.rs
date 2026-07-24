@@ -21,6 +21,7 @@ use pmkit_core::{PortfolioId, RunId};
 use serde_json::Value;
 use thiserror::Error;
 
+mod bundle;
 mod chain;
 mod chain_store;
 mod decoder;
@@ -41,6 +42,7 @@ mod tests;
 #[cfg(test)]
 mod chain_tests;
 
+pub use bundle::{CacheChecksum, REPLAY_BUNDLE_VERSION, export_replay_bundle};
 pub use chain::{Address, AddressError, ChainId, ContractRegistry, LegacyV1Contracts};
 pub use chain_store::{CanonicalLogStore, ingest_finalized_batch};
 pub use decoder::{DecodeError, decode_raw_log};
