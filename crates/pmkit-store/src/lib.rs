@@ -3,8 +3,8 @@
 //! [`TursoTapeStore`] implements [`TapeStore`] over a local Turso (libSQL)
 //! database. It stores:
 //!
-//! - **Lossless PM envelopes** — versioned raw frames with normalized
-//!   projections, SHA-256 integrity digests, and deterministic replay cursors.
+//! - **Versioned PM envelopes** — typed normalized projections, optional raw
+//!   frames, SHA-256 integrity digests, and deterministic replay cursors.
 //! - **Causal decisions** — portable strategy snapshots with risk verdicts.
 //! - **Idempotent order intents** — pending → accepted/rejected/unknown
 //!   transitions linked to decision correlation IDs.
@@ -23,9 +23,12 @@ use thiserror::Error;
 
 mod chain;
 mod chain_store;
+mod decoder;
 mod integrity;
 mod local_files;
 mod log;
+mod raw;
+mod rpc;
 mod schema;
 mod source;
 mod turso_store;
@@ -39,12 +42,19 @@ mod tests;
 mod chain_tests;
 
 pub use chain::{Address, AddressError, ChainId, ContractRegistry, LegacyV1Contracts};
-pub use chain_store::CanonicalLogStore;
+pub use chain_store::{CanonicalLogStore, ingest_finalized_batch};
+pub use decoder::{DecodeError, decode_raw_log};
 pub use log::{
     CanonicalChainLog, CanonicalLogIdentity, CanonicalLogSegment, ChainCheckpoint, ChainEvent,
     OutcomeTokenAmount, TradeSide,
 };
-pub use source::{CanonicalLogSource, ChainSourceError, FixtureCanonicalLogSource};
+pub use rpc::{JsonRpcFinalizedProvider, RpcProviderConfig};
+pub use source::{
+    BlockHead, CanonicalLogSource, ChainSourceError, FinalizedBlockCoverage, FinalizedBlockRange,
+    FinalizedProviderHead, FinalizedRawLogBatch, FinalizedRawLogProvider,
+    FixtureCanonicalLogSource, ProviderIdentity, RawLogIdentity, RawRpcLog,
+    agree_on_finalized_heads,
+};
 pub use turso_store::TursoTapeStore;
 pub use wallet::{
     WalletActivity, WalletActivityKind, WalletPosition, WalletQuery, WalletSnapshot, WalletTrade,
@@ -172,7 +182,7 @@ pub struct PmEnvelope {
     pub receipt_timestamp_ms: i64,
     /// The monotonically assigned ingest sequence.
     pub ingest_sequence: i64,
-    /// The byte-identical PM transport frame.
+    /// The PM transport frame when the source provides raw bytes.
     pub raw_frame: Vec<u8>,
     /// The normalized PM projection derived from the frame.
     pub normalized: Value,
@@ -293,6 +303,17 @@ pub trait TapeStore: Send + Sync {
         outcome: IntentOutcome,
     ) -> Result<(), StoreError>;
 
+    /// Transitions an intent and optionally persists its venue order id.
+    async fn transition_intent_with_order(
+        &self,
+        identity: &CausalIdentity,
+        outcome: IntentOutcome,
+        venue_order_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let _ = venue_order_id;
+        self.transition_intent(identity, outcome).await
+    }
+
     /// Lists durable intents still in the pending state for one owner scope.
     async fn read_pending_intents(
         &self,
@@ -307,4 +328,20 @@ pub trait TapeStore: Send + Sync {
 
     /// Lists causal decisions recorded for one owner scope in canonical order.
     async fn read_decisions(&self, scope: &OwnerScope) -> Result<Vec<CausalDecision>, StoreError>;
+
+    /// Persists the portfolio-wide live kill state.
+    async fn set_kill_state(
+        &self,
+        _portfolio: &PortfolioId,
+        _killed: bool,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Storage {
+            message: "kill-state persistence is not configured".into(),
+        })
+    }
+
+    /// Reads the portfolio-wide live kill state.
+    async fn kill_state(&self, _portfolio: &PortfolioId) -> Result<bool, StoreError> {
+        Ok(false)
+    }
 }

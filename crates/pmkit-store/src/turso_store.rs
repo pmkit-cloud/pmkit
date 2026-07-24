@@ -14,7 +14,8 @@ use crate::{
     local_files::{remove_database, restrict_permissions},
     schema::{
         INSERT_DECISION, INSERT_ENVELOPE, INSERT_PENDING_INTENT, READ_DECISIONS, READ_ENVELOPES,
-        READ_PENDING_INTENTS, READ_UNKNOWN_INTENTS, SCHEMA, TRANSITION_PENDING_INTENT,
+        READ_KILL_STATE, READ_PENDING_INTENTS, READ_UNKNOWN_INTENTS, SCHEMA,
+        TRANSITION_PENDING_INTENT, UPSERT_KILL_STATE,
     },
 };
 
@@ -223,6 +224,34 @@ impl TapeStore for TursoTapeStore {
                     identity.correlation_id.as_str(),
                     identity.source_timestamp_ms,
                     identity.ingest_sequence,
+                    None::<&str>,
+                ),
+            )
+            .await?;
+        if written == 0 {
+            return Err(StoreError::PendingIntentNotFound);
+        }
+        Ok(())
+    }
+
+    async fn transition_intent_with_order(
+        &self,
+        identity: &CausalIdentity,
+        outcome: IntentOutcome,
+        venue_order_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let written = self
+            .connection
+            .execute(
+                TRANSITION_PENDING_INTENT,
+                (
+                    outcome.as_sql(),
+                    identity.scope.portfolio_id.to_string(),
+                    identity.scope.run_id.to_string(),
+                    identity.correlation_id.as_str(),
+                    identity.source_timestamp_ms,
+                    identity.ingest_sequence,
+                    venue_order_id,
                 ),
             )
             .await?;
@@ -280,6 +309,31 @@ impl TapeStore for TursoTapeStore {
             });
         }
         Ok(decisions)
+    }
+
+    async fn set_kill_state(
+        &self,
+        portfolio: &PortfolioId,
+        killed: bool,
+    ) -> Result<(), StoreError> {
+        self.connection
+            .execute(
+                UPSERT_KILL_STATE,
+                (portfolio.to_string(), i64::from(killed)),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn kill_state(&self, portfolio: &PortfolioId) -> Result<bool, StoreError> {
+        let mut rows = self
+            .connection
+            .query(READ_KILL_STATE, [portfolio.to_string()])
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(false);
+        };
+        Ok(row.get::<i64>(0)? != 0)
     }
 }
 

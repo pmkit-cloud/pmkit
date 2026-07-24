@@ -271,7 +271,7 @@ async fn pending_and_unknown_intents_are_enumerated() -> Result<(), Box<dyn std:
         .store_intent_pending(&unknown, &json!({"u": 3}))
         .await?;
     store
-        .transition_intent(&unknown, IntentOutcome::Unknown)
+        .transition_intent_with_order(&unknown, IntentOutcome::Unknown, Some("venue-unknown"))
         .await?;
 
     // When: pending and unknown intents are enumerated.
@@ -297,6 +297,7 @@ async fn pending_and_unknown_intents_are_enumerated() -> Result<(), Box<dyn std:
     );
     assert_eq!(unknowns.len(), 1);
     assert_eq!(unknowns[0].identity.correlation_id, "unknown");
+    assert_eq!(unknowns[0].payload["venue_order_id"], "venue-unknown");
 
     store.delete_database()?;
     assert!(!path.exists());
@@ -346,5 +347,22 @@ async fn decisions_are_read_in_canonical_order_and_owner_scoped()
     assert!(foreign.is_empty());
     store.delete_database()?;
     assert!(!path.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn portfolio_kill_state_survives_restart() -> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, path) = database_path("kill-state")?;
+    let portfolio = PortfolioId::new("live")?;
+    let store = TursoTapeStore::open_local(&path).await?;
+    assert!(!store.kill_state(&portfolio).await?);
+    store.set_kill_state(&portfolio, true).await?;
+    drop(store);
+
+    let store = TursoTapeStore::open_local(&path).await?;
+    assert!(store.kill_state(&portfolio).await?);
+    store.set_kill_state(&portfolio, false).await?;
+    assert!(!store.kill_state(&portfolio).await?);
+    store.delete_database()?;
     Ok(())
 }

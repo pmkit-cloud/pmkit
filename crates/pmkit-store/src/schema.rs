@@ -47,6 +47,10 @@ CREATE TABLE IF NOT EXISTS durable_intents (
 );
 CREATE INDEX IF NOT EXISTS durable_intents_owner_pending
     ON durable_intents (portfolio_id, run_id, state, source_timestamp_ms, ingest_sequence);
+CREATE TABLE IF NOT EXISTS portfolio_kill_state (
+    portfolio_id TEXT PRIMARY KEY,
+    killed INTEGER NOT NULL CHECK (killed IN (0, 1))
+);
 CREATE TABLE IF NOT EXISTS canonical_chain_logs (
     chain_id INTEGER NOT NULL,
     block_number INTEGER NOT NULL,
@@ -98,9 +102,13 @@ INSERT INTO durable_intents (
 ON CONFLICT DO NOTHING";
 
 pub const TRANSITION_PENDING_INTENT: &str = "
-UPDATE durable_intents SET state = ?1
+UPDATE durable_intents SET state = ?1, payload_json =
+    CASE WHEN ?7 IS NULL THEN payload_json
+         ELSE json_set(payload_json, '$.venue_order_id', ?7)
+    END
 WHERE portfolio_id = ?2 AND run_id = ?3 AND correlation_id = ?4
-  AND source_timestamp_ms = ?5 AND ingest_sequence = ?6 AND state = 'pending'";
+  AND source_timestamp_ms = ?5 AND ingest_sequence = ?6
+  AND state IN ('pending', 'unknown')";
 
 pub const DELETE_CANONICAL_LOGS_AFTER: &str = "
 DELETE FROM canonical_chain_logs WHERE chain_id = ?1 AND block_number > ?2";
@@ -153,3 +161,10 @@ SELECT portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequenc
 FROM causal_decisions
 WHERE portfolio_id = ?1 AND run_id = ?2
 ORDER BY source_timestamp_ms, ingest_sequence";
+
+pub const UPSERT_KILL_STATE: &str = "
+INSERT INTO portfolio_kill_state (portfolio_id, killed) VALUES (?1, ?2)
+ON CONFLICT(portfolio_id) DO UPDATE SET killed = excluded.killed";
+
+pub const READ_KILL_STATE: &str = "
+SELECT killed FROM portfolio_kill_state WHERE portfolio_id = ?1";
