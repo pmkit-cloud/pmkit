@@ -158,6 +158,17 @@
   can add its rate state alongside that map; Todo 15 should keep replaying into
   the existing `LiveRiskState` and leave override configuration non-durable.
 
+## 2026-07-24 - Parallel deterministic backtests
+
+- `PmkitBuilder::start` uses a Tokio `JoinSet` capped by
+  `RuntimeConfig.backtest_concurrency.get()`. Only independent backtest drivers
+  enter the set; paper/live runs drain it first and remain sequential barriers,
+  while each backtest keeps its existing single ordered event loop.
+- Duplicate run IDs are rejected before any task is spawned. `AppHandle` keeps
+  keyed reports in its `HashMap` and exposes submission order through
+  `reports_ordered(&self) -> Vec<(&RunId, &RunReport)>`, so completion timing and
+  `HashMap` iteration cannot affect callers.
+
 ## 2026-07-24 - Restart-safe logical-time order rate limits
 
 - `OrderRateLimits` is the live-risk companion spec: 100 accepted submissions
