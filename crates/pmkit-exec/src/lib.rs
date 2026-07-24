@@ -22,6 +22,21 @@ pub struct ExecutionSnapshot {
     pub open_orders: Vec<OrderId>,
 }
 
+/// Authoritative status returned for one venue order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderStatus {
+    /// The order remains open at the venue.
+    Open,
+    /// The venue accepted or filled the order.
+    Accepted,
+    /// The venue rejected the order.
+    Rejected,
+    /// The venue cancelled the order.
+    Cancelled,
+    /// The venue could not determine the final status.
+    Unknown,
+}
+
 /// An order to place on a single market outcome.
 #[derive(Debug, Clone)]
 pub struct PlaceOrder {
@@ -79,6 +94,13 @@ pub trait Executor: Send + Sync {
     ///
     /// Returns [`ExecError`] when state cannot be reconciled safely.
     async fn reconcile(&self) -> Result<ExecutionSnapshot, ExecError>;
+
+    /// Queries one venue order during restart recovery.
+    async fn query_status(&self, _order_id: &OrderId) -> Result<OrderStatus, ExecError> {
+        Err(ExecError::Transport {
+            message: "venue order status query is not configured".into(),
+        })
+    }
 
     /// Submits a single order and returns its venue id.
     ///
