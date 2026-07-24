@@ -119,3 +119,19 @@
 - Todo 15 can rebuild these identities and balances by replaying the durable
   account records into a fresh `LiveRiskState`; no durable derived snapshot was
   added as a second authority.
+
+## 2026-07-24 - Tightening-only scoped risk limits
+
+- `PartialRiskLimits` mirrors all eight numeric `RiskLimits` fields as
+  `Option`s. `RiskLimitOverrides` is `{ per_market: HashMap<MarketId,
+  PartialRiskLimits>, per_strategy: HashMap<StrategyId, PartialRiskLimits> }`
+  and is attached to `StrategyRegistration` through `.risk_overrides(...)`;
+  existing `RiskLimits` struct literals and registrations remain unchanged.
+- `RiskLimitOverrides::effective_limits(&RiskLimits, &MarketId, &StrategyId)
+  -> RiskLimits` clones the globals, then tightens each field with the matching
+  market and strategy values via `min`; larger override values cannot loosen a
+  global limit, and empty maps return an exact clone of the globals.
+- `live.rs` precomputes `effective_limits_by_strategy` before the event loop and
+  passes the selected plain `RiskLimits` to `passes_aggregated_risk`. Todo 14
+  can add its rate state alongside that map; Todo 15 should keep replaying into
+  the existing `LiveRiskState` and leave override configuration non-durable.

@@ -408,3 +408,111 @@ mod ledger_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod override_tests {
+    use super::{PortfolioRiskExposure, passes_aggregated_risk};
+    use crate::test_support::{risk, risk_overrides};
+    use pmkit_book::Side;
+    use pmkit_core::{MarketId, StrategyId};
+    use pmkit_exec::PlaceOrder;
+    use pmkit_market::Outcome;
+    use pmkit_money::Money;
+    use pmkit_runtime::PartialRiskLimits;
+    use rust_decimal::Decimal;
+
+    fn order(market: MarketId) -> PlaceOrder {
+        PlaceOrder {
+            market,
+            outcome: Outcome::Up,
+            side: Side::Buy,
+            price: Decimal::ONE,
+            qty: Decimal::from(10),
+            post_only: false,
+        }
+    }
+
+    fn empty_exposure() -> PortfolioRiskExposure {
+        PortfolioRiskExposure {
+            portfolio_notional: Decimal::ZERO,
+            market_notional: Decimal::ZERO,
+            strategy_notional: Decimal::ZERO,
+            daily_pnl: Decimal::ZERO,
+            open_orders: 0,
+        }
+    }
+
+    #[test]
+    fn override_tightens() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: a globally valid order and a tighter strategy notional override.
+        let limits = risk()?;
+        let market = MarketId::new("btc-5m")?;
+        let strategy = StrategyId::new("maker")?;
+        let order = order(market.clone());
+        let mut overrides = risk_overrides();
+        overrides.per_strategy.insert(
+            strategy.clone(),
+            PartialRiskLimits {
+                max_strategy_notional: Some(Money::usdc(5)),
+                ..PartialRiskLimits::default()
+            },
+        );
+
+        // When: the scoped effective limits are applied.
+        let effective = overrides.effective_limits(&limits, &market, &strategy);
+
+        // Then: the override rejects what the global limit alone allows.
+        assert!(passes_aggregated_risk(
+            &order,
+            &limits,
+            &[],
+            empty_exposure(),
+        ));
+        assert!(!passes_aggregated_risk(
+            &order,
+            &effective,
+            &[],
+            empty_exposure(),
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn override_cannot_loosen() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: tight global market and strategy limits with looser overrides.
+        let mut limits = risk()?;
+        limits.max_market_notional = Money::usdc(5);
+        limits.max_strategy_notional = Money::usdc(5);
+        let market = MarketId::new("btc-5m")?;
+        let strategy = StrategyId::new("maker")?;
+        let mut overrides = risk_overrides();
+        overrides.per_market.insert(
+            market.clone(),
+            PartialRiskLimits {
+                max_market_notional: Some(Money::usdc(50)),
+                ..PartialRiskLimits::default()
+            },
+        );
+        overrides.per_strategy.insert(
+            strategy.clone(),
+            PartialRiskLimits {
+                max_strategy_notional: Some(Money::usdc(50)),
+                ..PartialRiskLimits::default()
+            },
+        );
+
+        // When: the looser scoped values are combined with the globals.
+        let effective = overrides.effective_limits(&limits, &market, &strategy);
+
+        // Then: both effective values remain global and the order stays blocked.
+        assert_eq!(effective.max_market_notional, Money::usdc(5));
+        assert_eq!(effective.max_strategy_notional, Money::usdc(5));
+        assert!(!passes_aggregated_risk(
+            &order(market),
+            &effective,
+            &[],
+            empty_exposure(),
+        ));
+        Ok(())
+    }
+}

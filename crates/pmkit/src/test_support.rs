@@ -2,7 +2,7 @@ use pmkit_book::Side;
 use pmkit_exec::PlaceOrder;
 use pmkit_market::Outcome;
 use pmkit_money::Money;
-use pmkit_runtime::{RiskLimits, RuntimeConfig, ShutdownConfig};
+use pmkit_runtime::{RiskLimitOverrides, RiskLimits, RuntimeConfig, ShutdownConfig};
 use pmkit_strategy::{
     Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
 };
@@ -63,4 +63,8 @@ pub fn risk() -> Result<RiskLimits, Box<dyn std::error::Error>> {
         max_loss: Money::usdc(500),
         max_daily_loss: Money::usdc(500),
     })
+}
+
+pub fn risk_overrides() -> RiskLimitOverrides {
+    RiskLimitOverrides::default()
 }

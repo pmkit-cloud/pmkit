@@ -3,6 +3,7 @@
 //! These are neutral value types that describe *how* a run is configured. The
 //! orchestration engine that consumes them lives above this crate.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
@@ -33,6 +34,85 @@ pub struct RiskLimits {
     pub max_loss: Money,
     /// Maximum daily portfolio loss before new orders are rejected.
     pub max_daily_loss: Money,
+}
+
+/// Optional risk values that can only tighten global limits.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PartialRiskLimits {
+    /// Maximum notional per single order.
+    pub max_order_notional: Option<Money>,
+    /// Maximum notional held in one position.
+    pub max_position_notional: Option<Money>,
+    /// Maximum marked notional across the portfolio.
+    pub max_portfolio_notional: Option<Money>,
+    /// Maximum marked and reserved notional in one market.
+    pub max_market_notional: Option<Money>,
+    /// Maximum reserved notional attributable to one strategy.
+    pub max_strategy_notional: Option<Money>,
+    /// Maximum number of simultaneously open orders.
+    pub max_open_orders: Option<NonZeroU32>,
+    /// Maximum tolerated loss before the portfolio is killed.
+    pub max_loss: Option<Money>,
+    /// Maximum daily portfolio loss before new orders are rejected.
+    pub max_daily_loss: Option<Money>,
+}
+
+impl PartialRiskLimits {
+    fn tighten(self, limits: &mut RiskLimits) {
+        if let Some(value) = self.max_order_notional {
+            limits.max_order_notional = limits.max_order_notional.min(value);
+        }
+        if let Some(value) = self.max_position_notional {
+            limits.max_position_notional = limits.max_position_notional.min(value);
+        }
+        if let Some(value) = self.max_portfolio_notional {
+            limits.max_portfolio_notional = limits.max_portfolio_notional.min(value);
+        }
+        if let Some(value) = self.max_market_notional {
+            limits.max_market_notional = limits.max_market_notional.min(value);
+        }
+        if let Some(value) = self.max_strategy_notional {
+            limits.max_strategy_notional = limits.max_strategy_notional.min(value);
+        }
+        if let Some(value) = self.max_open_orders {
+            limits.max_open_orders = limits.max_open_orders.min(value);
+        }
+        if let Some(value) = self.max_loss {
+            limits.max_loss = limits.max_loss.min(value);
+        }
+        if let Some(value) = self.max_daily_loss {
+            limits.max_daily_loss = limits.max_daily_loss.min(value);
+        }
+    }
+}
+
+/// Optional per-market and per-strategy risk-limit overrides.
+#[derive(Debug, Clone, Default)]
+pub struct RiskLimitOverrides {
+    /// Overrides keyed by exact market identity.
+    pub per_market: HashMap<MarketId, PartialRiskLimits>,
+    /// Overrides keyed by exact strategy identity.
+    pub per_strategy: HashMap<StrategyId, PartialRiskLimits>,
+}
+
+impl RiskLimitOverrides {
+    /// Returns the tightest limits for a market and strategy.
+    #[must_use]
+    pub fn effective_limits(
+        &self,
+        global: &RiskLimits,
+        market: &MarketId,
+        strategy: &StrategyId,
+    ) -> RiskLimits {
+        let mut effective = global.clone();
+        if let Some(override_limits) = self.per_market.get(market) {
+            override_limits.tighten(&mut effective);
+        }
+        if let Some(override_limits) = self.per_strategy.get(strategy) {
+            override_limits.tighten(&mut effective);
+        }
+        effective
+    }
 }
 
 /// What the runtime does with live orders during shutdown.
@@ -79,6 +159,7 @@ pub struct StrategyRegistration {
     name: Option<String>,
     version: Option<String>,
     config_revision: Option<String>,
+    risk_overrides: RiskLimitOverrides,
 }
 
 impl StrategyRegistration {
@@ -92,6 +173,7 @@ impl StrategyRegistration {
             name: None,
             version: None,
             config_revision: None,
+            risk_overrides: RiskLimitOverrides::default(),
         }
     }
 
@@ -113,6 +195,13 @@ impl StrategyRegistration {
     #[must_use]
     pub fn config_revision(mut self, revision: impl Into<String>) -> Self {
         self.config_revision = Some(revision.into());
+        self
+    }
+
+    /// Sets scoped risk-limit overrides for this registration.
+    #[must_use]
+    pub fn risk_overrides(mut self, overrides: RiskLimitOverrides) -> Self {
+        self.risk_overrides = overrides;
         self
     }
 
@@ -150,6 +239,12 @@ impl StrategyRegistration {
     #[must_use]
     pub fn config_revision_ref(&self) -> Option<&str> {
         self.config_revision.as_deref()
+    }
+
+    /// Returns the scoped risk-limit overrides.
+    #[must_use]
+    pub const fn risk_overrides_ref(&self) -> &RiskLimitOverrides {
+        &self.risk_overrides
     }
 }
 

@@ -306,6 +306,20 @@ pub async fn drive_with_control(
     store: Option<&dyn TapeStore>,
     control: &RunControl,
 ) -> Result<LiveReport, StartError> {
+    let effective_limits_by_strategy: HashMap<_, _> = run
+        .strategies()
+        .iter()
+        .map(|registration| {
+            (
+                registration.id().clone(),
+                registration.risk_overrides_ref().effective_limits(
+                    run.risk(),
+                    registration.market(),
+                    registration.id(),
+                ),
+            )
+        })
+        .collect();
     let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
     let executor = run.executor().clone();
     let limits = run.risk().clone();
@@ -433,6 +447,9 @@ pub async fn drive_with_control(
                     if instance.market != *market {
                         continue;
                     }
+                    let effective_limits = effective_limits_by_strategy
+                        .get(&instance.id)
+                        .map_or(&limits, |effective_limits| effective_limits);
                     let market_positions = risk_state.positions(market);
                     let context = StrategyContext {
                         fact: &fact,
@@ -483,7 +500,7 @@ pub async fn drive_with_control(
                                     || exposure.is_none_or(|exposure| {
                                         !passes_aggregated_risk(
                                             order,
-                                            &limits,
+                                            effective_limits,
                                             market_positions,
                                             exposure,
                                         )
