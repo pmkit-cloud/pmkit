@@ -25,6 +25,7 @@ use tokio::sync::mpsc::Sender;
 mod binance;
 mod binance_cache;
 mod binance_history;
+mod binance_live;
 
 #[cfg(test)]
 /// Test-only Binance archive cache fixtures and local HTTP server.
@@ -38,6 +39,7 @@ pub use binance::{
 };
 pub use binance_cache::{BinanceArchiveLimits, CachePolicy, VerifiedBinanceArchiveCache};
 pub use binance_history::BinanceVisionHistory;
+pub use binance_live::BinanceAggTradeLive;
 
 /// An unmodified PM public-market frame plus the metadata needed to audit it.
 #[derive(Debug, Clone)]
@@ -192,6 +194,24 @@ pub trait LiveDataSource: Send + Sync {
         outcome: Outcome,
         sink: Sender<SourceSignal>,
     ) -> Result<(), DataSourceError>;
+}
+
+/// A live authenticated PM account source.
+#[async_trait]
+pub trait LiveAccountDataSource: Send + Sync {
+    /// Subscribes to account lifecycle events for one portfolio.
+    async fn subscribe_account(
+        &self,
+        portfolio: PortfolioId,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError>;
+}
+
+/// A live reference-exchange source that emits replayable trade facts.
+#[async_trait]
+pub trait LiveCexDataSource: Send + Sync {
+    /// Subscribes to one reference asset until the stream ends or the sink closes.
+    async fn subscribe_reference(&self, sink: Sender<SourceSignal>) -> Result<(), DataSourceError>;
 }
 
 #[cfg(test)]
