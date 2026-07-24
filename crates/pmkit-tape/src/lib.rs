@@ -67,7 +67,8 @@ impl<W: Write> JsonLinesTape<W> {
 
 impl<W: Write> UserTapeSink for JsonLinesTape<W> {
     fn append(&mut self, envelope: &PmAccountEnvelope) -> io::Result<()> {
-        let line = serde_json::to_string(&account_envelope_json(envelope)).unwrap_or_default();
+        let line =
+            serde_json::to_string(&account_envelope_json(envelope)).map_err(io::Error::other)?;
         writeln!(self.writer, "{line}")
     }
 
@@ -269,6 +270,40 @@ pub fn account_envelope_json(envelope: &PmAccountEnvelope) -> serde_json::Value 
             "strategy": strategy.as_ref().map(ToString::to_string),
             "order_id": order_id,
         }),
+        PmAccountEvent::OrderCancelled {
+            strategy,
+            order_id,
+            timestamp_ms,
+        } => json!({
+            "kind": "order_cancelled",
+            "ts": timestamp_ms,
+            "strategy": strategy.as_ref().map(ToString::to_string),
+            "order_id": order_id,
+        }),
+        PmAccountEvent::OrderRejected {
+            strategy,
+            order_id,
+            reason,
+            timestamp_ms,
+        } => json!({
+            "kind": "order_rejected",
+            "ts": timestamp_ms,
+            "strategy": strategy.as_ref().map(ToString::to_string),
+            "order_id": order_id,
+            "reason": reason,
+        }),
+        PmAccountEvent::OrderStatus {
+            strategy,
+            order_id,
+            status,
+            timestamp_ms,
+        } => json!({
+            "kind": "order_status",
+            "ts": timestamp_ms,
+            "strategy": strategy.as_ref().map(ToString::to_string),
+            "order_id": order_id,
+            "status": status,
+        }),
     };
     let mut value = envelope_json(&envelope.metadata, &payload);
     value["portfolio"] = json!(envelope.portfolio.to_string());
@@ -296,24 +331,6 @@ pub fn reference_envelope_json(envelope: &CexReferenceEnvelope) -> serde_json::V
             "price": price.to_string(),
             "qty": qty.to_string(),
             "is_buyer_maker": is_buyer_maker,
-        }),
-        CexReferenceEvent::BestBidOffer {
-            asset,
-            exchange,
-            bid_px,
-            bid_qty,
-            ask_px,
-            ask_qty,
-            timestamp_ms,
-        } => json!({
-            "kind": "reference_bbo",
-            "ts": timestamp_ms,
-            "asset": asset.to_string(),
-            "exchange": exchange.to_string(),
-            "bid_px": bid_px.to_string(),
-            "bid_qty": bid_qty.to_string(),
-            "ask_px": ask_px.to_string(),
-            "ask_qty": ask_qty.to_string(),
         }),
     };
     envelope_json(&envelope.metadata, &payload)
