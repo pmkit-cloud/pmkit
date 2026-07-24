@@ -125,6 +125,27 @@ impl MarketEvent {
     }
 }
 
+/// A market resolution reported by Gamma.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketResolutionEvent {
+    /// Exact market identity.
+    pub market: MarketId,
+    /// Resolved market outcome.
+    pub outcome: Outcome,
+    /// Exact payout price for the outcome.
+    pub resolution_price: Decimal,
+    /// Resolution timestamp in milliseconds.
+    pub timestamp_ms: i64,
+}
+
+impl MarketResolutionEvent {
+    /// Returns the resolution timestamp in milliseconds.
+    #[must_use]
+    pub const fn timestamp_ms(&self) -> i64 {
+        self.timestamp_ms
+    }
+}
+
 /// A normalized authenticated-account fact from Polymarket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PmAccountEvent {
@@ -300,7 +321,7 @@ impl StrategyInput for StrategyFact {}
 mod tests {
     use std::any::TypeId;
 
-    use super::{Liquidity, MarketEvent, PmMarketEnvelope, StrategyFact};
+    use super::{Liquidity, MarketEvent, MarketResolutionEvent, PmMarketEnvelope, StrategyFact};
     use pmkit_book::Side;
     use pmkit_core::MarketId;
     use pmkit_market::Outcome;
@@ -326,6 +347,27 @@ mod tests {
     #[test]
     fn liquidity_variants_differ() {
         assert_ne!(Liquidity::Maker, Liquidity::Taker);
+    }
+
+    #[test]
+    fn resolution_event_carries_outcome_and_time() -> Result<(), Box<dyn std::error::Error>> {
+        // Given a typed Gamma resolution fact.
+        let event = MarketResolutionEvent {
+            market: MarketId::new("btc-5m")?,
+            outcome: Outcome::Up,
+            resolution_price: Decimal::ONE,
+            timestamp_ms: 1_700_000_000_000,
+        };
+
+        // When its resolution fields are read.
+        let timestamp_ms = event.timestamp_ms();
+
+        // Then market identity, outcome, exact price, and time are preserved.
+        assert_eq!(event.market, MarketId::new("btc-5m")?);
+        assert_eq!(event.outcome, Outcome::Up);
+        assert_eq!(event.resolution_price, Decimal::ONE);
+        assert_eq!(timestamp_ms, 1_700_000_000_000);
+        Ok(())
     }
 
     #[test]

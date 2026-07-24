@@ -4,10 +4,11 @@ use polymarket_client_sdk_v2::gamma::Client as SdkGammaClient;
 use polymarket_client_sdk_v2::gamma::types::request::MarketsRequest;
 use polymarket_client_sdk_v2::gamma::types::response::Market;
 use polymarket_client_sdk_v2::types::U256;
+use rust_decimal::Decimal;
 use thiserror::Error;
 
 /// Market metadata returned by Gamma.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GammaMarket {
     /// Parent event identifier.
     pub event_id: String,
@@ -24,7 +25,7 @@ pub struct GammaMarket {
     /// Unix timestamp when the market closed, if known.
     pub closed_time: Option<i64>,
     /// Resolution prices in token order.
-    pub outcome_prices: Vec<f64>,
+    pub outcome_prices: Vec<Decimal>,
     /// Market question.
     pub title: String,
     /// Market slug.
@@ -72,7 +73,7 @@ impl GammaMarket {
 
     /// Returns the closed-market payout for a token, when resolved.
     #[must_use]
-    pub fn resolution_price(&self, token_id: &str) -> Option<f64> {
+    pub fn resolution_price(&self, token_id: &str) -> Option<Decimal> {
         if !self.closed {
             return None;
         }
@@ -82,6 +83,35 @@ impl GammaMarket {
             .and_then(|index| self.outcome_prices.get(index))
             .copied()
     }
+}
+
+/// Failure returned while loading or converting a Gamma market.
+#[derive(Debug, Error)]
+pub enum GammaError {
+    /// The Gamma API request or response decoding failed.
+    #[error("gamma market request failed: {source}")]
+    Request {
+        #[from]
+        #[source]
+        source: SdkError,
+    },
+
+    /// Gamma omitted a field required by [`GammaMarket`].
+    #[error("gamma market payload omitted required field `{field}`")]
+    MissingField {
+        /// Missing Gamma response field.
+        field: &'static str,
+    },
+
+    /// Gamma supplied a closed timestamp that was not RFC 3339.
+    #[error("gamma market closed timestamp `{value}` was invalid: {source}")]
+    InvalidClosedTime {
+        /// Invalid timestamp text.
+        value: String,
+        /// Timestamp parsing failure.
+        #[source]
+        source: chrono::ParseError,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -149,11 +179,9 @@ impl GammaClient {
     ///
     /// # Errors
     ///
-    /// Returns the SDK's Gamma transport or decoding error.
-    pub async fn market_by_token(
-        &self,
-        token_id: &str,
-    ) -> Result<Option<GammaMarket>, polymarket_client_sdk_v2::error::Error> {
+    /// Returns a typed error when the request, response decoding, or required-field conversion
+    /// fails.
+    pub async fn market_by_token(&self, token_id: &str) -> Result<Option<GammaMarket>, GammaError> {
         let Ok(token) = token_id.parse::<U256>() else {
             return Ok(None);
         };
@@ -161,45 +189,72 @@ impl GammaClient {
             .clob_token_ids(vec![token])
             .build();
         let markets = self.client.markets(&request).await?;
-        Ok(markets.into_iter().next().map(GammaMarket::from))
+        markets
+            .into_iter()
+            .next()
+            .map(GammaMarket::try_from)
+            .transpose()
     }
 }
 
-impl From<Market> for GammaMarket {
-    fn from(market: Market) -> Self {
-        let event = market.events.as_ref().and_then(|events| events.first());
-        Self {
-            event_id: event.map_or_else(String::new, |event| event.id.clone()),
+impl TryFrom<Market> for GammaMarket {
+    type Error = GammaError;
+
+    fn try_from(market: Market) -> Result<Self, Self::Error> {
+        let event = market
+            .events
+            .as_ref()
+            .and_then(|events| events.first())
+            .ok_or(GammaError::MissingField { field: "events[0]" })?;
+        let event_id = event.id.clone();
+        let event_slug = event.slug.clone().ok_or(GammaError::MissingField {
+            field: "event.slug",
+        })?;
+        let closed_time = market
+            .closed_time
+            .map(|value| {
+                parse_timestamp(&value)
+                    .map_err(|source| GammaError::InvalidClosedTime { value, source })
+            })
+            .transpose()?;
+
+        Ok(Self {
+            event_id,
             end_date_iso: market.end_date_iso.map(|date| date.to_string()),
-            negative_risk: market.neg_risk.unwrap_or(false),
-            outcomes: market.outcomes.unwrap_or_default(),
+            negative_risk: market
+                .neg_risk
+                .ok_or(GammaError::MissingField { field: "negRisk" })?,
+            outcomes: market
+                .outcomes
+                .ok_or(GammaError::MissingField { field: "outcomes" })?,
             clob_token_ids: market
                 .clob_token_ids
-                .unwrap_or_default()
+                .ok_or(GammaError::MissingField {
+                    field: "clobTokenIds",
+                })?
                 .into_iter()
                 .map(|token| token.to_string())
                 .collect(),
-            closed: market.closed.unwrap_or(false),
-            closed_time: market.closed_time.as_deref().and_then(parse_timestamp),
-            outcome_prices: market
-                .outcome_prices
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|price| price.to_string().parse().ok())
-                .collect(),
-            title: market.question.unwrap_or_default(),
-            slug: market.slug.unwrap_or_default(),
-            event_slug: event
-                .and_then(|event| event.slug.clone())
-                .unwrap_or_default(),
-        }
+            closed: market
+                .closed
+                .ok_or(GammaError::MissingField { field: "closed" })?,
+            closed_time,
+            outcome_prices: market.outcome_prices.ok_or(GammaError::MissingField {
+                field: "outcomePrices",
+            })?,
+            title: market
+                .question
+                .ok_or(GammaError::MissingField { field: "question" })?,
+            slug: market
+                .slug
+                .ok_or(GammaError::MissingField { field: "slug" })?,
+            event_slug,
+        })
     }
 }
 
-fn parse_timestamp(value: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|date| date.timestamp())
+fn parse_timestamp(value: &str) -> Result<i64, chrono::ParseError> {
+    chrono::DateTime::parse_from_rfc3339(value).map(|date| date.timestamp())
 }
 
 #[cfg(test)]
