@@ -382,18 +382,25 @@ source pairing, causal recording, and failure semantics must remain equivalent.
 
 Required work:
 
-- [ ] Define a golden strategy-input contract shared by all three drivers.
-- [ ] Use the same normalized PM event parser in historical, paper, and live
-  paths.
-- [ ] Add live Binance `@aggTrade` source injection and pair it with the
-  existing Vision historical source.
-- [ ] Keep CEX source identity, exchange timestamp, aggregate ID, and ordering
-  identical between live and replay.
-- [ ] Add one fixture strategy run in all three modes and compare normalized
-  facts, decision snapshots, and causal correlation IDs.
-- [ ] Make source failure, premature EOF, stale data, and storage failure obey
-  the same fail-closed contract in all modes.
-- [ ] Add a mode-parity integration test before adding more exchanges.
+- [x] Define a golden strategy-input contract shared by all three drivers.
+  `StrategyFact`/`StrategyContext` are the sole strategy inputs in every driver.
+- [x] Use the same normalized PM event parser in historical, paper, and live
+  paths. All three drive `MergedFeed` over the same `SourceEnvelope`
+  normalization.
+- [x] Add live Binance `@aggTrade` source injection and pair it with the
+  existing Vision historical source. Shipped as P1-6b (`BinanceAggTradeLive`).
+- [x] Keep CEX source identity, exchange timestamp, aggregate ID, and ordering
+  identical between live and replay. Locked by the P1-6b parser parity tests.
+- [x] Add one fixture strategy run in all three modes and compare normalized
+  facts, decision snapshots, and causal correlation IDs. Covered by
+  `decision_causality_matches_all_modes` and
+  `deterministic_source_merge_matches_all_modes`.
+- [x] Make source failure, premature EOF, stale data, and storage failure obey
+  the same fail-closed contract in all modes. Covered by
+  `source_gap_aborts_before_strategy_evaluation` and the shared `MergedFeed`.
+- [x] Add a mode-parity integration test before adding more exchanges.
+  `deterministic_source_merge_matches_all_modes` asserts identical facts across
+  backtest, paper, and live.
 
 The `pm-money` Binance/Bybit/Coinbase/Kraken/OKX feed code is a source of
 adapter candidates, not an automatic extraction target. Each adapter must have
@@ -633,12 +640,24 @@ behavioral test and documentation update.
 
 ### Review gate for every task
 
-- [ ] Does this belong in OSS, or is it cloud/product infrastructure?
-- [ ] Does it preserve PM-owned evidence versus public CEX context?
-- [ ] Does it add a real consumer, or only a write-only field/abstraction?
-- [ ] Is the behavior replayable and deterministic?
-- [ ] Is failure fail-closed where money or truth is involved?
-- [ ] Is there a focused test and an executable surface check?
+- [x] Does this belong in OSS, or is it cloud/product infrastructure? The
+  collector is a transport-agnostic reliability engine, the archive is a
+  contract plus filesystem reference, and the bundle reads durable state — no
+  S3 client, Parquet, or CLI landed in OSS.
+- [x] Does it preserve PM-owned evidence versus public CEX context? Raw frames
+  are preserved verbatim and stored immutably; the bundle keeps PM evidence and
+  CEX archive checksums in separate sections; CEX is still never tape-stored.
+- [x] Does it add a real consumer, or only a write-only field/abstraction?
+  Every crate ships tests and a runnable example/QA that drive the public
+  surface end to end.
+- [x] Is the behavior replayable and deterministic? Scripted transports,
+  canonical segment/bundle ordering, and the all-mode feed parity tests are
+  deterministic.
+- [x] Is failure fail-closed where money or truth is involved? Bounded reconnect
+  budgets, backpressure that never drops frames, checksum/version/gap rejection,
+  live-cancel shutdown routing, and bundle gap rejection all fail closed.
+- [x] Is there a focused test and an executable surface check? Each task shipped
+  focused tests plus an example or in-tree QA exercising the real surface.
 
 ## Review evidence
 
