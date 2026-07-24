@@ -155,6 +155,12 @@ pub enum StoreError {
     /// A canonical segment contains an invalid checkpoint relationship.
     #[error("canonical segment does not begin after its common ancestor")]
     InvalidCanonicalSegment,
+    /// A paper-account ledger cannot be reconstructed safely.
+    #[error("paper ledger is corrupt or inconsistent: {message}")]
+    CorruptPaperLedger {
+        /// The replay invariant that failed.
+        message: String,
+    },
 }
 
 impl From<turso::Error> for StoreError {

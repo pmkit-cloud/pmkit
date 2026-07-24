@@ -14,16 +14,19 @@ categories.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
+rust_decimal = { workspace = true }
+pmkit-accounting = { path = "../pmkit-accounting" }
 pmkit-core = { path = "../pmkit-core" }
 pmkit-market = { path = "../pmkit-market" }
 pmkit-book = { path = "../pmkit-book" }
 pmkit-event = { path = "../pmkit-event" }
 pmkit-exec = { path = "../pmkit-exec" }
+pmkit-money = { path = "../pmkit-money" }
 pmkit-sim = { path = "../pmkit-sim" }
-
-[dev-dependencies]
-rust_decimal = { workspace = true }
 
 [lints]
 workspace = true

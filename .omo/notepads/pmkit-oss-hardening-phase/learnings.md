@@ -120,6 +120,28 @@
   account records into a fresh `LiveRiskState`; no durable derived snapshot was
   added as a second authority.
 
+## 2026-07-24 - Durable paper-account ledger
+
+- Paper records reuse owner-scoped `CausalDecision` rows; no table or migration
+  was added. Each payload is tagged `record_type = "paper_ledger"`, version 1,
+  and carries `event_id = "paper-ledger-{sequence}"`, contiguous sequence,
+  logical timestamp, and one event: cash movement, order placement,
+  ack/rejection, cancel, fill, or settlement.
+- Submission is represented as `OrderPlaced` followed by `OrderAck` or
+  `OrderRejected`. The ack stores the generated order id, immediate/resting/
+  delayed state, and exact activation time. This reconstructs rejected-attempt
+  ID consumption, partial resting quantities, delayed orders, and the next id.
+- `PaperExecutor::reconstruct` deduplicates byte-equivalent stable event
+  identities, rejects conflicting duplicates, sequence gaps, dangling/unknown
+  order transitions, mismatched or oversize fills, and inconsistent
+  settlements, then rebuilds cash, fees, realized PnL, per-market positions,
+  open orders, and `SimEngine` from records only. No derived snapshot exists.
+- `paper.rs` restores before feed consumption and persists executor entries
+  through `store_decision` after each mutation. Strategy positions now come
+  from `PaperExecutor::positions_for_market`, so the durable reducer is the
+  paper account authority that Todos 20 and 21 should extend rather than a
+  parallel position vector.
+
 ## 2026-07-24 - Tightening-only scoped risk limits
 
 - `PartialRiskLimits` mirrors all eight numeric `RiskLimits` fields as

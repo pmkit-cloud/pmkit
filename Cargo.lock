@@ -3768,13 +3768,18 @@ name = "pmkit-paper"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "pmkit-accounting",
  "pmkit-book",
  "pmkit-core",
  "pmkit-event",
  "pmkit-exec",
  "pmkit-market",
+ "pmkit-money",
  "pmkit-sim",
  "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror",
  "tokio",
 ]
 
