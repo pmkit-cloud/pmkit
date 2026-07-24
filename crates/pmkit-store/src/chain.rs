@@ -3,7 +3,7 @@ use thiserror::Error;
 use crate::log::{CanonicalChainLog, ChainEvent};
 
 /// The only supported onchain network for `PMKit` wallet reconstruction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ChainId(u64);
 
 impl ChainId {

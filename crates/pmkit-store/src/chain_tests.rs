@@ -5,8 +5,10 @@ use rust_decimal::Decimal;
 
 use crate::wallet::rebuild_wallet;
 use crate::{
-    Address, CanonicalChainLog, CanonicalLogSegment, CanonicalLogStore, ChainCheckpoint,
-    ChainEvent, ChainId, ContractRegistry, TradeSide, TursoTapeStore, WalletQuery,
+    Address, BlockHead, CanonicalChainLog, CanonicalLogSegment, CanonicalLogStore, ChainCheckpoint,
+    ChainEvent, ChainId, ContractRegistry, FinalizedBlockRange, FinalizedRawLogBatch,
+    ProviderIdentity, RawLogIdentity, RawRpcLog, TradeSide, TursoTapeStore, WalletQuery,
+    ingest_finalized_batch,
 };
 
 fn database_path(name: &str) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
@@ -367,6 +369,61 @@ async fn bounded_wallet_snapshot_reports_its_own_canonical_tip()
     assert_eq!(
         snapshot.canonical_tip,
         Some(ChainCheckpoint::new(ChainId::POLYGON, 2, "0xblock2a"))
+    );
+    store.delete_database()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn finalized_raw_batch_is_decoded_and_ingested_transactionally()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: one finalized ERC-20 collateral transfer from a provider boundary.
+    let (_dir, path) = database_path("raw-ingestion")?;
+    let registry = ContractRegistry::polygon();
+    let wallet = address("0x00000000000000000000000000000000000000aa");
+    let provider = ProviderIdentity::new("fixture-rpc");
+    let raw = RawRpcLog {
+        identity: RawLogIdentity {
+            provider: provider.clone(),
+            chain_id: ChainId::POLYGON,
+            block_number: 1,
+            block_hash: "0xblock1".into(),
+            transaction_hash: "0xtx1".into(),
+            transaction_index: 0,
+            log_index: 0,
+        },
+        contract_address: registry.collateral.clone(),
+        topics: vec![
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a8df523b3ef".into(),
+            "0x0000000000000000000000000000000000000000000000000000000000000001".into(),
+            format!("0x00000000000000000000000000000000000000000000000000000000000000aa"),
+        ],
+        data: format!("0x{:064x}", 42),
+    };
+    let batch = FinalizedRawLogBatch::new(
+        provider,
+        FinalizedBlockRange::new(ChainId::POLYGON, 1, 1)?,
+        BlockHead::new(ChainId::POLYGON, 2, "0xhead"),
+        BlockHead::new(ChainId::POLYGON, 1, "0xblock1"),
+        vec![raw],
+    )?;
+    let store = TursoTapeStore::open_local(&path).await?;
+
+    // When: the validated batch is decoded and committed through the canonical store.
+    ingest_finalized_batch(
+        &store,
+        &registry,
+        &batch,
+        ChainCheckpoint::new(ChainId::POLYGON, 0, "0xgenesis"),
+    )
+    .await?;
+    let snapshot = store.wallet_snapshot(&WalletQuery::new(wallet)).await?;
+
+    // Then: the durable wallet view reflects the decoded canonical event.
+    assert_eq!(snapshot.collateral_balance, Decimal::from(42));
+    assert_eq!(
+        snapshot.canonical_tip,
+        Some(ChainCheckpoint::new(ChainId::POLYGON, 1, "0xblock1"))
     );
     store.delete_database()?;
     Ok(())

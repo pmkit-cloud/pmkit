@@ -1,14 +1,46 @@
 use async_trait::async_trait;
 
 use crate::{
-    CanonicalChainLog, CanonicalLogSegment, ChainCheckpoint, ContractRegistry, StoreError,
-    TursoTapeStore, WalletQuery, WalletSnapshot,
+    CanonicalChainLog, CanonicalLogSegment, ChainCheckpoint, ContractRegistry, DecodeError,
+    FinalizedRawLogBatch, StoreError, TursoTapeStore, WalletQuery, WalletSnapshot, decode_raw_log,
     schema::{
         DELETE_CANONICAL_LOGS_AFTER, INSERT_CANONICAL_LOG, READ_CANONICAL_CHECKPOINT,
         READ_CANONICAL_LOGS, UPSERT_CANONICAL_CHECKPOINT,
     },
     wallet::rebuild_wallet,
 };
+
+/// Decodes and transactionally ingests one validated finalized raw-log batch.
+///
+/// The common ancestor is supplied by the caller that owns provider/checkpoint
+/// coordination. Durable validation and replacement remain delegated to
+/// [`CanonicalLogStore::replace_canonical_segment`].
+///
+/// # Errors
+///
+/// Returns [`StoreError::CanonicalLogDecode`] when a raw log cannot be decoded,
+/// or the store's canonical segment validation fails.
+pub async fn ingest_finalized_batch(
+    store: &TursoTapeStore,
+    registry: &ContractRegistry,
+    batch: &FinalizedRawLogBatch,
+    common_ancestor: ChainCheckpoint,
+) -> Result<(), StoreError> {
+    let logs = batch
+        .logs
+        .iter()
+        .map(|raw| decode_raw_log(registry, raw).map_err(|error| decode_error(&error)))
+        .collect::<Result<Vec<_>, _>>()?;
+    store
+        .replace_canonical_segment(registry, &CanonicalLogSegment::new(common_ancestor, logs))
+        .await
+}
+
+fn decode_error(error: &DecodeError) -> StoreError {
+    StoreError::CanonicalLogDecode {
+        message: error.to_string(),
+    }
+}
 
 /// Durable canonical-log operations and deterministic wallet reconstruction.
 #[async_trait]
