@@ -12,10 +12,11 @@ Raw frames and normalized hashes remain immutable evidence for every stored
 envelope.
 
 `causal_decisions.schema_version` and `durable_intents.schema_version` version
-their stored records independently of `payload_json`. Both current record
-versions are `1`; writers persist that version explicitly, and readers return a
-typed `StoreError::UnsupportedRecordSchemaVersion` instead of skipping a row
-whose version they cannot decode. The JSON payload shape is unchanged.
+their stored records independently of `payload_json`. Current causal decisions
+are version `2`, recording the resolved maker/taker simulation fee model;
+durable intents remain version `1`. Writers persist each version explicitly,
+and readers return a typed `StoreError::UnsupportedRecordSchemaVersion` instead
+of skipping a row whose version they cannot decode.
 
 ## Database schema migrations
 
@@ -47,6 +48,12 @@ only rows whose `schema_version` is exactly `1`; unsupported versions remain
 untouched and replay as `ReplayGapReason::UnsupportedSchemaVersion`. Existing
 `normalized_json`, raw frames, and integrity hashes remain byte-for-byte
 unchanged because all pre-v2 account variants retain their original shape.
+
+Database migration version `5` advances only `causal_decisions` rows whose
+record schema is exactly version `1` to version `2`. Existing decision payloads
+and causal identities remain byte-for-byte unchanged and readable; new version-2
+decision snapshots include the resolved simulation fee model. Unsupported
+record versions remain untouched and fail closed in the reader.
 
 Opening fails with a typed `StoreError` when the newest on-disk version exceeds
 the binary's maximum supported version. PMKit never auto-downgrades a database.

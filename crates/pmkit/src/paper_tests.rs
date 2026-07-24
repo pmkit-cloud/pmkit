@@ -10,6 +10,7 @@ use pmkit_market::Outcome;
 use pmkit_money::Money;
 use pmkit_runtime::StrategyRegistration;
 use pmkit_spec::{ConservativeV1Config, PaperRun};
+use pmkit_store::{OwnerScope, TapeStore, TursoTapeStore};
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,6 +60,7 @@ async fn paper_run_drives_live_feed_to_fill() -> Result<(), Box<dyn std::error::
             maker_queue_ahead_bps: 0,
             slippage_bps: 0,
             market_impact_bps: 0,
+            fee_model: None,
         },
     )
     .strategy(StrategyRegistration::new(
@@ -77,5 +79,50 @@ async fn paper_run_drives_live_feed_to_fill() -> Result<(), Box<dyn std::error::
         paper.fills >= 1,
         "the taker buy should fill against the ask"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_fee_unchanged() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: a durable paper run with no explicit fee-model override.
+    let directory = tempfile::tempdir()?;
+    let store =
+        Arc::new(TursoTapeStore::open_local(directory.path().join("default-fee.db")).await?);
+    let run = PaperRun::new(
+        RunId::new("paper-default-fee")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        risk()?,
+        Arc::new(ScriptedLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(BuyFactory),
+    ));
+
+    // When: the default paper path fills ten shares at the 46-cent ask.
+    Pmkit::builder(config()?)
+        .storage(store.clone())
+        .run(run)
+        .start()
+        .await?;
+    let scope = OwnerScope::new(PortfolioId::new("alice")?, RunId::new("paper-default-fee")?);
+    let decisions = store.read_decisions(&scope).await?;
+    let fill = decisions
+        .iter()
+        .find(|decision| decision.payload["event"]["kind"] == "fill")
+        .ok_or("paper fill was not recorded")?;
+
+    // Then: the durable fill fee exactly matches the legacy Crypto calculation.
+    assert_eq!(fill.payload["event"]["fee"], "0.17388");
+    drop(store);
     Ok(())
 }

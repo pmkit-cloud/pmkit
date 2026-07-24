@@ -5,6 +5,8 @@
 //! a later book update crosses them. Fills are emitted as
 //! [`MarketEvent::Fill`], never touching a real venue.
 
+// allow: SIZE_OK — the simulator's order lifecycle is one state machine.
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -13,10 +15,12 @@ use pmkit_core::MarketId;
 use pmkit_event::{Liquidity, MarketEvent};
 use pmkit_exec::{OrderId, PlaceOrder};
 use pmkit_market::Outcome;
-use pmkit_math::fees::taker_fee_order;
 use pmkit_math::fill::walk_book;
 use rust_decimal::Decimal;
 
+mod fee;
+
+pub use fee::{FeeModel, FeeModelError};
 pub use pmkit_math::fees::MarketCategory;
 
 type BookKey = (MarketId, Outcome);
@@ -48,6 +52,8 @@ pub struct SimulationConfig {
     pub slippage_bps: u16,
     /// Adverse taker impact in basis points.
     pub market_impact_bps: u16,
+    /// Optional fee override; unset preserves the selected category's legacy fees.
+    pub fee_model: Option<FeeModel>,
 }
 
 /// A conservative fill-simulation engine shared by paper and backtest modes.
@@ -59,7 +65,7 @@ pub struct SimEngine {
     pending_fills: Vec<MarketEvent>,
     next_id: AtomicU64,
     id_prefix: String,
-    category: MarketCategory,
+    fee_model: FeeModel,
     config: SimulationConfig,
 }
 
@@ -68,16 +74,7 @@ impl SimEngine {
     /// `start_id`, charging taker fees for `category`.
     #[must_use]
     pub fn new(id_prefix: impl Into<String>, start_id: u64, category: MarketCategory) -> Self {
-        Self {
-            books: HashMap::new(),
-            resting: HashMap::new(),
-            delayed: Vec::new(),
-            pending_fills: Vec::new(),
-            next_id: AtomicU64::new(start_id),
-            id_prefix: id_prefix.into(),
-            category,
-            config: SimulationConfig::default(),
-        }
+        Self::with_config(id_prefix, start_id, category, SimulationConfig::default())
     }
 
     /// Creates an engine with explicit latency, queue, slippage, and impact inputs.
@@ -88,9 +85,36 @@ impl SimEngine {
         category: MarketCategory,
         config: SimulationConfig,
     ) -> Self {
+        let fee_model = config
+            .fee_model
+            .unwrap_or_else(|| FeeModel::for_category(category));
+        Self::with_fee_config(
+            id_prefix,
+            start_id,
+            SimulationConfig {
+                fee_model: Some(fee_model),
+                ..config
+            },
+        )
+    }
+
+    /// Creates an engine from a fee-resolved simulation configuration.
+    #[must_use]
+    pub fn with_fee_config(
+        id_prefix: impl Into<String>,
+        start_id: u64,
+        config: SimulationConfig,
+    ) -> Self {
+        let fee_model = config.fee_model.unwrap_or_default();
         Self {
+            books: HashMap::new(),
+            resting: HashMap::new(),
+            delayed: Vec::new(),
+            pending_fills: Vec::new(),
+            next_id: AtomicU64::new(start_id),
+            id_prefix: id_prefix.into(),
+            fee_model,
             config,
-            ..Self::new(id_prefix, start_id, category)
         }
     }
 
@@ -212,7 +236,9 @@ impl SimEngine {
             Side::Buy => (vwap * (Decimal::ONE + adverse_bps)).min(order.price),
             Side::Sell => (vwap * (Decimal::ONE - adverse_bps)).max(order.price),
         };
-        let fee = taker_fee_order(fill_qty, fill_price, self.category);
+        let fee = self
+            .fee_model
+            .fee_order(fill_qty, fill_price, Liquidity::Taker)?;
         self.pending_fills.push(MarketEvent::Fill {
             strategy: None,
             order_id: order_id.clone(),
@@ -302,6 +328,13 @@ impl SimEngine {
                     self.resting.insert(order_id, resting);
                     continue;
                 }
+                let Some(fee) =
+                    self.fee_model
+                        .fee_order(fill_quantity, resting.order.price, Liquidity::Maker)
+                else {
+                    self.resting.insert(order_id, resting);
+                    continue;
+                };
                 self.pending_fills.push(MarketEvent::Fill {
                     strategy: None,
                     order_id: resting.order_id.clone(),
@@ -310,7 +343,7 @@ impl SimEngine {
                     price: resting.order.price,
                     size: fill_quantity,
                     side: resting.order.side,
-                    fee: Decimal::ZERO,
+                    fee,
                     liquidity: Liquidity::Maker,
                     timestamp_ms: book.timestamp_ms.max(resting.submitted_ms),
                 });

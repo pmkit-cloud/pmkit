@@ -3849,6 +3849,7 @@ dependencies = [
  "pmkit-money",
  "pmkit-run",
  "pmkit-runtime",
+ "pmkit-sim",
  "pmkit-strategy",
  "tokio",
 ]

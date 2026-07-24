@@ -20,6 +20,7 @@ pmkit-runtime = { path = "../pmkit-runtime" }
 pmkit-data = { path = "../pmkit-data" }
 pmkit-exec = { path = "../pmkit-exec" }
 pmkit-run = { path = "../pmkit-run" }
+pmkit-sim = { path = "../pmkit-sim" }
 
 [dev-dependencies]
 async-trait = { workspace = true }

@@ -445,12 +445,19 @@ fn snapshot_payload(snapshot: &DecisionSnapshot) -> Value {
             "observation_ms": snapshot.observation_timestamp_ms,
             "decision_ms": snapshot.decision_timestamp_ms,
         },
-        "simulation": snapshot.simulation.map(|simulation| json!({
-            "activation_latency_ms": simulation.activation_latency_ms,
-            "maker_queue_ahead_bps": simulation.maker_queue_ahead_bps,
-            "slippage_bps": simulation.slippage_bps,
-            "market_impact_bps": simulation.market_impact_bps,
-        })),
+        "simulation": snapshot.simulation.map(|simulation| {
+            let fee_model = simulation.fee_model.unwrap_or_default();
+            json!({
+                "activation_latency_ms": simulation.activation_latency_ms,
+                "maker_queue_ahead_bps": simulation.maker_queue_ahead_bps,
+                "slippage_bps": simulation.slippage_bps,
+                "market_impact_bps": simulation.market_impact_bps,
+                "fee_model": {
+                    "maker_bps": fee_model.maker_bps(),
+                    "taker_bps": fee_model.taker_bps(),
+                },
+            })
+        }),
         "pm_book": {
             "best_bid": decimal_option(snapshot.pm_book.best_bid),
             "best_ask": decimal_option(snapshot.pm_book.best_ask),

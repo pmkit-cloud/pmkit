@@ -14,7 +14,7 @@ use pmkit_event::MarketEvent;
 use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
 use pmkit_market::Outcome;
 use pmkit_money::Money;
-use pmkit_sim::{MarketCategory, SimEngine, SimulationConfig};
+use pmkit_sim::{FeeModel, MarketCategory, SimEngine, SimulationConfig};
 use rust_decimal::Decimal;
 use tokio::sync::mpsc::Sender;
 
@@ -80,10 +80,32 @@ impl PaperExecutor {
         config: SimulationConfig,
         initial_cash: Money,
     ) -> Self {
+        let fee_model = config
+            .fee_model
+            .unwrap_or_else(|| FeeModel::for_category(category));
+        Self::with_account_fee_config(
+            fills,
+            id_prefix,
+            SimulationConfig {
+                fee_model: Some(fee_model),
+                ..config
+            },
+            initial_cash,
+        )
+    }
+
+    /// Creates a paper executor from a fee-resolved simulation configuration.
+    #[must_use]
+    pub fn with_account_fee_config(
+        fills: Sender<MarketEvent>,
+        id_prefix: impl Into<String>,
+        config: SimulationConfig,
+        initial_cash: Money,
+    ) -> Self {
         let id_prefix = id_prefix.into();
         Self {
             state: Mutex::new(ExecutorState {
-                engine: SimEngine::with_config(id_prefix.clone(), 0, category, config),
+                engine: SimEngine::with_fee_config(id_prefix.clone(), 0, config),
                 ledger: PaperLedger::new(initial_cash, id_prefix),
                 config,
                 last_timestamp_ms: 0,
@@ -104,9 +126,34 @@ impl PaperExecutor {
         config: SimulationConfig,
         entries: &[PaperLedgerEntry],
     ) -> Result<Self, PaperLedgerError> {
+        let fee_model = config
+            .fee_model
+            .unwrap_or_else(|| FeeModel::for_category(category));
+        Self::reconstruct_with_fee_config(
+            fills,
+            id_prefix,
+            SimulationConfig {
+                fee_model: Some(fee_model),
+                ..config
+            },
+            entries,
+        )
+    }
+
+    /// Reconstructs a paper executor from records and a fee-resolved configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PaperLedgerError`] when records are corrupt or inconsistent.
+    pub fn reconstruct_with_fee_config(
+        fills: Sender<MarketEvent>,
+        id_prefix: impl Into<String>,
+        config: SimulationConfig,
+        entries: &[PaperLedgerEntry],
+    ) -> Result<Self, PaperLedgerError> {
         let id_prefix = id_prefix.into();
         let ledger = PaperLedger::reconstruct(entries, id_prefix)?;
-        let engine = ledger.rebuild_engine(category, config)?;
+        let engine = ledger.rebuild_engine(config)?;
         let last_timestamp_ms = ledger.last_timestamp_ms();
         Ok(Self {
             state: Mutex::new(ExecutorState {

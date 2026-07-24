@@ -7,7 +7,7 @@ use pmkit_event::MarketEvent;
 use pmkit_exec::{OrderId, PlaceOrder};
 use pmkit_market::Outcome;
 use pmkit_money::Money;
-use pmkit_sim::{MarketCategory, SimEngine, SimulationConfig};
+use pmkit_sim::{SimEngine, SimulationConfig};
 use rust_decimal::Decimal;
 use thiserror::Error;
 
@@ -494,10 +494,9 @@ impl PaperLedger {
 
     pub(crate) fn rebuild_engine(
         &self,
-        category: MarketCategory,
         config: SimulationConfig,
     ) -> Result<SimEngine, PaperLedgerError> {
-        let mut engine = SimEngine::with_config(self.id_prefix.clone(), 0, category, config);
+        let mut engine = SimEngine::with_fee_config(self.id_prefix.clone(), 0, config);
         for entry in &self.entries {
             let PaperLedgerEvent::OrderPlaced { order } = &entry.event else {
                 continue;

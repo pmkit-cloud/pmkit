@@ -1,4 +1,4 @@
-use super::{MarketCategory, SimEngine, SimulationConfig};
+use super::{FeeModel, MarketCategory, SimEngine, SimulationConfig};
 use pmkit_book::{OrderBookL2, Side};
 use pmkit_core::MarketId;
 use pmkit_event::{Liquidity, MarketEvent};
@@ -168,6 +168,80 @@ fn slippage_and_impact_adjust_taker_price_without_crossing_limit()
     assert!(matches!(
         fills.as_slice(),
         [MarketEvent::Fill { price, .. }] if *price == Decimal::new(4646, 4)
+    ));
+    Ok(())
+}
+
+#[test]
+fn custom_fee_applied() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: a one-percent taker fee and one-percent maker rebate.
+    let config = SimulationConfig {
+        fee_model: Some(FeeModel::try_new(-100, 100)?),
+        ..SimulationConfig::default()
+    };
+    let market = MarketId::new("btc-5m")?;
+    let mut taker = SimEngine::with_config("taker", 0, MarketCategory::Crypto, config);
+    taker.update_book(&market, Outcome::Up, ask_book());
+    let mut maker = SimEngine::with_config("maker", 0, MarketCategory::Crypto, config);
+    maker.update_book(&market, Outcome::Up, ask_book());
+    maker.submit(&order(Side::Buy, Decimal::new(45, 2), true)?, 0);
+
+    // When: the taker crosses immediately and the maker is crossed by a later book.
+    taker.submit(&order(Side::Buy, Decimal::new(50, 2), false)?, 0);
+    maker.update_book(
+        &market,
+        Outcome::Up,
+        OrderBookL2 {
+            bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+            asks: vec![(Decimal::new(45, 2), Decimal::from(50))],
+            timestamp_ms: 1,
+            last_trade_price: None,
+        },
+    );
+
+    // Then: each fill carries the configured exact fee or rebate.
+    assert!(matches!(
+        taker.drain_fills().as_slice(),
+        [MarketEvent::Fill { fee, .. }] if *fee == Decimal::new(2_484, 5)
+    ));
+    assert!(matches!(
+        maker.drain_fills().as_slice(),
+        [MarketEvent::Fill { fee, .. }] if *fee == Decimal::new(-2_475, 5)
+    ));
+    Ok(())
+}
+
+#[test]
+fn invalid_fee_rejected() {
+    // Given / When: fee inputs exceed the documented rebate floor and fee ceiling.
+    let excessive_rebate = FeeModel::try_new(-10_001, 0);
+    let overflow_inducing = FeeModel::try_new(0, i32::MAX);
+    let negative_taker = FeeModel::try_new(0, -1);
+
+    // Then: no invalid model can enter SimulationConfig.
+    assert!(excessive_rebate.is_err());
+    assert!(overflow_inducing.is_err());
+    assert!(negative_taker.is_err());
+}
+
+#[test]
+fn default_fee_unchanged() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: the simulation fee model is unset.
+    let mut engine = SimEngine::with_config(
+        "paper",
+        0,
+        MarketCategory::Crypto,
+        SimulationConfig::default(),
+    );
+    engine.update_book(&MarketId::new("btc-5m")?, Outcome::Up, ask_book());
+
+    // When: the same ten-share taker order crosses the 46-cent ask.
+    engine.submit(&order(Side::Buy, Decimal::new(50, 2), false)?, 0);
+
+    // Then: the fee is byte-for-byte equal to the legacy Crypto calculation.
+    assert!(matches!(
+        engine.drain_fills().as_slice(),
+        [MarketEvent::Fill { fee, .. }] if *fee == Decimal::new(17_388, 5)
     ));
     Ok(())
 }

@@ -6,7 +6,7 @@ use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_book::OrderBookL2;
 use pmkit_data::ReplayQuery;
 use pmkit_event::{MarketEvent, SourceEnvelope, StrategyFact};
-use pmkit_sim::{MarketCategory, SimEngine, SimulationConfig};
+use pmkit_sim::{SimEngine, SimulationConfig};
 use pmkit_spec::BacktestRun;
 use pmkit_store::{CausalIdentity, OwnerScope, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
@@ -69,8 +69,9 @@ pub async fn drive_with_control(
         maker_queue_ahead_bps: simulation.maker_queue_ahead_bps,
         slippage_bps: simulation.slippage_bps,
         market_impact_bps: simulation.market_impact_bps,
+        fee_model: Some(simulation.resolved_fee_model()),
     };
-    let mut sim = SimEngine::with_config("bt", 0, MarketCategory::Crypto, simulation_config);
+    let mut sim = SimEngine::with_fee_config("bt", 0, simulation_config);
     let mut positions = Vec::new();
     let mut events_processed = 0_usize;
     let mut fills = 0_usize;
@@ -306,6 +307,7 @@ mod tests {
                 maker_queue_ahead_bps: 0,
                 slippage_bps: 0,
                 market_impact_bps: 0,
+                fee_model: None,
             },
         ))
     }

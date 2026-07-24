@@ -7,7 +7,6 @@ use pmkit_event::{MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
 use pmkit_exec::{ExecError, Executor};
 use pmkit_market::Outcome;
 use pmkit_paper::{PaperExecutor, PaperLedgerEntry, PaperLedgerError};
-use pmkit_sim::MarketCategory;
 use pmkit_sim::SimulationConfig;
 use pmkit_spec::PaperRun;
 use pmkit_store::{CausalDecision, CausalIdentity, OwnerScope, StoreError, TapeStore};
@@ -56,18 +55,16 @@ async fn restore_paper_executor(
     scope: &OwnerScope,
     fills: tokio::sync::mpsc::Sender<MarketEvent>,
     id_prefix: &str,
-    category: MarketCategory,
     config: SimulationConfig,
 ) -> Result<Option<PaperExecutor>, StoreError> {
     let decisions = store.read_decisions(scope).await?;
-    restore_paper_executor_from_decisions(&decisions, fills, id_prefix, category, config)
+    restore_paper_executor_from_decisions(&decisions, fills, id_prefix, config)
 }
 
 fn restore_paper_executor_from_decisions(
     decisions: &[CausalDecision],
     fills: tokio::sync::mpsc::Sender<MarketEvent>,
     id_prefix: &str,
-    category: MarketCategory,
     config: SimulationConfig,
 ) -> Result<Option<PaperExecutor>, StoreError> {
     let mut entries = Vec::new();
@@ -95,7 +92,7 @@ fn restore_paper_executor_from_decisions(
     if entries.is_empty() {
         return Ok(None);
     }
-    PaperExecutor::reconstruct(fills, id_prefix, category, config, &entries)
+    PaperExecutor::reconstruct_with_fee_config(fills, id_prefix, config, &entries)
         .map(Some)
         .map_err(|error| corrupt_paper_ledger(&error))
 }
@@ -125,36 +122,28 @@ pub async fn drive_with_control(
         maker_queue_ahead_bps: simulation.maker_queue_ahead_bps,
         slippage_bps: simulation.slippage_bps,
         market_impact_bps: simulation.market_impact_bps,
+        fee_model: Some(simulation.resolved_fee_model()),
     };
     let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
     let paper = if let Some(store) = store {
-        restore_paper_executor(
-            store,
-            &scope,
-            fill_tx.clone(),
-            "paper",
-            MarketCategory::Crypto,
-            simulation_config,
-        )
-        .await
-        .map_err(|source| StartError::Storage {
-            run: run.id().clone(),
-            source,
-        })?
-        .unwrap_or_else(|| {
-            PaperExecutor::with_account_config(
-                fill_tx,
-                "paper",
-                MarketCategory::Crypto,
-                simulation_config,
-                run.initial_cash(),
-            )
-        })
+        restore_paper_executor(store, &scope, fill_tx.clone(), "paper", simulation_config)
+            .await
+            .map_err(|source| StartError::Storage {
+                run: run.id().clone(),
+                source,
+            })?
+            .unwrap_or_else(|| {
+                PaperExecutor::with_account_fee_config(
+                    fill_tx,
+                    "paper",
+                    simulation_config,
+                    run.initial_cash(),
+                )
+            })
     } else {
-        PaperExecutor::with_account_config(
+        PaperExecutor::with_account_fee_config(
             fill_tx,
             "paper",
-            MarketCategory::Crypto,
             simulation_config,
             run.initial_cash(),
         )
@@ -421,7 +410,7 @@ mod ledger_tests {
     use pmkit_market::Outcome;
     use pmkit_money::Money;
     use pmkit_paper::PaperExecutor;
-    use pmkit_sim::{MarketCategory, SimulationConfig};
+    use pmkit_sim::SimulationConfig;
     use pmkit_store::{
         CausalDecision, CausalIdentity, OwnerScope, StoreError, TapeStore, TursoTapeStore,
     };
@@ -459,10 +448,6 @@ mod ledger_tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one round trip asserts every reconstructed account and order-state dimension"
-    )]
     async fn paper_full_state_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         // Given a durable paper account with fills, settlement, open orders, and multiple markets.
         let directory = tempdir()?;
@@ -473,15 +458,11 @@ mod ledger_tests {
             maker_queue_ahead_bps: 0,
             slippage_bps: 0,
             market_impact_bps: 0,
+            fee_model: None,
         };
         let (fill_tx, _fill_rx) = mpsc::channel(32);
-        let paper = PaperExecutor::with_account_config(
-            fill_tx,
-            "paper",
-            MarketCategory::Crypto,
-            config,
-            Money::usdc(100),
-        );
+        let paper =
+            PaperExecutor::with_account_fee_config(fill_tx, "paper", config, Money::usdc(100));
         flush(&store, &scope, &paper).await?;
 
         let settled_market = MarketId::new("btc-5m")?;
@@ -561,16 +542,9 @@ mod ledger_tests {
 
         // When a new executor reconstructs exclusively from the durable records.
         let (restored_tx, _restored_rx) = mpsc::channel(32);
-        let restored = restore_paper_executor(
-            &store,
-            &scope,
-            restored_tx,
-            "paper",
-            MarketCategory::Crypto,
-            config,
-        )
-        .await?
-        .ok_or("durable paper ledger was not found")?;
+        let restored = restore_paper_executor(&store, &scope, restored_tx, "paper", config)
+            .await?
+            .ok_or("durable paper ledger was not found")?;
         let after = restored.account_state();
 
         // Then every derived balance and simulator order state is identical.
@@ -624,7 +598,6 @@ mod ledger_tests {
             &scope,
             fill_tx,
             "paper",
-            MarketCategory::Crypto,
             SimulationConfig::default(),
         )
         .await
@@ -644,10 +617,9 @@ mod ledger_tests {
         let store = TursoTapeStore::open_local(directory.path().join("paper.db")).await?;
         let scope = OwnerScope::new(PortfolioId::new("alice")?, RunId::new("paper-idempotent")?);
         let (fill_tx, _fill_rx) = mpsc::channel(8);
-        let paper = PaperExecutor::with_account_config(
+        let paper = PaperExecutor::with_account_fee_config(
             fill_tx,
             "paper",
-            MarketCategory::Crypto,
             SimulationConfig::default(),
             Money::usdc(10),
         );
@@ -668,7 +640,6 @@ mod ledger_tests {
             &duplicated,
             restored_tx,
             "paper",
-            MarketCategory::Crypto,
             SimulationConfig::default(),
         )?
         .ok_or("durable paper ledger was not found")?;

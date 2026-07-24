@@ -17,9 +17,10 @@ mod compiled_provenance {
 }
 
 /// Schema version for run manifests.
-pub const MANIFEST_SCHEMA_VERSION: u16 = 2;
+pub const MANIFEST_SCHEMA_VERSION: u16 = 3;
 
 const MANIFEST_SCHEMA_VERSION_V1: u16 = 1;
+const MANIFEST_SCHEMA_VERSION_V2: u16 = 2;
 const REDACTED_MANIFEST_DIR: &str = "<redacted>";
 
 /// Git state captured when the manifest crate was compiled.
@@ -82,6 +83,21 @@ pub struct ManifestV2 {
     body: ManifestBodyV1,
 }
 
+/// A fully decoded version-3 run manifest.
+///
+/// Version 3 records the resolved maker/taker fee model for simulated runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestV3 {
+    /// Manifest schema version.
+    pub schema_version: u16,
+    /// SHA-256 of the canonical manifest content excluding this field.
+    pub artifact_sha256: String,
+    /// Compile-time reproducibility provenance.
+    pub provenance: Provenance,
+    #[serde(flatten)]
+    body: ManifestBodyV3,
+}
+
 /// A decoded manifest from any supported schema version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionedManifest {
@@ -89,6 +105,8 @@ pub enum VersionedManifest {
     V1(ManifestV1),
     /// A version-2 manifest with compile-time provenance.
     V2(ManifestV2),
+    /// A version-3 manifest with a resolved simulation fee model.
+    V3(ManifestV3),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +129,46 @@ enum ManifestBodyV1 {
         #[serde(flatten)]
         common: ManifestCommonV1,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum ManifestBodyV3 {
+    Backtest {
+        #[serde(flatten)]
+        common: ManifestCommonV1,
+        initial_cash: String,
+        simulation: SimulationV2,
+        replay: ReplayV1,
+    },
+    Paper {
+        #[serde(flatten)]
+        common: ManifestCommonV1,
+        initial_cash: String,
+        simulation: SimulationV2,
+    },
+    Live {
+        #[serde(flatten)]
+        common: ManifestCommonV1,
+    },
+}
+
+impl ManifestBodyV3 {
+    fn validate_fee_model(&self) -> Result<(), ManifestError> {
+        let simulation = match self {
+            Self::Backtest { simulation, .. } | Self::Paper { simulation, .. } => simulation,
+            Self::Live { .. } => return Ok(()),
+        };
+        pmkit_spec::FeeModel::try_new(
+            simulation.fee_model.maker_bps,
+            simulation.fee_model.taker_bps,
+        )
+        .map(|_| ())
+        .map_err(|_| ManifestError::InvalidFeeModel {
+            maker_bps: simulation.fee_model.maker_bps,
+            taker_bps: simulation.fee_model.taker_bps,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +199,21 @@ struct SimulationV1 {
     maker_queue_ahead_bps: u16,
     slippage_bps: u16,
     market_impact_bps: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SimulationV2 {
+    activation_latency_ms: serde_json::Number,
+    maker_queue_ahead_bps: u16,
+    slippage_bps: u16,
+    market_impact_bps: u16,
+    fee_model: FeeModelV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FeeModelV1 {
+    maker_bps: i32,
+    taker_bps: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +259,14 @@ pub enum ManifestError {
         #[source]
         source: serde_json::Error,
     },
+    /// A version-3 manifest contains unsafe simulation fee coefficients.
+    #[error("invalid simulation fee model: maker {maker_bps} bps, taker {taker_bps} bps")]
+    InvalidFeeModel {
+        /// Invalid maker fee coefficient.
+        maker_bps: i32,
+        /// Invalid taker fee coefficient.
+        taker_bps: i32,
+    },
 }
 
 /// Decodes and validates a versioned run manifest.
@@ -202,9 +283,15 @@ pub fn parse_manifest(value: &Value) -> Result<VersionedManifest, ManifestError>
         MANIFEST_SCHEMA_VERSION_V1 => ManifestV1::deserialize(value)
             .map(VersionedManifest::V1)
             .map_err(|source| ManifestError::Malformed { source }),
-        MANIFEST_SCHEMA_VERSION => ManifestV2::deserialize(value)
+        MANIFEST_SCHEMA_VERSION_V2 => ManifestV2::deserialize(value)
             .map(VersionedManifest::V2)
             .map_err(|source| ManifestError::Malformed { source }),
+        MANIFEST_SCHEMA_VERSION => {
+            let manifest = ManifestV3::deserialize(value)
+                .map_err(|source| ManifestError::Malformed { source })?;
+            manifest.body.validate_fee_model()?;
+            Ok(VersionedManifest::V3(manifest))
+        }
         found => Err(ManifestError::UnsupportedSchemaVersion { found }),
     }
 }
@@ -282,11 +369,16 @@ fn with_artifact_sha256(mut artifact: Value) -> Value {
 }
 
 fn simulation_json(config: &pmkit_spec::ConservativeV1Config) -> Value {
+    let fee_model = config.resolved_fee_model();
     json!({
         "activation_latency_ms": config.activation_latency.as_millis(),
         "maker_queue_ahead_bps": config.maker_queue_ahead_bps,
         "slippage_bps": config.slippage_bps,
         "market_impact_bps": config.market_impact_bps,
+        "fee_model": {
+            "maker_bps": fee_model.maker_bps(),
+            "taker_bps": fee_model.taker_bps(),
+        },
     })
 }
 

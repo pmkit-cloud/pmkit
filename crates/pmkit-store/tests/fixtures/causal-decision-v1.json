@@ -1,0 +1,13 @@
+{
+  "snapshot": {
+    "simulation": {
+      "activation_latency_ms": 25,
+      "maker_queue_ahead_bps": 100,
+      "slippage_bps": 20,
+      "market_impact_bps": 30
+    }
+  },
+  "decision": {
+    "kind": "no_action"
+  }
+}

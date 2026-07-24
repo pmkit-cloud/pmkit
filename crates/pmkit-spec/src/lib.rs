@@ -18,5 +18,6 @@ pub use backtest::BacktestRun;
 pub use config::ConservativeV1Config;
 pub use live::LiveRun;
 pub use paper::PaperRun;
+pub use pmkit_sim::FeeModel;
 pub use replay::ReplaySpec;
 pub use run_spec::RunSpec;

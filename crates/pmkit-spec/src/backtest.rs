@@ -118,6 +118,7 @@ mod tests {
                 maker_queue_ahead_bps: 0,
                 slippage_bps: 0,
                 market_impact_bps: 0,
+                fee_model: None,
             },
         )
         .strategy(StrategyRegistration::new(

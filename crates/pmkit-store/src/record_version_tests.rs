@@ -38,8 +38,8 @@ async fn decision_unsupported_version_rejected() -> Result<(), Box<dyn std::erro
     let updated = store
         .connection
         .execute(
-            "UPDATE causal_decisions SET schema_version = 2
-             WHERE correlation_id = ?1 AND schema_version = 1",
+            "UPDATE causal_decisions SET schema_version = 3
+             WHERE correlation_id = ?1 AND schema_version = 2",
             [identity.correlation_id.as_str()],
         )
         .await?;
@@ -54,8 +54,8 @@ async fn decision_unsupported_version_rejected() -> Result<(), Box<dyn std::erro
         result,
         Err(StoreError::UnsupportedRecordSchemaVersion {
             record_type: "causal_decisions",
-            schema_version: 2,
-            max_supported_version: 1,
+            schema_version: 3,
+            max_supported_version: 2,
         })
     ));
     Ok(())

@@ -6,7 +6,7 @@ use pmkit_book::{OrderBookL2, Side};
 use pmkit_core::{MarketId, PortfolioId, RunId};
 use pmkit_exec::{ExecError, OrderId, PlaceOrder};
 use pmkit_market::Outcome;
-use pmkit_sim::SimulationConfig;
+use pmkit_sim::{FeeModel, SimulationConfig};
 use pmkit_store::{
     CausalDecision, CausalIdentity, IntentOutcome, OwnerScope, PmEnvelope, ReplayCursor,
     ReplayPage, StoreError, TapeStore, TursoTapeStore,
@@ -88,6 +88,7 @@ async fn simulated_decision_records_timing_and_model_inputs()
         maker_queue_ahead_bps: 100,
         slippage_bps: 20,
         market_impact_bps: 30,
+        fee_model: Some(FeeModel::try_new(-100, 200)?),
     };
     CausalRecorder::new(&store)
         .record_evaluation(
@@ -125,6 +126,14 @@ async fn simulated_decision_records_timing_and_model_inputs()
     assert_eq!(
         decisions[0].payload["snapshot"]["simulation"]["slippage_bps"],
         20
+    );
+    assert_eq!(
+        decisions[0].payload["snapshot"]["simulation"]["fee_model"]["maker_bps"],
+        -100
+    );
+    assert_eq!(
+        decisions[0].payload["snapshot"]["simulation"]["fee_model"]["taker_bps"],
+        200
     );
     let pending = store.read_pending_intents(&event.scope).await?;
     assert_eq!(pending[0].payload["submitted_ms"], 1_005);

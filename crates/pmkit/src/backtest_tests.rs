@@ -117,6 +117,7 @@ fn backtest_run() -> Result<BacktestRun, Box<dyn std::error::Error>> {
             maker_queue_ahead_bps: 0,
             slippage_bps: 0,
             market_impact_bps: 0,
+            fee_model: None,
         },
     )
     .strategy(StrategyRegistration::new(
@@ -181,7 +182,6 @@ async fn wait_for_rejects_unknown_run() -> Result<(), Box<dyn std::error::Error>
 }
 
 #[tokio::test]
-#[allow(clippy::significant_drop_tightening)]
 async fn backtest_records_one_decision_per_book_event() -> Result<(), Box<dyn std::error::Error>> {
     // Given: a store-backed backtest over two scripted book events.
     let dir = tempfile::tempdir()?;
@@ -206,6 +206,7 @@ async fn backtest_records_one_decision_per_book_event() -> Result<(), Box<dyn st
             maker_queue_ahead_bps: 0,
             slippage_bps: 0,
             market_impact_bps: 0,
+            fee_model: None,
         },
     )
     .strategy(StrategyRegistration::new(

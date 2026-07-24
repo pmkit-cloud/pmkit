@@ -95,6 +95,7 @@ fn test_manifest(provenance: &Provenance) -> Result<serde_json::Value, Box<dyn s
             maker_queue_ahead_bps: 0,
             slippage_bps: 0,
             market_impact_bps: 0,
+            fee_model: Some(pmkit_spec::FeeModel::try_new(-100, 200)?),
         },
     )
     .strategy(StrategyRegistration::new(
@@ -132,6 +133,10 @@ fn manifest_v1_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         .as_object_mut()
         .ok_or("manifest must be an object")?
         .remove("provenance");
+    let _fee_model = manifest["simulation"]
+        .as_object_mut()
+        .ok_or("simulation must be an object")?
+        .remove("fee_model");
 
     // When
     let parsed = parse_manifest(&manifest)?;
@@ -149,7 +154,12 @@ fn manifest_v1_round_trip() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn manifest_v2_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     // Given
-    let manifest = test_manifest(&test_provenance())?;
+    let mut manifest = test_manifest(&test_provenance())?;
+    manifest["schema_version"] = serde_json::json!(2);
+    let _fee_model = manifest["simulation"]
+        .as_object_mut()
+        .ok_or("simulation must be an object")?
+        .remove("fee_model");
 
     // When
     let parsed = parse_manifest(&manifest)?;
@@ -160,6 +170,24 @@ fn manifest_v2_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     };
     assert_eq!(parsed.schema_version, 2);
     assert_eq!(parsed.provenance, test_provenance());
+    Ok(())
+}
+
+#[test]
+fn manifest_v3_round_trip_records_fee_model() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: a manifest built from a custom validated simulation fee model.
+    let manifest = test_manifest(&test_provenance())?;
+
+    // When: the current manifest is decoded through the versioned reader.
+    let parsed = parse_manifest(&manifest)?;
+
+    // Then: schema v3 records maker rebates and taker fees exactly.
+    let VersionedManifest::V3(parsed) = parsed else {
+        return Err("expected version-3 manifest".into());
+    };
+    assert_eq!(parsed.schema_version, 3);
+    assert_eq!(manifest["simulation"]["fee_model"]["maker_bps"], -100);
+    assert_eq!(manifest["simulation"]["fee_model"]["taker_bps"], 200);
     Ok(())
 }
 
@@ -175,7 +203,7 @@ fn provenance_captured() -> Result<(), Box<dyn std::error::Error>> {
     let lock_hash = manifest["provenance"]["cargo_lock_sha256"]
         .as_str()
         .ok_or("Cargo.lock hash must be a string")?;
-    assert_eq!(manifest["schema_version"], 2);
+    assert_eq!(manifest["schema_version"], 3);
     assert_eq!(manifest["provenance"]["git"]["commit"], "0123456789abcdef");
     assert_eq!(manifest["provenance"]["git"]["dirty"], true);
     assert_eq!(lock_hash.len(), 64);
@@ -209,14 +237,14 @@ fn provenance_absent_git_is_deterministic() -> Result<(), Box<dyn std::error::Er
 fn manifest_rejects_unsupported_and_malformed() -> Result<(), Box<dyn std::error::Error>> {
     // Given
     let mut unsupported = test_manifest(&test_provenance())?;
-    unsupported["schema_version"] = serde_json::json!(3);
+    unsupported["schema_version"] = serde_json::json!(4);
     let mut malformed = test_manifest(&test_provenance())?;
     malformed["run"] = serde_json::json!(false);
 
     // When / Then
     assert!(matches!(
         parse_manifest(&unsupported),
-        Err(ManifestError::UnsupportedSchemaVersion { found: 3 })
+        Err(ManifestError::UnsupportedSchemaVersion { found: 4 })
     ));
     assert!(matches!(
         parse_manifest(&malformed),

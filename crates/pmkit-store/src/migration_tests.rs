@@ -10,6 +10,8 @@ use crate::{
 
 const OLD_PM_ACCOUNT_ENVELOPE: &str = include_str!("../tests/fixtures/pm-account-envelope-v1.json");
 const NEW_PM_ACCOUNT_ENVELOPE: &str = include_str!("../tests/fixtures/pm-account-envelope-v2.json");
+const OLD_CAUSAL_DECISION: &str = include_str!("../tests/fixtures/causal-decision-v1.json");
+const NEW_CAUSAL_DECISION: &str = include_str!("../tests/fixtures/causal-decision-v2.json");
 
 fn database_path(name: &str) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
     let dir = tempfile::tempdir()?;
@@ -67,12 +69,14 @@ async fn migration_applies_and_is_idempotent() -> Result<(), Box<dyn std::error:
             (1, first_applied_at),
             (2, second_applied_at),
             (3, third_applied_at),
-            (4, fourth_applied_at)
+            (4, fourth_applied_at),
+            (5, fifth_applied_at)
         ]
             if !first_applied_at.is_empty()
                 && !second_applied_at.is_empty()
                 && !third_applied_at.is_empty()
                 && !fourth_applied_at.is_empty()
+                && !fifth_applied_at.is_empty()
     ));
     assert_eq!(reopened_rows, first_rows);
     Ok(())
@@ -87,7 +91,7 @@ async fn migration_rejects_newer_version() -> Result<(), Box<dyn std::error::Err
     let (database, connection) = open_connection(&path).await?;
     connection
         .execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (5, CURRENT_TIMESTAMP)",
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (6, CURRENT_TIMESTAMP)",
             (),
         )
         .await?;
@@ -99,8 +103,8 @@ async fn migration_rejects_newer_version() -> Result<(), Box<dyn std::error::Err
     assert!(matches!(
         TursoTapeStore::open_local(&path).await,
         Err(StoreError::DatabaseSchemaTooNew {
-            database_version: 5,
-            max_supported_version: 4,
+            database_version: 6,
+            max_supported_version: 5,
         })
     ));
     Ok(())
@@ -109,7 +113,7 @@ async fn migration_rejects_newer_version() -> Result<(), Box<dyn std::error::Err
 #[tokio::test]
 async fn migration_rolls_back_on_failure() -> Result<(), Box<dyn std::error::Error>> {
     const FAILING_MIGRATION: Migration = Migration::new(
-        5,
+        6,
         &[
             "CREATE TABLE migration_partial_change (value INTEGER NOT NULL)",
             "CREATE TABLE migration_partial_change (",
@@ -143,7 +147,7 @@ async fn migration_rolls_back_on_failure() -> Result<(), Box<dyn std::error::Err
     assert!(matches!(result, Err(StoreError::Storage { .. })));
     assert!(matches!(
         migrations.as_slice(),
-        [(1, _), (2, _), (3, _), (4, _)]
+        [(1, _), (2, _), (3, _), (4, _), (5, _)]
     ));
     assert_eq!(partial_table_count, 0);
     Ok(())
@@ -191,7 +195,7 @@ async fn pm_account_envelope_version_migrates_old_and_reads_new_fixtures()
     store.store_envelope(&old).await?;
     store
         .connection
-        .execute("DELETE FROM schema_migrations WHERE version = 4", ())
+        .execute("DELETE FROM schema_migrations WHERE version IN (4, 5)", ())
         .await?;
     drop(store);
 
@@ -225,7 +229,7 @@ async fn pm_account_envelope_version_migrates_old_and_reads_new_fixtures()
     );
     assert!(matches!(
         migrations.as_slice(),
-        [(1, _), (2, _), (3, _), (4, _)]
+        [(1, _), (2, _), (3, _), (4, _), (5, _)]
     ));
     Ok(())
 }
@@ -297,15 +301,92 @@ async fn decision_version_round_trip() -> Result<(), Box<dyn std::error::Error>>
         )
     };
 
-    // Then: legacy records become version 1 without changing their JSON payloads.
+    // Then: legacy decisions advance to v2 while intents remain v1 without payload changes.
     assert!(matches!(
         migrations.as_slice(),
-        [(1, _), (2, _), (3, _), (4, _)]
+        [(1, _), (2, _), (3, _), (4, _), (5, _)]
     ));
     assert!(killed);
-    assert_eq!(decision_version, 1);
+    assert_eq!(decision_version, 2);
     assert_eq!(intent_version, 1);
     assert_eq!(decisions[0].payload, json!({"kind": "legacy-decision"}));
     assert_eq!(intents[0].payload, json!({"kind": "legacy-intent"}));
+    Ok(())
+}
+
+#[tokio::test]
+async fn decision_schema_v1_migrates_and_v2_reads() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: a pre-bump decision row and database migration state.
+    let (_dir, path) = database_path("causal-decision-v2")?;
+    let old_payload: serde_json::Value = serde_json::from_str(OLD_CAUSAL_DECISION)?;
+    let new_payload: serde_json::Value = serde_json::from_str(NEW_CAUSAL_DECISION)?;
+    let store = TursoTapeStore::open_local(&path).await?;
+    store
+        .connection
+        .execute(
+            "INSERT INTO causal_decisions (
+                portfolio_id, run_id, correlation_id, source_timestamp_ms,
+                ingest_sequence, schema_version, payload_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+            (
+                "legacy",
+                "run",
+                "decision-v1",
+                1_i64,
+                1_i64,
+                OLD_CAUSAL_DECISION,
+            ),
+        )
+        .await?;
+    store
+        .connection
+        .execute("DELETE FROM schema_migrations WHERE version = 5", ())
+        .await?;
+    drop(store);
+
+    // When: the current store migrates the old row and writes a new decision.
+    let store = TursoTapeStore::open_local(&path).await?;
+    let scope = OwnerScope::new(PortfolioId::new("legacy")?, RunId::new("run")?);
+    store
+        .store_decision(&crate::CausalDecision {
+            identity: crate::CausalIdentity {
+                scope: scope.clone(),
+                correlation_id: "decision-v2".into(),
+                source_timestamp_ms: 2,
+                ingest_sequence: 2,
+            },
+            payload: new_payload.clone(),
+        })
+        .await?;
+    let decisions = store.read_decisions(&scope).await?;
+    let migrations = migration_rows(&store.connection).await?;
+    let mut versions = store
+        .connection
+        .query(
+            "SELECT schema_version FROM causal_decisions ORDER BY ingest_sequence",
+            (),
+        )
+        .await?;
+    let first_version = versions
+        .next()
+        .await?
+        .ok_or("old decision row")?
+        .get::<i64>(0)?;
+    let second_version = versions
+        .next()
+        .await?
+        .ok_or("new decision row")?
+        .get::<i64>(0)?;
+
+    // Then: both payload generations read under decision schema version 2.
+    assert_eq!(first_version, 2);
+    assert_eq!(second_version, 2);
+    assert_eq!(decisions[0].payload, old_payload);
+    assert_eq!(decisions[1].payload, new_payload);
+    assert!(matches!(
+        migrations.as_slice(),
+        [(1, _), (2, _), (3, _), (4, _), (5, _)]
+    ));
+    drop(store);
     Ok(())
 }

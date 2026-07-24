@@ -30,6 +30,18 @@ pub enum MarketCategory {
 }
 
 impl MarketCategory {
+    /// Returns the taker-fee coefficient in basis points for this category.
+    #[must_use]
+    pub const fn fee_rate_bps(self) -> i32 {
+        match self {
+            Self::Crypto => 700,
+            Self::Sports => 300,
+            Self::Finance | Self::Politics | Self::Mentions | Self::Tech => 400,
+            Self::Economics | Self::Culture | Self::Weather | Self::Other => 500,
+            Self::Geopolitics => 0,
+        }
+    }
+
     /// Returns the taker-fee rate coefficient for this category.
     #[must_use]
     pub const fn fee_rate(self) -> Decimal {

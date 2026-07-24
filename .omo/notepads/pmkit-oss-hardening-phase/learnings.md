@@ -202,3 +202,18 @@
   fill facts. Open-order risk counts remain sourced from the existing venue
   reconciliation, not a persisted derived snapshot. Todo 22 can read restored
   `portfolio_notional`/`market_notional` directly from `LiveRiskState`.
+
+## 2026-07-24 - Configurable simulation fee model
+
+- `FeeModel` is validated basis-point configuration: maker coefficients range
+  from `-10_000` (maximum rebate) through `10_000`, while taker coefficients
+  range from `0` through `10_000`. Fee arithmetic uses checked exact-decimal
+  operations for maker and taker fills.
+- `ConservativeV1Config.fee_model = None` resolves to maker `0` bps and taker
+  `700` bps, preserving the prior Crypto formula and five-decimal rounding.
+  Backtest and paper pass the resolved model without a hard-wired market
+  category; direct category-based simulator constructors remain compatible.
+- Run manifests are schema version `3` with typed v1/v2 parsing retained.
+  Causal decisions are record schema version `2`, durable intents remain
+  version `1`, and database migration `5` updates only decision rows at version
+  `1` without rewriting payload JSON or causal identity.
