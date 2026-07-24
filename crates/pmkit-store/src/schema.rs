@@ -1,4 +1,14 @@
 pub const PM_ENVELOPE_VERSION: i64 = 1;
+pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+
+pub const CREATE_SCHEMA_MIGRATIONS: &str = "
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY CHECK (version > 0),
+    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+)";
+
+pub const RECORD_SCHEMA_MIGRATION: &str = "
+INSERT INTO schema_migrations (version) VALUES (?1)";
 
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS pm_envelopes (

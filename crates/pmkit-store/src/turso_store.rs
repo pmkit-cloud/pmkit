@@ -12,10 +12,11 @@ use crate::{
     PortfolioId, ReplayCursor, ReplayPage, RunId, StoreError, TapeStore,
     integrity::{decode_row, sha256_hex},
     local_files::{remove_database, restrict_permissions},
+    migrations::{MIGRATIONS, apply},
     schema::{
         INSERT_DECISION, INSERT_ENVELOPE, INSERT_PENDING_INTENT, READ_DECISIONS, READ_ENVELOPES,
-        READ_KILL_STATE, READ_PENDING_INTENTS, READ_UNKNOWN_INTENTS, SCHEMA,
-        TRANSITION_PENDING_INTENT, UPSERT_KILL_STATE,
+        READ_KILL_STATE, READ_PENDING_INTENTS, READ_UNKNOWN_INTENTS, TRANSITION_PENDING_INTENT,
+        UPSERT_KILL_STATE,
     },
 };
 
@@ -46,7 +47,7 @@ impl TursoTapeStore {
             .build()
             .await?;
         let connection = database.connect()?;
-        connection.execute_batch(SCHEMA).await?;
+        apply(&connection, MIGRATIONS).await?;
         restrict_permissions(&path)?;
         Ok(Self {
             database,

@@ -28,6 +28,7 @@ mod decoder;
 mod integrity;
 mod local_files;
 mod log;
+mod migrations;
 mod raw;
 mod rpc;
 mod schema;
@@ -38,6 +39,9 @@ mod wallet_reducer;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod migration_tests;
 
 #[cfg(test)]
 mod chain_tests;
@@ -70,6 +74,16 @@ pub enum StoreError {
     Storage {
         /// Storage-specific detail.
         message: String,
+    },
+    /// The database was written by a newer binary and cannot be downgraded safely.
+    #[error(
+        "database schema version {database_version} exceeds supported version {max_supported_version}"
+    )]
+    DatabaseSchemaTooNew {
+        /// The newest migration recorded on disk.
+        database_version: i64,
+        /// The newest migration known to this binary.
+        max_supported_version: i64,
     },
     /// A source identity already exists in its owner scope.
     #[error("source identity already exists")]
