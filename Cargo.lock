@@ -3857,7 +3857,9 @@ dependencies = [
  "pmkit-event",
  "pmkit-market",
  "rust_decimal",
+ "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]

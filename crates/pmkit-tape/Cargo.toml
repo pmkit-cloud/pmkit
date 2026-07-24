@@ -13,7 +13,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 pmkit-book = { path = "../pmkit-book" }
 pmkit-event = { path = "../pmkit-event" }
 rust_decimal = { workspace = true }

@@ -13,6 +13,13 @@ use pmkit_event::{
 };
 use serde_json::json;
 
+mod raw;
+
+pub use raw::{
+    RAW_TAPE_SCHEMA_VERSION, RawJsonLinesTape, RawTapeError, RawTapeRecord, RawTapeSink,
+    decode_raw_record, recoverable_raw_tape_prefix,
+};
+
 /// A sink that records market events to a durable local tape.
 pub trait UserTapeSink {
     /// Appends one event to the tape.
@@ -27,23 +34,6 @@ pub trait UserTapeSink {
     /// # Errors
     ///
     /// Returns an error if the underlying writer fails to flush.
-    fn flush(&mut self) -> io::Result<()>;
-}
-
-/// A sink for preserving raw text frames before venue adaptation.
-pub trait RawTapeSink {
-    /// Appends one received frame.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the underlying writer rejects the frame.
-    fn append_raw(&mut self, received_ms: i64, connection_id: &str, raw: &str) -> io::Result<()>;
-
-    /// Flushes buffered data to the underlying writer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the underlying writer cannot be flushed.
     fn flush(&mut self) -> io::Result<()>;
 }
 
@@ -70,43 +60,6 @@ impl<W: Write> UserTapeSink for JsonLinesTape<W> {
         let line =
             serde_json::to_string(&account_envelope_json(envelope)).map_err(io::Error::other)?;
         writeln!(self.writer, "{line}")
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
-    }
-}
-
-/// A lossless JSON-lines recorder for UTF-8 WebSocket text frames.
-#[derive(Debug)]
-pub struct RawJsonLinesTape<W: Write> {
-    writer: W,
-}
-
-impl<W: Write> RawJsonLinesTape<W> {
-    /// Creates a raw tape over `writer`.
-    pub const fn new(writer: W) -> Self {
-        Self { writer }
-    }
-
-    /// Consumes the tape and returns the underlying writer.
-    pub fn into_inner(self) -> W {
-        self.writer
-    }
-}
-
-impl<W: Write> RawTapeSink for RawJsonLinesTape<W> {
-    fn append_raw(&mut self, received_ms: i64, connection_id: &str, raw: &str) -> io::Result<()> {
-        serde_json::to_writer(
-            &mut self.writer,
-            &json!({
-                "received_ms": received_ms,
-                "connection_id": connection_id,
-                "raw": raw,
-            }),
-        )
-        .map_err(io::Error::other)?;
-        self.writer.write_all(b"\n")
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -353,7 +306,7 @@ fn envelope_json(metadata: &StreamMetadata, payload: &serde_json::Value) -> serd
 
 #[cfg(test)]
 mod tests {
-    use super::{JsonLinesTape, RawJsonLinesTape, RawTapeSink, UserTapeSink};
+    use super::{JsonLinesTape, UserTapeSink};
     use pmkit_core::PortfolioId;
     use pmkit_event::{PmAccountEnvelope, PmAccountEvent, StreamMetadata};
 
@@ -391,19 +344,6 @@ mod tests {
         assert!(lines[0].contains("\"connection_epoch\":3"));
         assert!(lines[0].contains("\"frame_sequence\":4"));
         assert!(lines[0].contains("\"ingest_sequence\":3"));
-        Ok(())
-    }
-
-    #[test]
-    fn records_raw_frame_metadata_and_text() -> Result<(), Box<dyn std::error::Error>> {
-        let mut tape = RawJsonLinesTape::new(Vec::new());
-        tape.append_raw(42, "connection-1", r#"{"event_type":"book"}"#)?;
-        tape.flush()?;
-
-        let value: serde_json::Value = serde_json::from_slice(&tape.into_inner())?;
-        assert_eq!(value["received_ms"], 42);
-        assert_eq!(value["connection_id"], "connection-1");
-        assert_eq!(value["raw"], r#"{"event_type":"book"}"#);
         Ok(())
     }
 }
