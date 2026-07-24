@@ -89,3 +89,16 @@ project: it must be re-derivable from committed segments, verifiable against the
 manifest's segment checksums, and never a replacement for the raw segments. No
 `arrow`/`parquet` dependency lives in OSS, and adding one is gated on that
 secondary-only contract.
+
+## Retention and compaction (P2-5)
+
+Raw evidence is immutable in OSS. `pmkit-archive` writes each segment once to a
+monotonically indexed key through the multipart + atomic-manifest path and never
+rewrites it in place; reopening an archive only appends new segments. OSS never
+compacts, merges, or deletes raw segments.
+
+Retention windows, archival tiering, and deriving-and-compacting *secondary*
+analytical files are retention-project concerns. Those secondary files are
+deferred (see the columnar note above), so their compaction lives with them in
+the separate project. Any such compaction operates only on derived secondaries
+and must leave the raw segments and their checksums untouched.

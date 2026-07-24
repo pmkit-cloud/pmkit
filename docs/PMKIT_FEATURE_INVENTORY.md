@@ -288,7 +288,8 @@ repository, not the long-term target.
 
 - Schema migrations.
 - Remote Turso deployment guidance.
-- Retention and compaction.
+- Secondary-file derive/compact retention (deferred to the separate retention
+  project; raw evidence is immutable and is never compacted or deleted in OSS).
 - Encryption.
 - Multi-process writer guarantees.
 - Venue order-ID persistence tied to a real status-query consumer.
@@ -585,8 +586,15 @@ behavioral test and documentation update.
   evidence stays authoritative. No event or storage shape changes; the
   `Parquet retention plane` boundary remains in force. See the columnar note in
   `docs/PMKIT_RAW_TAPE_FORMAT.md`.
-- [ ] **P2-5: add retention/compaction.** Keep raw evidence immutable; derive and
-  compact secondary analytical files.
+- [x] **P2-5: add retention/compaction.** In-scope half implemented: raw
+  evidence is immutable by construction in `pmkit-archive` (each segment is
+  written once to a monotonically indexed key via multipart + atomic manifest
+  and never rewritten in place), locked by a reopen-and-append test proving
+  previously committed segments stay byte- and checksum-identical while new
+  records land in new segments. Out-of-scope half deferred: deriving and
+  compacting secondary analytical files is a retention-project concern (those
+  secondary files were deferred in P2-4), and OSS never mutates, compacts, or
+  deletes raw evidence.
 
 ### P2: SDK ergonomics
 
@@ -639,5 +647,8 @@ behavioral test and documentation update.
 - P2-4 is a documented evaluation only: no code or dependency; columnar
   derivation is deferred to the separate retention project as a checksum-
   verifiable secondary of the raw segments.
-- P0-1 through P0-5, P1-1 through P1-16, and P2-1 through P2-4 were resolved
-  after review; P2-5 onward remains open.
+- P2-5 locks raw-evidence immutability with a reopen-and-append archive test
+  (7 archive tests) proving committed segments stay byte- and checksum-identical
+  while new records append; secondary-file compaction is deferred.
+- P0-1 through P0-5, P1-1 through P1-16, and P2-1 through P2-5 were resolved
+  after review; the P2 storage track is complete.

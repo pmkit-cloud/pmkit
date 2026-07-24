@@ -254,3 +254,40 @@ async fn transient_put_failures_are_retried() -> Result<(), Box<dyn Error>> {
     assert_eq!(sha256_hex(&bytes), recovered.segments[0].sha256_hex);
     Ok(())
 }
+
+#[tokio::test]
+async fn reopen_appends_without_rewriting_committed_segments() -> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+
+    // First session: 3 records, 2 per segment -> segments s0(2), s1(1).
+    let mut sink = DurableRawSink::open(FsObjectStore::new(dir.path()), config(2, 64, 3)).await?;
+    for index in 1..=3 {
+        sink.append_record(&raw_line(index)?).await?;
+    }
+    let first = sink.close().await?;
+    assert_eq!(first.segments.len(), 2);
+
+    // Snapshot committed segment bytes before the second session.
+    let store = FsObjectStore::new(dir.path());
+    let mut before = Vec::new();
+    for segment in &first.segments {
+        let bytes = store.get(&segment.key).await?.ok_or("segment missing")?;
+        before.push((segment.clone(), bytes));
+    }
+
+    // Second session: append 2 more records -> new segment s2(2).
+    let mut sink = DurableRawSink::open(FsObjectStore::new(dir.path()), config(2, 64, 3)).await?;
+    for index in 4..=5 {
+        sink.append_record(&raw_line(index)?).await?;
+    }
+    let second = sink.close().await?;
+    assert_eq!(second.segments.len(), 3);
+
+    // Every previously committed segment is byte- and checksum-identical.
+    for (segment, bytes) in &before {
+        assert!(second.segments.contains(segment));
+        let now = store.get(&segment.key).await?.ok_or("segment missing")?;
+        assert_eq!(&now, bytes);
+    }
+    Ok(())
+}
