@@ -25,7 +25,29 @@ type BookKey = (MarketId, Outcome);
 struct RestingOrder {
     order_id: String,
     order: PlaceOrder,
-    timestamp_ms: i64,
+    submitted_ms: i64,
+    active_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct DelayedOrder {
+    order_id: String,
+    order: PlaceOrder,
+    submitted_ms: i64,
+    active_at_ms: i64,
+}
+
+/// Explicit inputs for conservative simulation behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SimulationConfig {
+    /// Delay from submission until an order can fill.
+    pub activation_latency_ms: i64,
+    /// Share of crossed maker liquidity assumed ahead in queue.
+    pub maker_queue_ahead_bps: u16,
+    /// Adverse taker slippage in basis points.
+    pub slippage_bps: u16,
+    /// Adverse taker impact in basis points.
+    pub market_impact_bps: u16,
 }
 
 /// A conservative fill-simulation engine shared by paper and backtest modes.
@@ -33,10 +55,12 @@ struct RestingOrder {
 pub struct SimEngine {
     books: HashMap<BookKey, OrderBookL2>,
     resting: HashMap<String, RestingOrder>,
+    delayed: Vec<DelayedOrder>,
     pending_fills: Vec<MarketEvent>,
     next_id: AtomicU64,
     id_prefix: String,
     category: MarketCategory,
+    config: SimulationConfig,
 }
 
 impl SimEngine {
@@ -47,16 +71,33 @@ impl SimEngine {
         Self {
             books: HashMap::new(),
             resting: HashMap::new(),
+            delayed: Vec::new(),
             pending_fills: Vec::new(),
             next_id: AtomicU64::new(start_id),
             id_prefix: id_prefix.into(),
             category,
+            config: SimulationConfig::default(),
+        }
+    }
+
+    /// Creates an engine with explicit latency, queue, slippage, and impact inputs.
+    #[must_use]
+    pub fn with_config(
+        id_prefix: impl Into<String>,
+        start_id: u64,
+        category: MarketCategory,
+        config: SimulationConfig,
+    ) -> Self {
+        Self {
+            config,
+            ..Self::new(id_prefix, start_id, category)
         }
     }
 
     /// Replaces the book for one market outcome and fills any crossed makers.
     pub fn update_book(&mut self, market: &MarketId, outcome: Outcome, book: OrderBookL2) {
         self.books.insert((market.clone(), outcome), book);
+        self.activate_delayed(market, outcome);
         self.check_resting_fills(market, outcome);
     }
 
@@ -66,8 +107,16 @@ impl SimEngine {
         let order_id = self.next_order_id();
         if order.post_only {
             self.submit_maker(order_id, order, now_ms)
+        } else if self.config.activation_latency_ms > 0 {
+            self.delayed.push(DelayedOrder {
+                order_id: order_id.clone(),
+                order: order.clone(),
+                submitted_ms: now_ms,
+                active_at_ms: now_ms.saturating_add(self.config.activation_latency_ms),
+            });
+            Some(OrderId(order_id))
         } else {
-            self.submit_taker(order_id, order, now_ms)
+            self.submit_taker(order_id, order, now_ms, now_ms)
         }
     }
 
@@ -134,7 +183,8 @@ impl SimEngine {
             RestingOrder {
                 order_id: order_id.clone(),
                 order: order.clone(),
-                timestamp_ms: now_ms,
+                submitted_ms: now_ms,
+                active_at_ms: now_ms.saturating_add(self.config.activation_latency_ms),
             },
         );
         Some(OrderId(order_id))
@@ -144,7 +194,8 @@ impl SimEngine {
         &mut self,
         order_id: String,
         order: &PlaceOrder,
-        now_ms: i64,
+        submitted_ms: i64,
+        fill_ms: i64,
     ) -> Option<OrderId> {
         let (vwap, fill_qty) = {
             let book = self.books.get(&(order.market.clone(), order.outcome))?;
@@ -154,20 +205,51 @@ impl SimEngine {
             };
             walk_book(levels, order.qty, order.price, is_buy)?
         };
-        let fee = taker_fee_order(fill_qty, vwap, self.category);
+        let adverse_bps = Decimal::from(
+            u32::from(self.config.slippage_bps) + u32::from(self.config.market_impact_bps),
+        ) / Decimal::from(10_000_u32);
+        let fill_price = match order.side {
+            Side::Buy => (vwap * (Decimal::ONE + adverse_bps)).min(order.price),
+            Side::Sell => (vwap * (Decimal::ONE - adverse_bps)).max(order.price),
+        };
+        let fee = taker_fee_order(fill_qty, fill_price, self.category);
         self.pending_fills.push(MarketEvent::Fill {
             strategy: None,
             order_id: order_id.clone(),
             market: order.market.clone(),
             outcome: order.outcome,
-            price: vwap,
+            price: fill_price,
             size: fill_qty,
             side: order.side,
             fee,
             liquidity: Liquidity::Taker,
-            timestamp_ms: now_ms,
+            timestamp_ms: fill_ms.max(submitted_ms),
         });
         Some(OrderId(order_id))
+    }
+
+    fn activate_delayed(&mut self, market: &MarketId, outcome: Outcome) {
+        let Some(book) = self.books.get(&(market.clone(), outcome)) else {
+            return;
+        };
+        let now_ms = book.timestamp_ms;
+        let mut remaining = Vec::new();
+        for delayed in std::mem::take(&mut self.delayed) {
+            if delayed.order.market == *market
+                && delayed.order.outcome == outcome
+                && delayed.active_at_ms <= now_ms
+            {
+                self.submit_taker(
+                    delayed.order_id,
+                    &delayed.order,
+                    delayed.submitted_ms,
+                    now_ms,
+                );
+            } else {
+                remaining.push(delayed);
+            }
+        }
+        self.delayed = remaining;
     }
 
     fn next_order_id(&self) -> String {
@@ -185,7 +267,11 @@ impl SimEngine {
             };
             self.resting
                 .values()
-                .filter(|r| r.order.market == *market && r.order.outcome == outcome)
+                .filter(|r| {
+                    r.order.market == *market
+                        && r.order.outcome == outcome
+                        && r.active_at_ms <= book.timestamp_ms
+                })
                 .filter(|r| match r.order.side {
                     Side::Buy => book.best_ask().is_some_and(|(ask, _)| ask <= r.order.price),
                     Side::Sell => book.best_bid().is_some_and(|(bid, _)| bid >= r.order.price),
@@ -195,19 +281,43 @@ impl SimEngine {
         };
 
         for order_id in to_fill {
-            if let Some(resting) = self.resting.remove(&order_id) {
+            if let Some(mut resting) = self.resting.remove(&order_id) {
+                let Some(book) = self.books.get(&(market.clone(), outcome)) else {
+                    continue;
+                };
+                let top_quantity = match resting.order.side {
+                    Side::Buy => book
+                        .best_ask()
+                        .map_or(Decimal::ZERO, |(_, quantity)| quantity),
+                    Side::Sell => book
+                        .best_bid()
+                        .map_or(Decimal::ZERO, |(_, quantity)| quantity),
+                };
+                let available = top_quantity
+                    * (Decimal::ONE
+                        - Decimal::from(self.config.maker_queue_ahead_bps)
+                            / Decimal::from(10_000_u32));
+                let fill_quantity = resting.order.qty.min(available.max(Decimal::ZERO));
+                if fill_quantity.is_zero() {
+                    self.resting.insert(order_id, resting);
+                    continue;
+                }
                 self.pending_fills.push(MarketEvent::Fill {
                     strategy: None,
-                    order_id: resting.order_id,
+                    order_id: resting.order_id.clone(),
                     market: resting.order.market.clone(),
                     outcome: resting.order.outcome,
                     price: resting.order.price,
-                    size: resting.order.qty,
+                    size: fill_quantity,
                     side: resting.order.side,
                     fee: Decimal::ZERO,
                     liquidity: Liquidity::Maker,
-                    timestamp_ms: resting.timestamp_ms,
+                    timestamp_ms: book.timestamp_ms.max(resting.submitted_ms),
                 });
+                resting.order.qty -= fill_quantity;
+                if !resting.order.qty.is_zero() {
+                    self.resting.insert(order_id, resting);
+                }
             }
         }
     }
