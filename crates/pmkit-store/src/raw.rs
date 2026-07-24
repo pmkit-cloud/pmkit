@@ -1,3 +1,4 @@
+// allow: SIZE_OK — raw provider evidence types and validation form one serde boundary.
 use std::collections::HashSet;
 
 use async_trait::async_trait;
@@ -180,23 +181,90 @@ impl FinalizedBlockCoverage {
     }
 }
 
-/// Confirms that two provider observations agree on head and finality.
+/// Returns the strict-majority finality quorum, with two-provider corroboration minimum.
+pub const fn required_finality_quorum(configured_provider_count: usize) -> usize {
+    let strict_majority = configured_provider_count / 2 + 1;
+    if strict_majority < 2 {
+        2
+    } else {
+        strict_majority
+    }
+}
+
+/// Selects a finalized block corroborated by a strict majority of configured providers.
+///
+/// Quorum is `configured_provider_count / 2 + 1`, with at least two providers.
+/// Missing or divergent providers are tolerated only while the remaining unique
+/// providers meet that threshold on the complete finalized block reference.
 ///
 /// # Errors
 ///
-/// Returns [`ChainSourceError::ProviderDisagreement`] when either block
-/// reference differs.
+/// Returns [`ChainSourceError::ProviderDisagreement`] for the legacy
+/// two-provider disagreement case. All other unavailable, duplicate, invalid,
+/// or sub-quorum observations return
+/// [`ChainSourceError::ProviderQuorumNotReached`].
 pub fn agree_on_finalized_heads(
-    left: FinalizedProviderHead,
-    right: &FinalizedProviderHead,
-) -> Result<FinalizedProviderHead, ChainSourceError> {
-    if left.head != right.head || left.finalized != right.finalized {
-        return Err(ChainSourceError::ProviderDisagreement {
-            left: left.provider,
-            right: right.provider.clone(),
+    configured_provider_count: usize,
+    provider_heads: &[FinalizedProviderHead],
+) -> Result<BlockHead, ChainSourceError> {
+    let required_provider_count = required_finality_quorum(configured_provider_count);
+    if configured_provider_count < 2 || provider_heads.len() > configured_provider_count {
+        return Err(ChainSourceError::ProviderQuorumNotReached {
+            configured_provider_count,
+            required_provider_count,
+            observed_provider_count: provider_heads.len(),
+            largest_agreement_count: 0,
         });
     }
-    Ok(left)
+
+    let mut providers = HashSet::with_capacity(provider_heads.len());
+    for provider_head in provider_heads {
+        if !providers.insert(&provider_head.provider) {
+            return Err(ChainSourceError::ProviderQuorumNotReached {
+                configured_provider_count,
+                required_provider_count,
+                observed_provider_count: providers.len(),
+                largest_agreement_count: 0,
+            });
+        }
+    }
+
+    if configured_provider_count == 2
+        && let [left, right] = provider_heads
+    {
+        if left.head != right.head || left.finalized != right.finalized {
+            return Err(ChainSourceError::ProviderDisagreement {
+                left: left.provider.clone(),
+                right: right.provider.clone(),
+            });
+        }
+        return Ok(left.finalized.clone());
+    }
+
+    let agreement_count = |candidate: &FinalizedProviderHead| {
+        provider_heads
+            .iter()
+            .filter(|provider_head| provider_head.finalized == candidate.finalized)
+            .count()
+    };
+    let largest_agreement_count = provider_heads
+        .iter()
+        .map(agreement_count)
+        .max()
+        .map_or(0, |count| count);
+    if let Some(agreed) = provider_heads
+        .iter()
+        .find(|candidate| agreement_count(candidate) >= required_provider_count)
+    {
+        return Ok(agreed.finalized.clone());
+    }
+
+    Err(ChainSourceError::ProviderQuorumNotReached {
+        configured_provider_count,
+        required_provider_count,
+        observed_provider_count: provider_heads.len(),
+        largest_agreement_count,
+    })
 }
 
 /// The provider-preserved identity of one raw EVM log.
@@ -384,6 +452,20 @@ pub enum ChainSourceError {
         left: ProviderIdentity,
         /// The second provider identity.
         right: ProviderIdentity,
+    },
+    /// Unique provider evidence did not reach the configured finality quorum.
+    #[error(
+        "provider finality quorum not reached: {largest_agreement_count} of {observed_provider_count} observations agree; {required_provider_count} of {configured_provider_count} configured providers required"
+    )]
+    ProviderQuorumNotReached {
+        /// The total number of providers configured for this chain.
+        configured_provider_count: usize,
+        /// The strict-majority provider count required to proceed.
+        required_provider_count: usize,
+        /// The number of unique provider observations supplied.
+        observed_provider_count: usize,
+        /// The largest group reporting one complete finalized block reference.
+        largest_agreement_count: usize,
     },
     /// Provider evidence did not cover every requested block exactly once.
     #[error("finalized block coverage is incomplete: {message}")]

@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+use crate::raw::required_finality_quorum;
 use crate::{CanonicalLogSegment, ChainCheckpoint, StoreError};
 
 pub use crate::raw::{
@@ -16,6 +17,83 @@ pub trait CanonicalLogSource: Send + Sync {
         &self,
         after: Option<&ChainCheckpoint>,
     ) -> Result<CanonicalLogSegment, ChainSourceError>;
+}
+
+/// Selects a provider batch whose finalized-height logs are corroborated by quorum.
+///
+/// Provider labels are excluded from log equality; chain position, hashes,
+/// contract, topics, data, range, and header coverage must otherwise match.
+///
+/// # Errors
+///
+/// Returns a typed source error when finalized heads or matching log batches do
+/// not reach the strict-majority threshold of configured providers.
+pub fn agree_on_finalized_log_batches(
+    configured_provider_count: usize,
+    batches: &[FinalizedRawLogBatch],
+) -> Result<FinalizedRawLogBatch, ChainSourceError> {
+    let provider_heads = batches
+        .iter()
+        .map(|batch| FinalizedProviderHead {
+            provider: batch.provider.clone(),
+            head: batch.head.clone(),
+            finalized: batch.finalized.clone(),
+        })
+        .collect::<Vec<_>>();
+    let agreed_head = agree_on_finalized_heads(configured_provider_count, &provider_heads)?;
+    let required_provider_count = required_finality_quorum(configured_provider_count);
+
+    let valid_at_agreed_height = |batch: &FinalizedRawLogBatch| {
+        batch.verify().is_ok()
+            && batch.finalized == agreed_head
+            && batch.range.to_block == agreed_head.block_number
+    };
+    let batches_agree = |left: &FinalizedRawLogBatch, right: &FinalizedRawLogBatch| {
+        left.range == right.range
+            && left.coverage == right.coverage
+            && left.logs.len() == right.logs.len()
+            && left.logs.iter().zip(&right.logs).all(|(left, right)| {
+                left.identity.chain_id == right.identity.chain_id
+                    && left.identity.block_number == right.identity.block_number
+                    && left.identity.block_hash == right.identity.block_hash
+                    && left.identity.transaction_hash == right.identity.transaction_hash
+                    && left.identity.transaction_index == right.identity.transaction_index
+                    && left.identity.log_index == right.identity.log_index
+                    && left.contract_address == right.contract_address
+                    && left.topics == right.topics
+                    && left.data == right.data
+            })
+    };
+    let agreement_count = |candidate: &FinalizedRawLogBatch| {
+        if !valid_at_agreed_height(candidate) {
+            return 0;
+        }
+        batches
+            .iter()
+            .filter(|batch| valid_at_agreed_height(batch) && batches_agree(candidate, batch))
+            .count()
+    };
+    let largest_agreement_count = batches
+        .iter()
+        .map(agreement_count)
+        .max()
+        .map_or(0, |count| count);
+    if let Some(agreed) = batches
+        .iter()
+        .find(|candidate| agreement_count(candidate) >= required_provider_count)
+    {
+        return Ok(agreed.clone());
+    }
+
+    Err(ChainSourceError::ProviderQuorumNotReached {
+        configured_provider_count,
+        required_provider_count,
+        observed_provider_count: batches
+            .iter()
+            .filter(|batch| valid_at_agreed_height(batch))
+            .count(),
+        largest_agreement_count,
+    })
 }
 
 /// A deterministic parsed-log fixture source for tests and offline backfills.
