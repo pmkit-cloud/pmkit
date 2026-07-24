@@ -4,7 +4,7 @@ use crate::{
 };
 
 /// A canonical ordering key derived from envelope metadata only.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CanonicalSourceKey {
     /// PM market or account ordering identity.
     Pm {
@@ -28,6 +28,55 @@ pub enum CanonicalSourceKey {
     },
 }
 
+impl PartialOrd for CanonicalSourceKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CanonicalSourceKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let ordering = self
+            .timestamp_ms()
+            .cmp(&other.timestamp_ms())
+            .then_with(|| {
+                self.canonical_source_rank()
+                    .cmp(&other.canonical_source_rank())
+            });
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+        match (self, other) {
+            (
+                Self::Pm {
+                    connection_epoch: left_epoch,
+                    frame_sequence: left_frame,
+                    ..
+                },
+                Self::Pm {
+                    connection_epoch: right_epoch,
+                    frame_sequence: right_frame,
+                    ..
+                },
+            ) => left_epoch
+                .cmp(right_epoch)
+                .then_with(|| left_frame.cmp(right_frame)),
+            (
+                Self::Cex {
+                    aggregate_trade_id: left_id,
+                    ..
+                },
+                Self::Cex {
+                    aggregate_trade_id: right_id,
+                    ..
+                },
+            ) => left_id.cmp(right_id),
+            (Self::Pm { .. }, Self::Cex { .. }) => std::cmp::Ordering::Less,
+            (Self::Cex { .. }, Self::Pm { .. }) => std::cmp::Ordering::Greater,
+        }
+    }
+}
+
 impl CanonicalSourceKey {
     /// Returns the timestamp used for watermark eligibility.
     #[must_use]
@@ -41,6 +90,19 @@ impl CanonicalSourceKey {
                 source_timestamp_ms,
                 ..
             } => *source_timestamp_ms,
+        }
+    }
+
+    const fn canonical_source_rank(&self) -> i64 {
+        match self {
+            Self::Pm {
+                canonical_source_rank,
+                ..
+            }
+            | Self::Cex {
+                canonical_source_rank,
+                ..
+            } => *canonical_source_rank,
         }
     }
 }
@@ -67,32 +129,28 @@ impl SourceEnvelope {
         }
     }
 
-    /// Returns the canonical key, rejecting unsupported CEX reference shapes.
+    /// Returns the canonical ordering key for this envelope.
     #[must_use]
-    pub const fn canonical_key(&self) -> Option<CanonicalSourceKey> {
+    pub const fn canonical_key(&self) -> CanonicalSourceKey {
         let metadata = self.metadata();
         match self {
-            Self::PmMarket(_) | Self::PmAccount(_) => Some(CanonicalSourceKey::Pm {
+            Self::PmMarket(_) | Self::PmAccount(_) => CanonicalSourceKey::Pm {
                 source_timestamp_ms: metadata.source_time_ms,
                 canonical_source_rank: metadata.canonical_source_rank,
                 connection_epoch: metadata.connection_epoch,
                 frame_sequence: metadata.frame_sequence,
-            }),
+            },
             Self::CexReference(CexReferenceEnvelope {
                 fact:
                     CexReferenceEvent::Trade {
                         aggregate_trade_id, ..
                     },
                 ..
-            }) => Some(CanonicalSourceKey::Cex {
+            }) => CanonicalSourceKey::Cex {
                 source_timestamp_ms: metadata.source_time_ms,
                 canonical_source_rank: metadata.canonical_source_rank,
                 aggregate_trade_id: *aggregate_trade_id,
-            }),
-            Self::CexReference(CexReferenceEnvelope {
-                fact: CexReferenceEvent::BestBidOffer { .. },
-                ..
-            }) => None,
+            },
         }
     }
 

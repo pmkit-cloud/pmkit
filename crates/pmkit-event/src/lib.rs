@@ -5,9 +5,9 @@
 //! [`MarketId`] plus [`Outcome`].
 //!
 //! Typed envelopes (`PmMarketEnvelope`, `PmAccountEnvelope`, `CexReferenceEnvelope`)
-//! preserve byte-identical raw frames with transport metadata. Strategies receive
-//! only [`StrategyFact`], never envelopes — the `StrategyInput` trait enforces this
-//! at compile time.
+//! preserve normalized facts with transport metadata and optional source frames.
+//! Strategies receive only [`StrategyFact`], never envelopes — the `StrategyInput`
+//! trait enforces this at compile time.
 
 use pmkit_book::Side;
 use pmkit_core::{MarketId, PortfolioId, StrategyId};
@@ -160,6 +160,37 @@ pub enum PmAccountEvent {
         /// Event timestamp in milliseconds.
         timestamp_ms: i64,
     },
+    /// A venue cancellation for one of the portfolio's orders.
+    OrderCancelled {
+        /// Owning strategy, if attributed.
+        strategy: Option<StrategyId>,
+        /// Venue order id.
+        order_id: String,
+        /// Event timestamp in milliseconds.
+        timestamp_ms: i64,
+    },
+    /// A venue rejection or failed user-stream outcome.
+    OrderRejected {
+        /// Owning strategy, if attributed.
+        strategy: Option<StrategyId>,
+        /// Venue order id.
+        order_id: String,
+        /// Provider status or rejection reason.
+        reason: String,
+        /// Event timestamp in milliseconds.
+        timestamp_ms: i64,
+    },
+    /// A non-terminal provider status retained for replay and recovery.
+    OrderStatus {
+        /// Owning strategy, if attributed.
+        strategy: Option<StrategyId>,
+        /// Venue order or trade id.
+        order_id: String,
+        /// Provider status value.
+        status: String,
+        /// Event timestamp in milliseconds.
+        timestamp_ms: i64,
+    },
 }
 
 /// A normalized reference-exchange fact.
@@ -179,23 +210,6 @@ pub enum CexReferenceEvent {
         qty: Decimal,
         /// Whether the buyer was the maker.
         is_buyer_maker: bool,
-        /// Event timestamp in milliseconds.
-        timestamp_ms: i64,
-    },
-    /// A reference-exchange best bid/offer.
-    BestBidOffer {
-        /// Underlying asset.
-        asset: Asset,
-        /// Source exchange.
-        exchange: Exchange,
-        /// Best bid price.
-        bid_px: Decimal,
-        /// Best bid quantity.
-        bid_qty: Decimal,
-        /// Best ask price.
-        ask_px: Decimal,
-        /// Best ask quantity.
-        ask_qty: Decimal,
         /// Event timestamp in milliseconds.
         timestamp_ms: i64,
     },
@@ -229,7 +243,7 @@ pub struct StreamMetadata {
 pub struct PmMarketEnvelope {
     /// Preserved transport metadata.
     pub metadata: StreamMetadata,
-    /// Byte-identical text frame received from the venue before adaptation.
+    /// Text frame received from the venue when available before adaptation.
     pub raw_frame: Vec<u8>,
     /// Normalized PM market fact.
     pub fact: MarketEvent,
@@ -242,7 +256,7 @@ pub struct PmAccountEnvelope {
     pub portfolio: PortfolioId,
     /// Preserved transport metadata.
     pub metadata: StreamMetadata,
-    /// Byte-identical text frame received from the venue before adaptation.
+    /// Text frame received from the venue when available before adaptation.
     pub raw_frame: Vec<u8>,
     /// Normalized PM account fact.
     pub fact: PmAccountEvent,
