@@ -546,8 +546,11 @@ behavioral test and documentation update.
 
 ### P2: reliable OSS tape and cloud storage
 
-- [ ] **P2-1: define raw tape record format.** Specify framing, schema version,
-  connection identity, receipt time, flush semantics, and crash recovery.
+- [x] **P2-1: define raw tape record format.** Version 1 is newline-delimited
+  UTF-8 JSON containing schema version, connection identity, local receipt time,
+  and the exact raw text frame. Graceful flush and fail-closed crash-tail
+  recovery are specified in `docs/PMKIT_RAW_TAPE_FORMAT.md` and locked by the
+  raw-tape contract tests.
 - [ ] **P2-2: build the OSS collector.** WebSocket reconnect, subscription
   sharding, bounded channels, backpressure, heartbeat, and graceful shutdown.
 - [ ] **P2-3: define durable object-store sink.** S3 multipart uploads, retry,
@@ -581,7 +584,7 @@ behavioral test and documentation update.
 
 ## Review evidence
 
-- `cargo test --workspace`: 157 tests passed.
+- `cargo test --workspace`: 161 tests passed.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `cargo doc --workspace --no-deps`: passed.
 - `pmkit-store` P1-1 focused tests: 13 passed.
@@ -590,5 +593,8 @@ behavioral test and documentation update.
 - P1-12/P1-13 risk and persistent kill-state tests: 49 focused tests passed.
 - P1-14 through P1-16 simulation tests cover delayed activation timestamps,
   queue-adjusted partial fills, slippage/impact, and durable model inputs.
-- P0-1 through P0-5 and P1-1 through P1-16 were fixed after review; P2 onward
-  remains open.
+- P2-1 raw-tape tests cover schema version, connection identity, receipt time,
+  exact raw text, newline framing, legacy-version rejection, crash-tail
+  recovery, malformed complete records, and flush forwarding.
+- P0-1 through P0-5, P1-1 through P1-16, and P2-1 were fixed after review;
+  P2-2 onward remains open.
