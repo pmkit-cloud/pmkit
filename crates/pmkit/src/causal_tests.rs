@@ -6,6 +6,7 @@ use pmkit_book::{OrderBookL2, Side};
 use pmkit_core::{MarketId, PortfolioId, RunId};
 use pmkit_exec::{ExecError, OrderId, PlaceOrder};
 use pmkit_market::Outcome;
+use pmkit_sim::SimulationConfig;
 use pmkit_store::{
     CausalDecision, CausalIdentity, IntentOutcome, OwnerScope, PmEnvelope, ReplayCursor,
     ReplayPage, StoreError, TapeStore, TursoTapeStore,
@@ -77,6 +78,61 @@ fn decision_causality_matches_all_modes() {
 }
 
 #[tokio::test]
+async fn simulated_decision_records_timing_and_model_inputs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, path) = database_path("simulation-inputs")?;
+    let store = TursoTapeStore::open_local(&path).await?;
+    let event = identity()?;
+    let simulation = SimulationConfig {
+        activation_latency_ms: 25,
+        maker_queue_ahead_bps: 100,
+        slippage_bps: 20,
+        market_impact_bps: 30,
+    };
+    CausalRecorder::new(&store)
+        .record_evaluation(
+            &event,
+            &snapshot().with_simulation(simulation),
+            DecisionKind::NoAction,
+        )
+        .await?;
+    let intent = CausalRecorder::new(&store).intent(&event, 0, 1_005, &order()?);
+    let result = CausalRecorder::new(&store)
+        .submit(&intent, || async {
+            Err(ExecError::Transport {
+                message: "unknown".into(),
+            })
+        })
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(crate::causal::RecorderError::VenueUnknown { .. })
+    ));
+    let decisions = store.read_decisions(&event.scope).await?;
+    assert_eq!(
+        decisions[0].payload["snapshot"]["timing"]["observation_ms"],
+        1_000
+    );
+    assert_eq!(
+        decisions[0].payload["snapshot"]["timing"]["decision_ms"],
+        1_000
+    );
+    assert_eq!(
+        decisions[0].payload["snapshot"]["simulation"]["activation_latency_ms"],
+        25
+    );
+    assert_eq!(
+        decisions[0].payload["snapshot"]["simulation"]["slippage_bps"],
+        20
+    );
+    let pending = store.read_pending_intents(&event.scope).await?;
+    assert_eq!(pending[0].payload["submitted_ms"], 1_005);
+    store.delete_database()?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn action_risk_and_outcomes_are_independent_and_linked()
 -> Result<(), Box<dyn std::error::Error>> {
     // Given: one decision with independently risked actions in a file-backed store.
@@ -93,8 +149,8 @@ async fn action_risk_and_outcomes_are_independent_and_linked()
             ]),
         )
         .await?;
-    let accepted = CausalRecorder::new(&store).intent(&event, 0, &order()?);
-    let rejected = CausalRecorder::new(&store).intent(&event, 1, &order()?);
+    let accepted = CausalRecorder::new(&store).intent(&event, 0, 1_001, &order()?);
+    let rejected = CausalRecorder::new(&store).intent(&event, 1, 1_002, &order()?);
 
     // When: one venue order accepts and the other rejects.
     let receipt = CausalRecorder::new(&store)
@@ -143,7 +199,7 @@ async fn pending_store_failure_aborts_before_submission() -> Result<(), Box<dyn 
         TursoTapeStore::open_local(&path).await?,
         FailureMode::Pending,
     );
-    let intent = CausalRecorder::new(&store).intent(&identity()?, 0, &order()?);
+    let intent = CausalRecorder::new(&store).intent(&identity()?, 0, 1_001, &order()?);
 
     // When: submission is attempted through the recorder.
     let result = CausalRecorder::new(&store)
@@ -176,7 +232,7 @@ async fn accepted_order_with_store_failure_is_reconciled() -> Result<(), Box<dyn
             TursoTapeStore::open_local(&path).await?,
             FailureMode::FirstTransition,
         );
-        let intent = CausalRecorder::new(&store).intent(&identity()?, 0, &order()?);
+        let intent = CausalRecorder::new(&store).intent(&identity()?, 0, 1_001, &order()?);
 
         // When: the venue accepts but recording its terminal state fails.
         let result = CausalRecorder::new(&store)
@@ -325,8 +381,8 @@ async fn recorder_enumerates_pending_and_unknown_intents() -> Result<(), Box<dyn
         )
         .await?;
 
-    let pending = CausalRecorder::new(&store).intent(&event, 0, &order()?);
-    let unknown = CausalRecorder::new(&store).intent(&event, 1, &order()?);
+    let pending = CausalRecorder::new(&store).intent(&event, 0, 1_001, &order()?);
+    let unknown = CausalRecorder::new(&store).intent(&event, 1, 1_002, &order()?);
     store
         .store_intent_pending(&pending.identity, &json!({"kind": "place"}))
         .await?;

@@ -3,7 +3,9 @@
 use std::future::Future;
 
 use pmkit_book::OrderBookL2;
+use pmkit_event::CexReferenceEvent;
 use pmkit_exec::{ExecError, OrderId, PlaceOrder};
+use pmkit_sim::SimulationConfig;
 use pmkit_store::{
     CausalDecision, CausalIdentity, IntentOutcome, OwnerScope, StoreError, TapeStore,
 };
@@ -26,6 +28,43 @@ pub struct CexTradeMetrics {
     pub vwap: Option<Decimal>,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct CexTradeMetricsState {
+    last_price: Option<Decimal>,
+    momentum: Decimal,
+    volume: Decimal,
+    cvd: Decimal,
+    vwap_numerator: Decimal,
+}
+
+impl CexTradeMetricsState {
+    pub(crate) fn observe(&mut self, event: &CexReferenceEvent) {
+        let CexReferenceEvent::Trade {
+            price,
+            qty,
+            is_buyer_maker,
+            ..
+        } = event;
+        if let Some(previous) = self.last_price {
+            self.momentum = *price - previous;
+        }
+        self.last_price = Some(*price);
+        self.volume += *qty;
+        self.cvd += if *is_buyer_maker { -*qty } else { *qty };
+        self.vwap_numerator += *price * *qty;
+    }
+
+    pub(crate) fn snapshot(&self) -> CexTradeMetrics {
+        CexTradeMetrics {
+            last_price: self.last_price,
+            momentum: self.momentum,
+            volume: self.volume,
+            cvd: self.cvd,
+            vwap: (!self.volume.is_zero()).then(|| self.vwap_numerator / self.volume),
+        }
+    }
+}
+
 /// The PM-book fields permitted in a portable decision snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PmBookSnapshot {
@@ -46,6 +85,12 @@ pub struct DecisionSnapshot {
     pub pm_book: PmBookSnapshot,
     /// The permitted CEX-trade values.
     pub cex_trade: CexTradeMetrics,
+    /// Source observation timestamp in milliseconds.
+    pub observation_timestamp_ms: i64,
+    /// Strategy decision timestamp in milliseconds.
+    pub decision_timestamp_ms: i64,
+    /// Simulation inputs used by paper/backtest, absent in live mode.
+    pub simulation: Option<SimulationConfig>,
 }
 
 impl DecisionSnapshot {
@@ -60,7 +105,17 @@ impl DecisionSnapshot {
                 imbalance: book.obi(),
             },
             cex_trade,
+            observation_timestamp_ms: book.timestamp_ms,
+            decision_timestamp_ms: book.timestamp_ms,
+            simulation: None,
         }
+    }
+
+    /// Attaches the simulation inputs used for this decision.
+    #[must_use]
+    pub const fn with_simulation(mut self, simulation: SimulationConfig) -> Self {
+        self.simulation = Some(simulation);
+        self
     }
 }
 
@@ -134,6 +189,15 @@ impl OrderIntent {
     #[must_use]
     pub const fn from_parts(identity: CausalIdentity, payload: Value) -> Self {
         Self { identity, payload }
+    }
+
+    /// Returns the venue order id persisted during an accepted submission.
+    #[must_use]
+    pub fn venue_order_id(&self) -> Option<OrderId> {
+        self.payload
+            .get("venue_order_id")
+            .and_then(Value::as_str)
+            .map(|value| OrderId(value.to_owned()))
     }
 }
 
@@ -214,6 +278,7 @@ impl<'a, S: TapeStore + ?Sized> CausalRecorder<'a, S> {
         &self,
         decision: &CausalIdentity,
         action_index: u32,
+        submitted_ms: i64,
         order: &PlaceOrder,
     ) -> OrderIntent {
         OrderIntent {
@@ -223,7 +288,7 @@ impl<'a, S: TapeStore + ?Sized> CausalRecorder<'a, S> {
                 source_timestamp_ms: decision.source_timestamp_ms,
                 ingest_sequence: decision.ingest_sequence,
             },
-            payload: order_payload(action_index, order),
+            payload: order_payload(action_index, submitted_ms, order),
         }
     }
 
@@ -249,7 +314,11 @@ impl<'a, S: TapeStore + ?Sized> CausalRecorder<'a, S> {
         match submit().await {
             Ok(order_id) => {
                 self.store
-                    .transition_intent(&intent.identity, IntentOutcome::Accepted)
+                    .transition_intent_with_order(
+                        &intent.identity,
+                        IntentOutcome::Accepted,
+                        Some(order_id.0.as_str()),
+                    )
                     .await
                     .map_err(|source| RecorderError::AcceptedButUnrecorded { source })?;
                 Ok(SubmissionReceipt {
@@ -334,18 +403,14 @@ pub(crate) async fn record_book_decision(
     store: &dyn TapeStore,
     identity: &CausalIdentity,
     book: &OrderBookL2,
+    cex_trade: CexTradeMetrics,
     actions_placed: u32,
+    simulation: Option<SimulationConfig>,
 ) -> Result<(), StoreError> {
-    let snapshot = DecisionSnapshot::from_book(
-        book,
-        CexTradeMetrics {
-            last_price: None,
-            momentum: Decimal::ZERO,
-            volume: Decimal::ZERO,
-            cvd: Decimal::ZERO,
-            vwap: None,
-        },
-    );
+    let mut snapshot = DecisionSnapshot::from_book(book, cex_trade);
+    if let Some(simulation) = simulation {
+        snapshot = snapshot.with_simulation(simulation);
+    }
     let decision = if actions_placed == 0 {
         DecisionKind::NoAction
     } else {
@@ -376,6 +441,16 @@ fn decision_payload(snapshot: &DecisionSnapshot, decision: DecisionKind) -> Valu
 
 fn snapshot_payload(snapshot: &DecisionSnapshot) -> Value {
     json!({
+        "timing": {
+            "observation_ms": snapshot.observation_timestamp_ms,
+            "decision_ms": snapshot.decision_timestamp_ms,
+        },
+        "simulation": snapshot.simulation.map(|simulation| json!({
+            "activation_latency_ms": simulation.activation_latency_ms,
+            "maker_queue_ahead_bps": simulation.maker_queue_ahead_bps,
+            "slippage_bps": simulation.slippage_bps,
+            "market_impact_bps": simulation.market_impact_bps,
+        })),
         "pm_book": {
             "best_bid": decimal_option(snapshot.pm_book.best_bid),
             "best_ask": decimal_option(snapshot.pm_book.best_ask),
@@ -406,9 +481,10 @@ fn risk_payload(verdict: ActionRiskVerdict) -> Value {
     })
 }
 
-fn order_payload(action_index: u32, order: &PlaceOrder) -> Value {
+fn order_payload(action_index: u32, submitted_ms: i64, order: &PlaceOrder) -> Value {
     json!({
         "action_index": action_index,
+        "submitted_ms": submitted_ms,
         "order": {
             "market": order.market.to_string(),
             "outcome": format!("{:?}", order.outcome),
