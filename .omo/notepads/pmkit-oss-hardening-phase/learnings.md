@@ -52,3 +52,18 @@
 - Incomplete coverage is held with no canonical writes. A verified advance
   filters logs at or below the effective finalized head and commits canonical
   replacement plus the monotonic checkpoint upsert in one transaction.
+
+## 2026-07-24 - Enriched Polymarket order status
+
+- `OrderStatus` is `Open(OrderStatusDetails) | Accepted(OrderStatusDetails) |
+  Rejected(OrderStatusDetails) | Cancelled(OrderStatusDetails) |
+  Unknown(OrderStatusDetails)`, where `OrderStatusDetails` is `{ filled_qty:
+  Option<Decimal>, price: Option<Decimal>, fee: Option<Decimal>,
+  settlement_reference: Option<String> }`.
+- The Executor seam remains `async fn query_status(&self, order_id: &OrderId)
+  -> Result<OrderStatus, ExecError>`.
+- Polymarket `size_matched` and `price` populate the corresponding fields. Its
+  order response has no fee or settlement transaction reference, so both stay
+  `None`; associated trade IDs are not relabeled as settlement references.
+- Unknown venue status strings fail closed as `ExecError::Transport`, while an
+  absent order (HTTP 404) maps to `ExecError::NotFound`.
