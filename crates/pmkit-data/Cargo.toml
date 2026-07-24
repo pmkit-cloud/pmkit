@@ -17,6 +17,8 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util"] }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 pmkit-core = { path = "../pmkit-core" }
 pmkit-market = { path = "../pmkit-market" }
 pmkit-event = { path = "../pmkit-event" }

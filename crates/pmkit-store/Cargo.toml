@@ -15,11 +15,13 @@ categories.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 pmkit-core = { path = "../pmkit-core" }
+reqwest = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
 thiserror = { workspace = true }
+tokio = { workspace = true }
 turso = "0.7"
 
 [dev-dependencies]
