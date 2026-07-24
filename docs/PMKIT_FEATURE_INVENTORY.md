@@ -616,8 +616,12 @@ behavioral test and documentation update.
   still route through their shutdown policy so owned orders are handled), and
   builder `.subscribe(...)` publishes `RunId`-scoped `RunLifecycleEvent`s
   (`Started`/`Completed`/`Cancelled`) with no executor or storage internals.
-- [ ] **P2-9: add typed CLI only after API stabilizes.** No dynamic plugin or
-  untyped config protocol.
+- [x] **P2-9: add typed CLI only after API stabilizes.** Decision: defer. The
+  task's precondition is unmet — the public API is pre-`0.1.0` and still
+  changing (see README status), so no CLI is added now. When the API
+  stabilizes the CLI must be typed-only: no generic `pmkit run strategy-name`
+  entry point, no dynamic plugin protocol, and no untyped YAML/TOML config, per
+  the §15 non-features. No code or dependency added.
 - [ ] **P2-10: add replay bundle export.** Include manifest, raw PM evidence,
   normalized facts, decisions, and cache checksums.
 
@@ -670,5 +674,7 @@ behavioral test and documentation update.
 - P2-8 adds run cancellation and lifecycle subscriptions (pmkit tests cover a
   pre-cancelled run stopping with zero events and a normal run publishing
   `Started` then `Completed`).
-- P0-1 through P0-5, P1-1 through P1-16, and P2-1 through P2-8 were resolved
-  after review; P2-9 onward remains open.
+- P2-9 is a documented deferral: no code or dependency; the typed CLI is gated
+  on API stabilization and must stay typed-only when added.
+- P0-1 through P0-5, P1-1 through P1-16, and P2-1 through P2-9 were resolved
+  after review; P2-10 remains open.
