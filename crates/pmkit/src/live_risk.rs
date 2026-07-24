@@ -34,6 +34,39 @@ pub fn passes_risk(
     (held + signed).abs() * order.price <= limits.max_position_notional.as_decimal()
 }
 
+/// Aggregated exposure checked before one live venue submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortfolioRiskExposure {
+    /// Current marked position and reserved-order notional.
+    pub portfolio_notional: Decimal,
+    /// Current marked position and reserved-order notional for the order market.
+    pub market_notional: Decimal,
+    /// Current reserved notional attributable to the strategy.
+    pub strategy_notional: Decimal,
+    /// Current daily portfolio profit and loss.
+    pub daily_pnl: Decimal,
+    /// Current open order count.
+    pub open_orders: usize,
+}
+
+#[must_use]
+pub fn passes_aggregated_risk(
+    order: &PlaceOrder,
+    limits: &RiskLimits,
+    positions: &[Position],
+    exposure: PortfolioRiskExposure,
+) -> bool {
+    let order_notional = order.qty * order.price;
+    passes_risk(order, limits, positions, Some(exposure.daily_pnl))
+        && exposure.portfolio_notional + order_notional
+            <= limits.max_portfolio_notional.as_decimal()
+        && exposure.market_notional + order_notional <= limits.max_market_notional.as_decimal()
+        && exposure.strategy_notional + order_notional <= limits.max_strategy_notional.as_decimal()
+        && exposure.daily_pnl > -limits.max_daily_loss.as_decimal()
+        && exposure.open_orders
+            < usize::try_from(limits.max_open_orders.get()).unwrap_or(usize::MAX)
+}
+
 #[must_use]
 pub fn mark_positions(
     positions_by_market: &mut HashMap<MarketId, Vec<Position>>,
@@ -106,6 +139,32 @@ impl LiveRiskState {
             *size,
         );
         self.refresh_marks(limits);
+    }
+
+    pub(super) fn portfolio_notional(&self) -> Decimal {
+        self.positions_by_market
+            .iter()
+            .map(|(market, positions)| self.marked_notional(market, positions))
+            .sum()
+    }
+
+    pub(super) fn market_notional(&self, market: &MarketId) -> Decimal {
+        self.positions_by_market
+            .get(market)
+            .map_or(Decimal::ZERO, |positions| {
+                self.marked_notional(market, positions)
+            })
+    }
+
+    fn marked_notional(&self, market: &MarketId, positions: &[Position]) -> Decimal {
+        positions
+            .iter()
+            .map(|position| {
+                self.marks
+                    .get(&(market.clone(), position.outcome))
+                    .map_or(Decimal::ZERO, |mark| position.qty.abs() * *mark)
+            })
+            .sum()
     }
 
     fn refresh_marks(&mut self, limits: &RiskLimits) -> Option<Decimal> {

@@ -133,8 +133,12 @@ fn risk_gate_rejects_a_marked_loss_at_the_limit() -> Result<(), Box<dyn std::err
     let limits = RiskLimits {
         max_order_notional: Money::usdc(10),
         max_position_notional: Money::usdc(10),
+        max_portfolio_notional: Money::usdc(20),
+        max_market_notional: Money::usdc(10),
+        max_strategy_notional: Money::usdc(10),
         max_open_orders: NonZeroU32::new(5).ok_or("nonzero")?,
         max_loss: Money::usdc(2),
+        max_daily_loss: Money::usdc(2),
     };
     let market = MarketId::new("btc-5m")?;
     let mut positions = HashMap::from([(
@@ -172,8 +176,12 @@ fn risk_gate_enforces_order_and_position_notional() -> Result<(), Box<dyn std::e
     let limits = RiskLimits {
         max_order_notional: Money::usdc(10),
         max_position_notional: Money::usdc(8),
+        max_portfolio_notional: Money::usdc(20),
+        max_market_notional: Money::usdc(8),
+        max_strategy_notional: Money::usdc(8),
         max_open_orders: NonZeroU32::new(5).ok_or("nonzero")?,
         max_loss: Money::usdc(100),
+        max_daily_loss: Money::usdc(100),
     };
     let market = MarketId::new("btc-5m")?;
     let order = |qty: i64| PlaceOrder {
@@ -207,6 +215,63 @@ fn risk_gate_enforces_order_and_position_notional() -> Result<(), Box<dyn std::e
         &limits,
         &held,
         Some(Decimal::ZERO),
+    ));
+    Ok(())
+}
+
+#[test]
+fn aggregated_risk_enforces_portfolio_market_strategy_and_daily_limits()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut limits = risk()?;
+    limits.max_portfolio_notional = Money::usdc(10);
+    limits.max_market_notional = Money::usdc(8);
+    limits.max_strategy_notional = Money::usdc(6);
+    limits.max_daily_loss = Money::usdc(2);
+    let order = PlaceOrder {
+        market: MarketId::new("btc-5m")?,
+        outcome: Outcome::Up,
+        side: Side::Buy,
+        price: Decimal::ONE,
+        qty: Decimal::from(2),
+        post_only: false,
+    };
+    let exposure = |portfolio, market, strategy, daily_pnl| live::TestRiskExposure {
+        portfolio_notional: Decimal::from(portfolio),
+        market_notional: Decimal::from(market),
+        strategy_notional: Decimal::from(strategy),
+        daily_pnl: Decimal::from(daily_pnl),
+        open_orders: 0,
+    };
+
+    assert!(live::test_passes_aggregated_risk(
+        &order,
+        &limits,
+        &[],
+        exposure(7, 5, 3, 0),
+    ));
+    assert!(!live::test_passes_aggregated_risk(
+        &order,
+        &limits,
+        &[],
+        exposure(9, 5, 3, 0),
+    ));
+    assert!(!live::test_passes_aggregated_risk(
+        &order,
+        &limits,
+        &[],
+        exposure(7, 7, 3, 0),
+    ));
+    assert!(!live::test_passes_aggregated_risk(
+        &order,
+        &limits,
+        &[],
+        exposure(7, 5, 5, 0),
+    ));
+    assert!(!live::test_passes_aggregated_risk(
+        &order,
+        &limits,
+        &[],
+        exposure(7, 5, 3, -2),
     ));
     Ok(())
 }
