@@ -12,10 +12,12 @@ use polymarket_client_sdk_v2::clob::types::Side as VenueSide;
 use polymarket_client_sdk_v2::types::U256;
 use rust_decimal::Decimal;
 
+mod account;
 mod execution;
 mod historical;
 mod live;
 
+pub use account::PolymarketUserData;
 pub use execution::PolymarketExecutor;
 pub use historical::PolymarketHistoricalData;
 pub use live::{
