@@ -322,6 +322,7 @@ pub async fn drive_with_control(
         return Err(StartError::KillSwitchActive(run.id().clone()));
     }
     let mut open_orders = initial_open_orders(run, runtime).await?;
+    let account_ledger_authoritative = run.account_data_ref().is_some();
     let max_open_orders = usize::try_from(limits.max_open_orders.get()).unwrap_or(usize::MAX);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1024);
     let feed = MergedFeed::from_tasks(FeedMode::Live, sources(run, &strategies), None);
@@ -334,7 +335,6 @@ pub async fn drive_with_control(
     let mut risk_state = LiveRiskState::default();
     let mut reservations: HashMap<String, Reservation> = HashMap::new();
     let mut events_processed = 0_usize;
-    let mut fills = 0_usize;
     let mut rejected = 0_usize;
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     control.emit(RunLifecycleEvent::Started {
@@ -349,7 +349,7 @@ pub async fn drive_with_control(
             runtime,
             &open_orders,
             &mut tape,
-            [events_processed, fills, rejected],
+            [events_processed, risk_state.fill_count(), rejected],
         )
         .await;
     }
@@ -363,7 +363,7 @@ pub async fn drive_with_control(
                 runtime,
                 &open_orders,
                 &mut tape,
-                [events_processed, fills, rejected],
+                [events_processed, risk_state.fill_count(), rejected],
             )
             .await;
         }
@@ -380,6 +380,7 @@ pub async fn drive_with_control(
         }
         if let SourceEnvelope::PmAccount(envelope) = &merged.source {
             tape.append_account(run, envelope)?;
+            risk_state.apply_account_event(&envelope.fact, &limits);
             match &envelope.fact {
                 PmAccountEvent::Fill { order_id, .. }
                 | PmAccountEvent::OrderCancelled { order_id, .. }
@@ -415,8 +416,7 @@ pub async fn drive_with_control(
                     last_trade_price: None,
                 };
                 let fact = StrategyFact::Market(event.clone());
-                let portfolio_unrealized_pnl =
-                    risk_state.update_book(market, *outcome, &book, &limits);
+                let portfolio_daily_pnl = risk_state.update_book(market, *outcome, &book, &limits);
                 if risk_state.loss_breached
                     && let Some(store) = store
                 {
@@ -469,8 +469,8 @@ pub async fn drive_with_control(
                                     .filter(|reservation| reservation.strategy == instance.id)
                                     .map(|reservation| reservation.notional)
                                     .sum();
-                                let exposure = portfolio_unrealized_pnl.map(|daily_pnl| {
-                                    PortfolioRiskExposure {
+                                let exposure =
+                                    portfolio_daily_pnl.map(|daily_pnl| PortfolioRiskExposure {
                                         portfolio_notional: risk_state.portfolio_notional()
                                             + reserved_portfolio,
                                         market_notional: risk_state.market_notional(market)
@@ -478,8 +478,7 @@ pub async fn drive_with_control(
                                         strategy_notional: reserved_strategy,
                                         daily_pnl,
                                         open_orders: open_orders.len(),
-                                    }
-                                });
+                                    });
                                 if risk_state.loss_breached
                                     || exposure.is_none_or(|exposure| {
                                         !passes_aggregated_risk(
@@ -576,9 +575,8 @@ pub async fn drive_with_control(
                         })?;
                 }
             }
-            MarketEvent::Fill { .. } => {
+            MarketEvent::Fill { .. } if !account_ledger_authoritative => {
                 risk_state.apply_fill(&event, &limits);
-                fills += 1;
             }
             _ => {}
         }
@@ -602,7 +600,7 @@ pub async fn drive_with_control(
         runtime,
         &open_orders,
         &mut tape,
-        [events_processed, fills, rejected],
+        [events_processed, risk_state.fill_count(), rejected],
     )
     .await?;
     control.emit(RunLifecycleEvent::Completed {

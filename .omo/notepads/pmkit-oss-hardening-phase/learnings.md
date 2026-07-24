@@ -105,3 +105,17 @@
   &[FinalizedRawLogBatch]) -> Result<FinalizedRawLogBatch, ChainSourceError>`
   requires the same quorum on verified range, coverage, and provider-neutral
   logs ending at the agreed finalized height.
+
+## 2026-07-24 - Authoritative live fill and settlement ledger
+
+- A live run with an authenticated account source treats `PmAccountEvent::Fill`
+  and `PmAccountEvent::Settlement` as its only position/PnL authority;
+  `MarketEvent::Fill` remains a compatibility fallback only when no account
+  source is configured, so one physical fill never has two writers.
+- `LiveRiskState` deduplicates normalized fill identity `(order, market,
+  outcome, side, price, size, timestamp)` and settlement identity `(market,
+  outcome, size, proceeds, timestamp)`. It owns the fill count, realized PnL,
+  fees, positions, and marked daily PnL; duplicate durable replay is a no-op.
+- Todo 15 can rebuild these identities and balances by replaying the durable
+  account records into a fresh `LiveRiskState`; no durable derived snapshot was
+  added as a second authority.
