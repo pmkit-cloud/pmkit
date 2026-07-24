@@ -252,3 +252,153 @@ async fn read_chain_checkpoint(
         row.get::<String>(1)?,
     )))
 }
+
+#[cfg(test)]
+mod rpc_batch_tests {
+    use rust_decimal::Decimal;
+
+    use crate::{
+        Address, BlockHead, CanonicalLogStore, ChainCheckpoint, ChainId, ContractRegistry,
+        FinalizedBlockCoverage, FinalizedBlockRange, FinalizedRawLogBatch, ProviderIdentity,
+        RawLogIdentity, RawRpcLog, StoreError, TursoTapeStore, WalletQuery, ingest_finalized_batch,
+    };
+
+    const TRANSFER_TOPIC: &str =
+        "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a8df523b3ef";
+
+    fn transfer_log(
+        provider: &ProviderIdentity,
+        contract_address: Address,
+        transaction_index: u64,
+        data: String,
+    ) -> RawRpcLog {
+        RawRpcLog {
+            identity: RawLogIdentity {
+                provider: provider.clone(),
+                chain_id: ChainId::POLYGON,
+                block_number: 1,
+                block_hash: "0xblock1".into(),
+                transaction_hash: format!("0xtx{transaction_index}"),
+                transaction_index,
+                log_index: 0,
+            },
+            contract_address,
+            topics: vec![
+                TRANSFER_TOPIC.into(),
+                format!("0x{:064x}", 1),
+                format!("0x{:064x}", 0xaa),
+            ],
+            data,
+        }
+    }
+
+    fn batch(
+        provider: ProviderIdentity,
+        logs: Vec<RawRpcLog>,
+    ) -> Result<FinalizedRawLogBatch, crate::ChainSourceError> {
+        let range = FinalizedBlockRange::new(ChainId::POLYGON, 1, 1)?;
+        let finalized = BlockHead::new(ChainId::POLYGON, 1, "0xblock1", "0xgenesis");
+        FinalizedRawLogBatch::new(
+            provider,
+            range.clone(),
+            BlockHead::new(ChainId::POLYGON, 2, "0xhead", "0xblock1"),
+            finalized.clone(),
+            FinalizedBlockCoverage::new(range, vec![finalized])?,
+            logs,
+        )
+    }
+
+    #[tokio::test]
+    async fn consistent_batch_ingests() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: complete linked coverage and one registered, recognized log.
+        let directory = tempfile::tempdir()?;
+        let store = TursoTapeStore::open_local(directory.path().join("consistent.db")).await?;
+        let registry = ContractRegistry::polygon();
+        let provider = ProviderIdentity::new("safe-provider");
+        let batch = batch(
+            provider.clone(),
+            vec![transfer_log(
+                &provider,
+                registry.collateral.clone(),
+                0,
+                format!("0x{:064x}", 42),
+            )],
+        )?;
+
+        // When: the finalized RPC batch crosses the durable ingestion boundary.
+        ingest_finalized_batch(
+            &store,
+            &registry,
+            &batch,
+            ChainCheckpoint::new(ChainId::POLYGON, 0, "0xgenesis"),
+        )
+        .await?;
+
+        // Then: the complete batch is committed and visible canonically.
+        let wallet = Address::new("0x00000000000000000000000000000000000000aa")?;
+        assert_eq!(
+            store
+                .wallet_snapshot(&WalletQuery::new(wallet))
+                .await?
+                .collateral_balance,
+            Decimal::from(42)
+        );
+        drop(store);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inconsistent_batch_rejected_redacted() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: a batch mixing one valid log with one unregistered-contract payload.
+        let directory = tempfile::tempdir()?;
+        let store = TursoTapeStore::open_local(directory.path().join("inconsistent.db")).await?;
+        let registry = ContractRegistry::polygon();
+        let provider = ProviderIdentity::new("safe-provider");
+        let secret_url = "https://rpc.example/v1/url-api-key";
+        let auth_header = "Bearer header-secret";
+        let raw_payload = "0xraw-payload-secret";
+        let batch = batch(
+            provider.clone(),
+            vec![
+                transfer_log(
+                    &provider,
+                    registry.collateral.clone(),
+                    0,
+                    format!("0x{:064x}", 42),
+                ),
+                transfer_log(
+                    &provider,
+                    Address::new("0x0000000000000000000000000000000000000001")?,
+                    1,
+                    raw_payload.into(),
+                ),
+            ],
+        )?;
+
+        // When: registry sanity rejects one member before the transaction begins.
+        let result = ingest_finalized_batch(
+            &store,
+            &registry,
+            &batch,
+            ChainCheckpoint::new(ChainId::POLYGON, 0, "0xgenesis"),
+        )
+        .await;
+        let Err(error) = result else {
+            return Err("inconsistent batch unexpectedly ingested".into());
+        };
+
+        // Then: the typed error exposes only provider identity and sanitized detail.
+        assert!(matches!(error, StoreError::CanonicalLogDecode { .. }));
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert!(display.contains("safe-provider"));
+        assert!(display.contains("unregistered contract"));
+        for secret in [secret_url, auth_header, raw_payload, TRANSFER_TOPIC] {
+            assert!(!display.contains(secret));
+            assert!(!debug.contains(secret));
+        }
+        assert_eq!(store.finalized_checkpoint(ChainId::POLYGON).await?, None);
+        drop(store);
+        Ok(())
+    }
+}

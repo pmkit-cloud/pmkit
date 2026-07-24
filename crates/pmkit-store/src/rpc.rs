@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -36,7 +36,7 @@ impl Default for RpcProviderConfig {
 }
 
 /// A narrow JSON-RPC provider for finalized Polygon logs.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct JsonRpcFinalizedProvider {
     client: reqwest::Client,
     endpoint: String,
@@ -44,6 +44,17 @@ pub struct JsonRpcFinalizedProvider {
     chain_id: ChainId,
     config: RpcProviderConfig,
     requests: Arc<Semaphore>,
+}
+
+impl fmt::Debug for JsonRpcFinalizedProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JsonRpcFinalizedProvider")
+            .field("provider", &self.provider)
+            .field("chain_id", &self.chain_id)
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
 }
 
 impl JsonRpcFinalizedProvider {
@@ -61,9 +72,9 @@ impl JsonRpcFinalizedProvider {
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
-            .map_err(|error| ChainSourceError::ProviderFailure {
+            .map_err(|_| ChainSourceError::ProviderFailure {
                 provider: provider.clone(),
-                message: error.to_string(),
+                message: "HTTP client configuration failed".into(),
             })?;
         let config = RpcProviderConfig::default();
         Ok(Self {
@@ -95,14 +106,14 @@ impl JsonRpcFinalizedProvider {
             "method": method,
             "params": params,
         }))
-        .map_err(|error| self.failure(error.to_string()))?;
+        .map_err(|_| self.failure("JSON-RPC request encoding failed"))?;
         let mut attempt = 0_u8;
         let response = loop {
             let _permit = self
                 .requests
                 .acquire()
                 .await
-                .map_err(|error| self.failure(error.to_string()))?;
+                .map_err(|_| self.failure("provider request limiter closed"))?;
             let response = self
                 .client
                 .post(&self.endpoint)
@@ -117,9 +128,9 @@ impl JsonRpcFinalizedProvider {
                         return Err(self.failure(format!("HTTP status {}", response.status())));
                     }
                 }
-                Err(error) => {
+                Err(_) => {
                     if attempt >= self.config.max_retries {
-                        return Err(self.failure(error.to_string()));
+                        return Err(self.failure("transport request failed"));
                     }
                 }
             }
@@ -130,11 +141,11 @@ impl JsonRpcFinalizedProvider {
             &response
                 .bytes()
                 .await
-                .map_err(|error| self.failure(error.to_string()))?,
+                .map_err(|_| self.failure("response body read failed"))?,
         )
-        .map_err(|error| self.failure(error.to_string()))?;
+        .map_err(|_| self.failure("invalid JSON-RPC response"))?;
         if let Some(error) = envelope.error {
-            return Err(self.failure(format!("JSON-RPC {}: {}", error.code, error.message)));
+            return Err(self.failure(format!("JSON-RPC error code {}", error.code)));
         }
         envelope
             .result
@@ -146,7 +157,7 @@ impl JsonRpcFinalizedProvider {
             .call("eth_getBlockByNumber", serde_json::json!([tag, false]))
             .await?;
         let block: RpcBlock =
-            serde_json::from_value(result).map_err(|error| self.failure(error.to_string()))?;
+            serde_json::from_value(result).map_err(|_| self.failure("invalid block response"))?;
         Ok(BlockHead::new(
             self.chain_id,
             parse_quantity(&block.number).map_err(|error| self.failure(error))?,
@@ -206,7 +217,7 @@ impl FinalizedRawLogProvider for JsonRpcFinalizedProvider {
             )
             .await?;
         let logs: Vec<RpcLog> =
-            serde_json::from_value(result).map_err(|error| self.failure(error.to_string()))?;
+            serde_json::from_value(result).map_err(|_| self.failure("invalid log response"))?;
         let logs = logs
             .into_iter()
             .map(|log| self.raw_log(log))
@@ -258,7 +269,6 @@ struct RpcResponse {
 #[derive(Debug, Deserialize)]
 struct RpcError {
     code: i64,
-    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -294,7 +304,10 @@ fn parse_quantity(value: &str) -> Result<u64, String> {
     value
         .strip_prefix("0x")
         .ok_or_else(|| "JSON-RPC quantity is not 0x-prefixed".to_owned())
-        .and_then(|value| u64::from_str_radix(value, 16).map_err(|error| error.to_string()))
+        .and_then(|value| {
+            u64::from_str_radix(value, 16)
+                .map_err(|_| "JSON-RPC quantity is not valid hexadecimal".to_owned())
+        })
 }
 
 #[cfg(test)]
@@ -320,6 +333,28 @@ mod tests {
         assert_eq!(parse_quantity("0x2a"), Ok(42));
         assert_eq!(quantity(42), "0x2a");
         assert!(parse_quantity("42").is_err());
+    }
+
+    #[test]
+    fn provider_diagnostics_redact_endpoint_credentials() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Given: an endpoint whose user info, path, and query all contain credentials.
+        let endpoint = "https://header-secret@rpc.example/raw-payload?api_key=url-secret";
+        let provider = super::super::JsonRpcFinalizedProvider::new(
+            endpoint,
+            ProviderIdentity::new("safe-provider"),
+            ChainId::POLYGON,
+        )?;
+
+        // When: operator-facing diagnostics format the provider.
+        let diagnostic = format!("{provider:?}");
+
+        // Then: only the stable provider identity survives formatting.
+        assert!(diagnostic.contains("safe-provider"));
+        for secret in [endpoint, "header-secret", "raw-payload", "url-secret"] {
+            assert!(!diagnostic.contains(secret));
+        }
+        Ok(())
     }
 
     #[tokio::test]

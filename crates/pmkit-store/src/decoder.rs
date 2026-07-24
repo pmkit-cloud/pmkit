@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::{
     Address, CanonicalChainLog, CanonicalLogIdentity, ChainEvent, ContractRegistry,
-    OutcomeTokenAmount, RawRpcLog, TradeSide,
+    OutcomeTokenAmount, ProviderIdentity, RawRpcLog, TradeSide,
 };
 
 const ERC20_TRANSFER_TOPIC: &str =
@@ -40,16 +40,22 @@ const ZERO_ASSET_ID: &str = "000000000000000000000000000000000000000000000000000
 #[derive(Debug, Error)]
 pub enum DecodeError {
     /// The raw log belongs to a chain outside the supplied registry.
-    #[error("raw log belongs to an unsupported chain")]
-    UnsupportedChain,
+    #[error("provider {provider:?} returned a raw log for an unsupported chain")]
+    UnsupportedChain {
+        /// The stable identity of the provider that returned the log.
+        provider: ProviderIdentity,
+    },
     /// The raw log contract is not accepted by the supplied registry.
-    #[error("raw log contract is not registered for this event family")]
-    UnregisteredContract,
+    #[error("provider {provider:?} returned a raw log from an unregistered contract")]
+    UnregisteredContract {
+        /// The stable identity of the provider that returned the log.
+        provider: ProviderIdentity,
+    },
     /// The topic has no verified decoder in this release.
-    #[error("raw log topic is not supported: {topic}")]
+    #[error("provider {provider:?} returned a raw log with an unsupported topic")]
     UnsupportedTopic {
-        /// The first topic identifying the event.
-        topic: String,
+        /// The stable identity of the provider that returned the log.
+        provider: ProviderIdentity,
     },
     /// The raw log has an invalid ABI field.
     #[error("raw log is malformed: {message}")]
@@ -73,29 +79,39 @@ pub fn decode_raw_log(
     raw: &RawRpcLog,
 ) -> Result<CanonicalChainLog, DecodeError> {
     if raw.identity.chain_id != registry.chain_id {
-        return Err(DecodeError::UnsupportedChain);
+        return Err(DecodeError::UnsupportedChain {
+            provider: raw.identity.provider.clone(),
+        });
     }
     let topic = raw.topics.first().ok_or_else(|| DecodeError::Malformed {
         message: "missing event topic".into(),
     })?;
     let event = if topic.eq_ignore_ascii_case(ERC20_TRANSFER_TOPIC) {
         if raw.contract_address != registry.collateral {
-            return Err(DecodeError::UnregisteredContract);
+            return Err(DecodeError::UnregisteredContract {
+                provider: raw.identity.provider.clone(),
+            });
         }
         decode_erc20_transfer(raw)?
     } else if topic.eq_ignore_ascii_case(ERC1155_TRANSFER_SINGLE_SIGNATURE_FIXTURE.1) {
         if !registry.is_conditional_tokens(&raw.contract_address) {
-            return Err(DecodeError::UnregisteredContract);
+            return Err(DecodeError::UnregisteredContract {
+                provider: raw.identity.provider.clone(),
+            });
         }
         decode_erc1155_transfer_single(raw)?
     } else if topic.eq_ignore_ascii_case(ERC1155_TRANSFER_BATCH_SIGNATURE_FIXTURE.1) {
         if !registry.is_conditional_tokens(&raw.contract_address) {
-            return Err(DecodeError::UnregisteredContract);
+            return Err(DecodeError::UnregisteredContract {
+                provider: raw.identity.provider.clone(),
+            });
         }
         decode_erc1155_transfer_batch(raw)?
     } else if topic.eq_ignore_ascii_case(CTF_POSITION_SPLIT_SIGNATURE_FIXTURE.1) {
         if !registry.is_conditional_tokens(&raw.contract_address) {
-            return Err(DecodeError::UnregisteredContract);
+            return Err(DecodeError::UnregisteredContract {
+                provider: raw.identity.provider.clone(),
+            });
         }
         let (stakeholder, condition_id, amount) =
             decode_ctf_position_change(raw, &registry.collateral)?;
@@ -106,7 +122,9 @@ pub fn decode_raw_log(
         }
     } else if topic.eq_ignore_ascii_case(CTF_POSITIONS_MERGE_SIGNATURE_FIXTURE.1) {
         if !registry.is_conditional_tokens(&raw.contract_address) {
-            return Err(DecodeError::UnregisteredContract);
+            return Err(DecodeError::UnregisteredContract {
+                provider: raw.identity.provider.clone(),
+            });
         }
         let (stakeholder, condition_id, amount) =
             decode_ctf_position_change(raw, &registry.collateral)?;
@@ -117,17 +135,21 @@ pub fn decode_raw_log(
         }
     } else if topic.eq_ignore_ascii_case(EXCHANGE_V1_ORDER_FILLED_SIGNATURE_FIXTURE.1) {
         if !registry.is_legacy_exchange(&raw.contract_address) {
-            return Err(DecodeError::UnregisteredContract);
+            return Err(DecodeError::UnregisteredContract {
+                provider: raw.identity.provider.clone(),
+            });
         }
         decode_exchange_v1_order_filled(raw)?
     } else if topic.eq_ignore_ascii_case(EXCHANGE_V2_ORDER_FILLED_SIGNATURE_FIXTURE.1) {
         if !registry.is_current_exchange(&raw.contract_address) {
-            return Err(DecodeError::UnregisteredContract);
+            return Err(DecodeError::UnregisteredContract {
+                provider: raw.identity.provider.clone(),
+            });
         }
         decode_exchange_v2_order_filled(raw)?
     } else {
         return Err(DecodeError::UnsupportedTopic {
-            topic: topic.clone(),
+            provider: raw.identity.provider.clone(),
         });
     };
     let log = CanonicalChainLog {
@@ -145,7 +167,9 @@ pub fn decode_raw_log(
     if registry.accepts(&log) {
         Ok(log)
     } else {
-        Err(DecodeError::UnregisteredContract)
+        Err(DecodeError::UnregisteredContract {
+            provider: raw.identity.provider.clone(),
+        })
     }
 }
 
@@ -713,7 +737,8 @@ mod tests {
         // Then: it is rejected before any event is created.
         assert!(matches!(
             wrong_contract,
-            Err(DecodeError::UnregisteredContract)
+            Err(DecodeError::UnregisteredContract { provider })
+                if provider.as_str() == "fixture-rpc"
         ));
         Ok(())
     }
@@ -729,15 +754,16 @@ mod tests {
             &registry,
             &raw(
                 registry.conditional_tokens.clone(),
-                vec![unknown_topic.clone()],
+                vec![unknown_topic],
                 "0x".into(),
             ),
         );
 
-        // Then: the exact topic is returned in the typed fail-closed rejection.
+        // Then: the typed rejection retains provider identity without the raw topic.
         assert!(matches!(
             result,
-            Err(DecodeError::UnsupportedTopic { topic }) if topic == unknown_topic
+            Err(DecodeError::UnsupportedTopic { provider })
+                if provider.as_str() == "fixture-rpc"
         ));
     }
 }
