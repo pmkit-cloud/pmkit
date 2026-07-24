@@ -7,17 +7,149 @@
 use pmkit_run::EvidenceRequirement;
 use pmkit_runtime::{RiskLimits, RuntimeConfig, StrategyRegistration};
 use pmkit_spec::RunSpec;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use thiserror::Error;
+
+/// Schema version for run manifests.
+pub const MANIFEST_SCHEMA_VERSION: u16 = 1;
+
+const REDACTED_MANIFEST_DIR: &str = "<redacted>";
+
+/// A fully decoded version-1 run manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestV1 {
+    /// Manifest schema version.
+    pub schema_version: u16,
+    #[serde(flatten)]
+    body: ManifestBodyV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum ManifestBodyV1 {
+    Backtest {
+        #[serde(flatten)]
+        common: ManifestCommonV1,
+        initial_cash: String,
+        simulation: SimulationV1,
+        replay: ReplayV1,
+    },
+    Paper {
+        #[serde(flatten)]
+        common: ManifestCommonV1,
+        initial_cash: String,
+        simulation: SimulationV1,
+    },
+    Live {
+        #[serde(flatten)]
+        common: ManifestCommonV1,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ManifestCommonV1 {
+    run: String,
+    portfolio: String,
+    risk: RiskV1,
+    strategies: Vec<StrategyV1>,
+    runtime: RuntimeV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RiskV1 {
+    max_order_notional: String,
+    max_position_notional: String,
+    max_portfolio_notional: String,
+    max_market_notional: String,
+    max_strategy_notional: String,
+    #[serde(rename = "max_open_orders")]
+    open_orders_limit: u32,
+    max_loss: String,
+    max_daily_loss: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SimulationV1 {
+    activation_latency_ms: serde_json::Number,
+    maker_queue_ahead_bps: u16,
+    slippage_bps: u16,
+    market_impact_bps: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StrategyV1 {
+    id: String,
+    market: String,
+    name: Option<String>,
+    version: Option<String>,
+    config_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReplayV1 {
+    from: String,
+    to: String,
+    evidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RuntimeV1 {
+    backtest_concurrency: usize,
+    manifest_dir: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestVersion {
+    schema_version: u16,
+}
+
+/// Failure while decoding a run manifest.
+#[derive(Debug, Error)]
+pub enum ManifestError {
+    /// The manifest uses a schema version this reader does not support.
+    #[error("unsupported manifest schema version {found}")]
+    UnsupportedSchemaVersion {
+        /// Version found in the manifest.
+        found: u16,
+    },
+    /// A version-1 manifest does not match the complete typed schema.
+    #[error("malformed version-1 manifest: {source}")]
+    Malformed {
+        /// JSON decoding failure.
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+/// Decodes and validates a versioned run manifest.
+///
+/// # Errors
+///
+/// Returns [`ManifestError::UnsupportedSchemaVersion`] for unknown versions and
+/// [`ManifestError::Malformed`] when a version-1 manifest is incomplete or has
+/// a field with the wrong type.
+pub fn parse_manifest(value: &Value) -> Result<ManifestV1, ManifestError> {
+    let version = ManifestVersion::deserialize(value)
+        .map_err(|source| ManifestError::Malformed { source })?;
+    match version.schema_version {
+        MANIFEST_SCHEMA_VERSION => {
+            ManifestV1::deserialize(value).map_err(|source| ManifestError::Malformed { source })
+        }
+        found => Err(ManifestError::UnsupportedSchemaVersion { found }),
+    }
+}
 
 /// Builds a redacted reproducibility manifest for `run` under `config`.
 #[must_use]
 pub fn build_manifest(run: &RunSpec, config: &RuntimeConfig) -> Value {
     let runtime = json!({
         "backtest_concurrency": config.backtest_concurrency.get(),
-        "manifest_dir": config.manifest_dir.display().to_string(),
+        "manifest_dir": REDACTED_MANIFEST_DIR,
     });
     match run {
         RunSpec::Backtest(backtest) => json!({
+            "schema_version": MANIFEST_SCHEMA_VERSION,
             "mode": "backtest",
             "run": backtest.id().to_string(),
             "portfolio": backtest.portfolio().to_string(),
@@ -33,6 +165,7 @@ pub fn build_manifest(run: &RunSpec, config: &RuntimeConfig) -> Value {
             "runtime": runtime,
         }),
         RunSpec::Paper(paper) => json!({
+            "schema_version": MANIFEST_SCHEMA_VERSION,
             "mode": "paper",
             "run": paper.id().to_string(),
             "portfolio": paper.portfolio().to_string(),
@@ -43,6 +176,7 @@ pub fn build_manifest(run: &RunSpec, config: &RuntimeConfig) -> Value {
             "runtime": runtime,
         }),
         RunSpec::Live(live) => json!({
+            "schema_version": MANIFEST_SCHEMA_VERSION,
             "mode": "live",
             "run": live.id().to_string(),
             "portfolio": live.portfolio().to_string(),
@@ -100,7 +234,7 @@ const fn evidence_str(evidence: EvidenceRequirement) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::build_manifest;
+    use super::{ManifestError, build_manifest, parse_manifest};
     use async_trait::async_trait;
     use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
     use pmkit_data::{DataSourceError, HistoricalDataSource, ReplayQuery, SourceSignal};
@@ -145,8 +279,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn backtest_manifest_captures_topology() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_manifest() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         let config = RuntimeConfig {
             backtest_concurrency: NonZeroUsize::new(4).ok_or("nonzero")?,
             startup_timeout: Duration::from_secs(30),
@@ -155,7 +288,7 @@ mod tests {
                 reconciliation_timeout: Duration::from_secs(30),
                 tape_flush_timeout: Duration::from_secs(10),
             },
-            manifest_dir: "./runs".into(),
+            manifest_dir: std::env::current_dir()?.join("private").join("runs"),
         };
         let replay = ReplaySpec::new(
             Arc::new(NoHistory),
@@ -192,7 +325,12 @@ mod tests {
             Arc::new(FlatFactory),
         ));
 
-        let manifest = build_manifest(&run.into(), &config);
+        Ok(build_manifest(&run.into(), &config))
+    }
+
+    #[test]
+    fn backtest_manifest_captures_topology() -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = test_manifest()?;
         assert_eq!(manifest["mode"], "backtest");
         assert_eq!(manifest["run"], "research");
         assert_eq!(manifest["initial_cash"], "100000");
@@ -200,6 +338,41 @@ mod tests {
         assert_eq!(manifest["strategies"][0]["id"], "maker");
         assert!(manifest["strategies"][0]["name"].is_null());
         assert_eq!(manifest["replay"]["evidence"], "corroborated_only");
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_v1_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        // Given
+        let manifest = test_manifest()?;
+
+        // When
+        let parsed = parse_manifest(&manifest)?;
+
+        // Then
+        assert_eq!(manifest["schema_version"], 1);
+        assert_eq!(parsed.schema_version, 1);
+        assert_eq!(manifest["runtime"]["manifest_dir"], "<redacted>");
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_rejects_unsupported_and_malformed() -> Result<(), Box<dyn std::error::Error>> {
+        // Given
+        let mut unsupported = test_manifest()?;
+        unsupported["schema_version"] = serde_json::json!(2);
+        let mut malformed = test_manifest()?;
+        malformed["run"] = serde_json::json!(false);
+
+        // When / Then
+        assert!(matches!(
+            parse_manifest(&unsupported),
+            Err(ManifestError::UnsupportedSchemaVersion { found: 2 })
+        ));
+        assert!(matches!(
+            parse_manifest(&malformed),
+            Err(ManifestError::Malformed { .. })
+        ));
         Ok(())
     }
 }

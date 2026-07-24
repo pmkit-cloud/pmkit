@@ -3733,7 +3733,9 @@ dependencies = [
  "pmkit-runtime",
  "pmkit-spec",
  "pmkit-strategy",
+ "serde",
  "serde_json",
+ "thiserror",
  "tokio",
 ]
 

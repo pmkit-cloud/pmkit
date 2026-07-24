@@ -13,7 +13,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 pmkit-runtime = { path = "../pmkit-runtime" }
 pmkit-run = { path = "../pmkit-run" }
 pmkit-spec = { path = "../pmkit-spec" }
