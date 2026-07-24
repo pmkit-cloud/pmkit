@@ -183,10 +183,7 @@ async fn reconnect_uses_a_new_connection_id() -> Result<(), Box<dyn Error>> {
     let (handle, shutdown) = shutdown_channel();
     let transport = Arc::new(ScriptedTransport::new(
         vec![
-            ConnectStep::Ok(vec![
-                Step::Frame(frame(1, r#"{"n":1}"#)),
-                Step::CleanClose,
-            ]),
+            ConnectStep::Ok(vec![Step::Frame(frame(1, r#"{"n":1}"#)), Step::CleanClose]),
             ConnectStep::Ok(vec![
                 Step::Frame(frame(2, r#"{"n":2}"#)),
                 Step::Error("drop".to_owned()),
