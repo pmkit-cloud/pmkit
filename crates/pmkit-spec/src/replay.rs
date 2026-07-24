@@ -9,6 +9,7 @@ use pmkit_run::{EvidenceRequirement, RetrievalWait};
 #[derive(Clone)]
 pub struct ReplaySpec {
     source: Arc<dyn HistoricalDataSource>,
+    reference_source: Option<Arc<dyn HistoricalDataSource>>,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     evidence: EvidenceRequirement,
@@ -27,6 +28,7 @@ impl ReplaySpec {
     ) -> Self {
         Self {
             source,
+            reference_source: None,
             from,
             to,
             evidence,
@@ -34,10 +36,23 @@ impl ReplaySpec {
         }
     }
 
+    /// Adds an optional historical CEX reference source for parity-aware runs.
+    #[must_use]
+    pub fn reference_source(mut self, source: Arc<dyn HistoricalDataSource>) -> Self {
+        self.reference_source = Some(source);
+        self
+    }
+
     /// Returns the historical data source.
     #[must_use]
     pub const fn source(&self) -> &Arc<dyn HistoricalDataSource> {
         &self.source
+    }
+
+    /// Returns the optional historical CEX reference source.
+    #[must_use]
+    pub const fn reference_source_ref(&self) -> Option<&Arc<dyn HistoricalDataSource>> {
+        self.reference_source.as_ref()
     }
 
     /// Returns the inclusive window start.
@@ -71,6 +86,10 @@ impl fmt::Debug for ReplaySpec {
             .debug_struct("ReplaySpec")
             .field("from", &self.from)
             .field("to", &self.to)
+            .field(
+                "reference_source",
+                &self.reference_source.as_ref().map(|_| "configured"),
+            )
             .field("evidence", &self.evidence)
             .field("retrieval_wait", &self.retrieval_wait)
             .finish_non_exhaustive()
