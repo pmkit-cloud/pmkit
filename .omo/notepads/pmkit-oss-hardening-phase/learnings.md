@@ -186,3 +186,19 @@
   timestamp order so only the latest fixed window remains in memory. Todo 15
   should preserve this decision/intent replay before reconciliation; Todo 22
   can read the portfolio window without making it a second durable authority.
+
+## 2026-07-24 - Reconstructed live risk state
+
+- Live startup pages through owner-scoped `TapeStore::read_envelopes` and replays
+  durable account fills and settlements into the same `LiveRiskState` that
+  receives new account events. Todo-11 fill/settlement identities therefore
+  deduplicate startup replay against later live delivery without a snapshot.
+- Durable account payloads are parsed fail-closed. Replay gaps, malformed or
+  owner-mismatched payloads, settlements without a matching position, and
+  oversettlements abort startup through `StartError::Storage`; no partial state
+  reaches the event loop.
+- Decisions and pending/unknown intents remain the durable inputs for Todo-14
+  order-rate reconstruction and Todo-10 intent recovery because they contain no
+  fill facts. Open-order risk counts remain sourced from the existing venue
+  reconciliation, not a persisted derived snapshot. Todo 22 can read restored
+  `portfolio_notional`/`market_notional` directly from `LiveRiskState`.
