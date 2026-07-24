@@ -104,7 +104,7 @@ pub async fn export_replay_bundle(
         })
         .collect();
 
-    Ok(json!({
+    Ok(with_artifact_sha256(json!({
         "schema_version": REPLAY_BUNDLE_VERSION,
         "scope": {
             "portfolio": scope.portfolio_id.to_string(),
@@ -114,5 +114,82 @@ pub async fn export_replay_bundle(
         "pm_evidence": evidence,
         "decisions": decisions,
         "cache_checksums": checksums,
-    }))
+    })))
+}
+
+fn with_artifact_sha256(mut artifact: Value) -> Value {
+    let digest = crate::integrity::sha256_hex(artifact.to_string().as_bytes());
+    if let Some(fields) = artifact.as_object_mut() {
+        fields.insert("artifact_sha256".to_owned(), Value::String(digest));
+    }
+    artifact
+}
+
+#[cfg(test)]
+mod artifact_digest_tests {
+    use super::REPLAY_BUNDLE_VERSION;
+    use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
+
+    fn bundle_content() -> Value {
+        json!({
+            "schema_version": REPLAY_BUNDLE_VERSION,
+            "scope": { "portfolio": "paper", "run": "run" },
+            "manifest": { "mode": "backtest", "run": "run" },
+            "pm_evidence": [{ "raw_frame": "frame" }],
+            "decisions": [{ "payload": { "kind": "quote" } }],
+            "cache_checksums": [{ "key": "archive.zip", "sha256_hex": "abc123" }],
+        })
+    }
+
+    fn content_sha256(artifact: &Value) -> Result<String, &'static str> {
+        let mut content = artifact.clone();
+        content
+            .as_object_mut()
+            .ok_or("bundle must be an object")?
+            .remove("artifact_sha256")
+            .ok_or("bundle must contain artifact_sha256")?;
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(content.to_string().as_bytes())
+        ))
+    }
+
+    #[test]
+    fn bundle_self_digest_verifies() -> Result<(), Box<dyn std::error::Error>> {
+        // Given / When
+        let first = super::with_artifact_sha256(bundle_content());
+        let second = super::with_artifact_sha256(bundle_content());
+        let stored = first["artifact_sha256"]
+            .as_str()
+            .ok_or("artifact_sha256 must be a string")?;
+
+        // Then
+        assert_eq!(stored, content_sha256(&first)?);
+        assert_eq!(first["artifact_sha256"], second["artifact_sha256"]);
+        Ok(())
+    }
+
+    #[test]
+    fn bundle_tamper_changes_digest() -> Result<(), Box<dyn std::error::Error>> {
+        // Given
+        let bundle = super::with_artifact_sha256(bundle_content());
+        let stored = bundle["artifact_sha256"]
+            .as_str()
+            .ok_or("artifact_sha256 must be a string")?
+            .to_owned();
+        let mut tampered = bundle;
+        tampered
+            .get_mut("scope")
+            .and_then(Value::as_object_mut)
+            .ok_or("scope must be an object")?
+            .insert("run".to_owned(), json!("rum"));
+
+        // When
+        let tampered_digest = content_sha256(&tampered)?;
+
+        // Then
+        assert_ne!(stored, tampered_digest);
+        Ok(())
+    }
 }

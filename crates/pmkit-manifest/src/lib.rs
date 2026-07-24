@@ -9,6 +9,7 @@ use pmkit_runtime::{RiskLimits, RuntimeConfig, StrategyRegistration};
 use pmkit_spec::RunSpec;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod compiled_provenance {
@@ -73,6 +74,8 @@ pub struct ManifestV1 {
 pub struct ManifestV2 {
     /// Manifest schema version.
     pub schema_version: u16,
+    /// SHA-256 of the canonical manifest content excluding this field.
+    pub artifact_sha256: String,
     /// Compile-time reproducibility provenance.
     pub provenance: Provenance,
     #[serde(flatten)]
@@ -226,7 +229,7 @@ pub fn build_manifest_with_provenance(
         "backtest_concurrency": config.backtest_concurrency.get(),
         "manifest_dir": REDACTED_MANIFEST_DIR,
     });
-    match run {
+    let manifest = match run {
         RunSpec::Backtest(backtest) => json!({
             "schema_version": MANIFEST_SCHEMA_VERSION,
             "mode": "backtest",
@@ -266,7 +269,16 @@ pub fn build_manifest_with_provenance(
             "provenance": provenance,
             "runtime": runtime,
         }),
+    };
+    with_artifact_sha256(manifest)
+}
+
+fn with_artifact_sha256(mut artifact: Value) -> Value {
+    let digest = format!("{:x}", Sha256::digest(artifact.to_string().as_bytes()));
+    if let Some(fields) = artifact.as_object_mut() {
+        fields.insert("artifact_sha256".to_owned(), Value::String(digest));
     }
+    artifact
 }
 
 fn simulation_json(config: &pmkit_spec::ConservativeV1Config) -> Value {
@@ -316,3 +328,77 @@ const fn evidence_str(evidence: EvidenceRequirement) -> &'static str {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod artifact_digest_tests {
+    use super::{MANIFEST_SCHEMA_VERSION, REDACTED_MANIFEST_DIR};
+    use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
+
+    fn manifest_content() -> Value {
+        json!({
+            "schema_version": MANIFEST_SCHEMA_VERSION,
+            "mode": "backtest",
+            "run": "research",
+            "portfolio": "research",
+            "risk": { "max_open_orders": 10 },
+            "strategies": [],
+            "provenance": {
+                "git": { "commit": "0123456789abcdef", "dirty": false },
+                "cargo_lock_sha256": "abc123",
+                "toolchain": "rustc test-toolchain",
+            },
+            "runtime": { "manifest_dir": REDACTED_MANIFEST_DIR },
+        })
+    }
+
+    fn content_sha256(artifact: &Value) -> Result<String, &'static str> {
+        let mut content = artifact.clone();
+        content
+            .as_object_mut()
+            .ok_or("manifest must be an object")?
+            .remove("artifact_sha256")
+            .ok_or("manifest must contain artifact_sha256")?;
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(content.to_string().as_bytes())
+        ))
+    }
+
+    #[test]
+    fn manifest_self_digest_verifies() -> Result<(), Box<dyn std::error::Error>> {
+        // Given / When
+        let first = super::with_artifact_sha256(manifest_content());
+        let second = super::with_artifact_sha256(manifest_content());
+        let stored = first["artifact_sha256"]
+            .as_str()
+            .ok_or("artifact_sha256 must be a string")?;
+
+        // Then
+        assert_eq!(stored, content_sha256(&first)?);
+        assert_eq!(first["artifact_sha256"], second["artifact_sha256"]);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_tamper_changes_digest() -> Result<(), Box<dyn std::error::Error>> {
+        // Given
+        let manifest = super::with_artifact_sha256(manifest_content());
+        let stored = manifest["artifact_sha256"]
+            .as_str()
+            .ok_or("artifact_sha256 must be a string")?
+            .to_owned();
+        let mut tampered = manifest;
+        tampered
+            .as_object_mut()
+            .ok_or("manifest must be an object")?
+            .insert("run".to_owned(), json!("researci"));
+
+        // When
+        let tampered_digest = content_sha256(&tampered)?;
+
+        // Then
+        assert_ne!(stored, tampered_digest);
+        Ok(())
+    }
+}
