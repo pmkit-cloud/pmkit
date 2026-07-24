@@ -574,8 +574,17 @@ behavioral test and documentation update.
   uploads, and fails closed on corruption or version mismatch. `FsObjectStore`
   is the filesystem reference; a concrete S3 client stays in the separate
   product-infrastructure project.
-- [ ] **P2-4: evaluate Parquet separately.** Add columnar derivation only after
-  raw durability and replay recovery are proven.
+- [x] **P2-4: evaluate Parquet separately.** Decision: defer columnar/Parquet
+  derivation to the separate retention project; add no `arrow`/`parquet`
+  dependency to OSS now. Rationale: the raw newline-delimited v1 segments in
+  `pmkit-archive` are the immutable evidence and their durability + recovery are
+  now proven, but a columnar plane is an analytics/retention concern that §12
+  places outside OSS. Preconditions for ever adding it: it must be a pure
+  secondary derived from committed segments (never a replacement), fully
+  re-derivable, and verifiable against the manifest's segment checksums so raw
+  evidence stays authoritative. No event or storage shape changes; the
+  `Parquet retention plane` boundary remains in force. See the columnar note in
+  `docs/PMKIT_RAW_TAPE_FORMAT.md`.
 - [ ] **P2-5: add retention/compaction.** Keep raw evidence immutable; derive and
   compact secondary analytical files.
 
@@ -627,5 +636,8 @@ behavioral test and documentation update.
   truth for an orphan completed segment, unsupported-manifest-version rejection,
   and transient-put retry. The `cargo run -p pmkit-archive --example durable`
   surface writes, closes, reopens, and recovers durable evidence.
-- P0-1 through P0-5, P1-1 through P1-16, and P2-1 through P2-3 were fixed after
-  review; P2-4 onward remains open.
+- P2-4 is a documented evaluation only: no code or dependency; columnar
+  derivation is deferred to the separate retention project as a checksum-
+  verifiable secondary of the raw segments.
+- P0-1 through P0-5, P1-1 through P1-16, and P2-1 through P2-4 were resolved
+  after review; P2-5 onward remains open.

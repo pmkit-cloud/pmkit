@@ -79,3 +79,13 @@ manifest and segments; committed segment objects are immutable and are never
 rewritten in place. The concrete S3 client that implements `ObjectStore` is a
 separate product-infrastructure project and does not change this plane's
 contract.
+
+## Columnar derivation (P2-4 evaluation)
+
+Parquet/columnar files are **not** part of the OSS raw plane. The newline-
+delimited v1 segments are the authoritative, immutable evidence. Any future
+columnar derivation is a pure secondary artifact of the separate retention
+project: it must be re-derivable from committed segments, verifiable against the
+manifest's segment checksums, and never a replacement for the raw segments. No
+`arrow`/`parquet` dependency lives in OSS, and adding one is gated on that
+secondary-only contract.
