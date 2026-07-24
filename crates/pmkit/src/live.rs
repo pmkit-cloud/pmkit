@@ -7,7 +7,7 @@ use pmkit_book::OrderBookL2;
 use pmkit_event::{MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
 use pmkit_exec::{ExecError, Executor, OrderId, OrderStatus, PlaceOrder};
 use pmkit_market::Outcome;
-use pmkit_runtime::{LiveOrderPolicy, RuntimeConfig};
+use pmkit_runtime::{LiveOrderPolicy, RuntimeConfig, StrategyRegistration};
 use pmkit_spec::LiveRun;
 use pmkit_store::{CausalIdentity, OwnerScope, StoreError, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
@@ -19,7 +19,9 @@ mod live_risk;
 mod live_tape;
 #[cfg(test)]
 pub use live_risk::mark_positions;
-use live_risk::{LiveRiskState, PortfolioRiskExposure, passes_aggregated_risk};
+use live_risk::{
+    LiveRiskState, OrderRateLimits, OrderRateState, PortfolioRiskExposure, passes_aggregated_risk,
+};
 #[cfg(test)]
 pub use live_risk::{
     PortfolioRiskExposure as TestRiskExposure,
@@ -220,6 +222,108 @@ fn report(run: &LiveRun, counts: [usize; 3]) -> LiveReport {
     }
 }
 
+fn strategy_correlation_id(
+    strategy: &pmkit_core::StrategyId,
+    market: &pmkit_core::MarketId,
+    timestamp_ms: i64,
+) -> String {
+    let strategy = strategy.to_string();
+    let market = market.to_string();
+    format!(
+        "live-strategy:{}:{strategy}:market:{}:{market}:{timestamp_ms}",
+        strategy.len(),
+        market.len()
+    )
+}
+
+fn correlation_strategy(
+    correlation_id: &str,
+    registrations: &[StrategyRegistration],
+) -> Option<pmkit_core::StrategyId> {
+    registrations.iter().find_map(|registration| {
+        let strategy = registration.id().to_string();
+        let prefix = format!("live-strategy:{}:{strategy}:", strategy.len());
+        correlation_id
+            .starts_with(&prefix)
+            .then(|| registration.id().clone())
+    })
+}
+
+fn corrupt_rate_history(message: impl Into<String>) -> StoreError {
+    StoreError::Storage {
+        message: format!("invalid durable order-rate history: {}", message.into()),
+    }
+}
+
+async fn accepted_submissions(
+    store: &dyn TapeStore,
+    scope: &OwnerScope,
+    registrations: &[StrategyRegistration],
+) -> Result<Vec<(Option<pmkit_core::StrategyId>, i64)>, StoreError> {
+    let mut submissions = Vec::new();
+    let mut accepted_intent_ids = HashSet::new();
+    for decision in store.read_decisions(scope).await? {
+        let decision_kind = decision.payload["decision"]["kind"]
+            .as_str()
+            .ok_or_else(|| corrupt_rate_history("decision kind is missing"))?;
+        let risk = match decision_kind {
+            "no_action" | "strategy_error" => continue,
+            "actions" => decision.payload["decision"]["risk"]
+                .as_array()
+                .ok_or_else(|| corrupt_rate_history("action risk list is missing"))?,
+            other => {
+                return Err(corrupt_rate_history(format!(
+                    "unsupported decision kind {other}"
+                )));
+            }
+        };
+        let timestamp_ms = decision.payload["snapshot"]["timing"]["decision_ms"]
+            .as_i64()
+            .ok_or_else(|| corrupt_rate_history("logical decision timestamp is missing"))?;
+        let strategy = correlation_strategy(&decision.identity.correlation_id, registrations);
+        for verdict in risk {
+            let action_index = verdict["action_index"]
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| corrupt_rate_history("action index is invalid"))?;
+            let verdict_kind = verdict["verdict"]["kind"]
+                .as_str()
+                .ok_or_else(|| corrupt_rate_history("risk verdict kind is missing"))?;
+            match verdict_kind {
+                "accepted" => {
+                    accepted_intent_ids.insert(format!(
+                        "{}:{action_index}",
+                        decision.identity.correlation_id
+                    ));
+                    submissions.push((strategy.clone(), timestamp_ms));
+                }
+                "rejected" => {}
+                other => {
+                    return Err(corrupt_rate_history(format!(
+                        "unsupported risk verdict {other}"
+                    )));
+                }
+            }
+        }
+    }
+
+    let mut unresolved = store.read_pending_intents(scope).await?;
+    unresolved.extend(store.read_unknown_intents(scope).await?);
+    for intent in unresolved {
+        if accepted_intent_ids.contains(&intent.identity.correlation_id) {
+            continue;
+        }
+        let timestamp_ms = intent.payload["submitted_ms"]
+            .as_i64()
+            .ok_or_else(|| corrupt_rate_history("intent logical timestamp is missing"))?;
+        submissions.push((
+            correlation_strategy(&intent.identity.correlation_id, registrations),
+            timestamp_ms,
+        ));
+    }
+    Ok(submissions)
+}
+
 #[cfg(test)]
 pub async fn drive(run: &LiveRun, runtime: &RuntimeConfig) -> Result<LiveReport, StartError> {
     drive_with_store(run, runtime, None).await
@@ -296,15 +400,37 @@ pub async fn drive_with_store(
     drive_with_control(run, runtime, store, &RunControl::default()).await
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the live run owns one ordered risk, tape, storage, and shutdown lifecycle"
-)]
+#[cfg(test)]
+async fn drive_with_rate_limits(
+    run: &LiveRun,
+    runtime: &RuntimeConfig,
+    store: Option<&dyn TapeStore>,
+    rate_limits: OrderRateLimits,
+) -> Result<LiveReport, StartError> {
+    drive_with_control_and_rate_limits(run, runtime, store, &RunControl::default(), rate_limits)
+        .await
+}
+
 pub async fn drive_with_control(
     run: &LiveRun,
     runtime: &RuntimeConfig,
     store: Option<&dyn TapeStore>,
     control: &RunControl,
+) -> Result<LiveReport, StartError> {
+    drive_with_control_and_rate_limits(run, runtime, store, control, OrderRateLimits::default())
+        .await
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the live run owns one ordered risk, tape, storage, and shutdown lifecycle"
+)]
+async fn drive_with_control_and_rate_limits(
+    run: &LiveRun,
+    runtime: &RuntimeConfig,
+    store: Option<&dyn TapeStore>,
+    control: &RunControl,
+    rate_limits: OrderRateLimits,
 ) -> Result<LiveReport, StartError> {
     let effective_limits_by_strategy: HashMap<_, _> = run
         .strategies()
@@ -342,7 +468,15 @@ pub async fn drive_with_control(
     let feed = MergedFeed::from_tasks(FeedMode::Live, sources(run, &strategies), None);
     let merge = tokio::spawn(async move { feed.forward(event_tx).await });
     let mut tape = LiveTape::open(run, runtime)?;
+    let mut order_rate_state = OrderRateState::default();
     if let Some(store) = store {
+        let submissions = accepted_submissions(store, &scope, run.strategies())
+            .await
+            .map_err(|source| StartError::Storage {
+                run: run.id().clone(),
+                source,
+            })?;
+        order_rate_state.restore(rate_limits, submissions);
         recover_intents(run, runtime, store, &scope).await?;
     }
 
@@ -442,11 +576,22 @@ pub async fn drive_with_control(
                             source,
                         })?;
                 }
-                let mut verdicts: Vec<crate::causal::ActionRiskVerdict> = Vec::new();
                 for instance in &mut *strategies {
                     if instance.market != *market {
                         continue;
                     }
+                    let identity = CausalIdentity {
+                        scope: scope.clone(),
+                        correlation_id: strategy_correlation_id(
+                            &instance.id,
+                            market,
+                            *timestamp_ms,
+                        ),
+                        source_timestamp_ms: *timestamp_ms,
+                        ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
+                            .unwrap_or(i64::MAX),
+                    };
+                    let mut verdicts: Vec<crate::causal::ActionRiskVerdict> = Vec::new();
                     let effective_limits = effective_limits_by_strategy
                         .get(&instance.id)
                         .map_or(&limits, |effective_limits| effective_limits);
@@ -461,12 +606,13 @@ pub async fn drive_with_control(
                     if let Ok(actions) = instance.strategy.on_event(context) {
                         for (action_index, action) in actions.as_slice().iter().enumerate() {
                             if let Action::Place(order) = action {
+                                let action_index = u32::try_from(action_index).unwrap_or(u32::MAX);
                                 if open_orders.len() >= max_open_orders {
                                     open_orders = reconcile_open_orders(run, runtime).await?;
                                 }
                                 if open_orders.len() >= max_open_orders {
                                     verdicts.push(crate::causal::ActionRiskVerdict::rejected(
-                                        u32::try_from(action_index).unwrap_or(u32::MAX),
+                                        action_index,
                                         "open order capacity",
                                     ));
                                     rejected += 1;
@@ -507,31 +653,33 @@ pub async fn drive_with_control(
                                     })
                                 {
                                     verdicts.push(crate::causal::ActionRiskVerdict::rejected(
-                                        u32::try_from(action_index).unwrap_or(u32::MAX),
+                                        action_index,
                                         "risk gate",
                                     ));
                                     rejected += 1;
                                     continue;
                                 }
-                                let identity = CausalIdentity {
-                                    scope: scope.clone(),
-                                    correlation_id: format!("{market:?}:{timestamp_ms}"),
-                                    source_timestamp_ms: envelope.metadata.source_time_ms,
-                                    ingest_sequence: i64::try_from(
-                                        envelope.metadata.ingest_sequence,
-                                    )
-                                    .unwrap_or(i64::MAX),
-                                };
-                                verdicts.push(crate::causal::ActionRiskVerdict::accepted(
-                                    u32::try_from(action_index).unwrap_or(u32::MAX),
-                                ));
+                                if !order_rate_state.try_accept(
+                                    &instance.id,
+                                    *timestamp_ms,
+                                    rate_limits,
+                                ) {
+                                    verdicts.push(crate::causal::ActionRiskVerdict::rejected(
+                                        action_index,
+                                        "order submission rate limit",
+                                    ));
+                                    rejected += 1;
+                                    continue;
+                                }
+                                verdicts
+                                    .push(crate::causal::ActionRiskVerdict::accepted(action_index));
                                 let placement = place_order(
                                     store,
                                     executor.as_ref(),
                                     order,
                                     *timestamp_ms,
                                     &identity,
-                                    u32::try_from(action_index).unwrap_or(u32::MAX),
+                                    action_index,
                                 )
                                 .await;
                                 match placement {
@@ -567,29 +715,24 @@ pub async fn drive_with_control(
                             }
                         }
                     }
-                }
-                if let Some(store) = store {
-                    let identity = CausalIdentity {
-                        scope: scope.clone(),
-                        correlation_id: format!("{market:?}:{timestamp_ms}"),
-                        source_timestamp_ms: envelope.metadata.source_time_ms,
-                        ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
-                            .unwrap_or(i64::MAX),
-                    };
-                    let snapshot =
-                        crate::causal::DecisionSnapshot::from_book(&book, cex_metrics.snapshot());
-                    let decision = if verdicts.is_empty() {
-                        crate::causal::DecisionKind::NoAction
-                    } else {
-                        crate::causal::DecisionKind::Actions(verdicts)
-                    };
-                    crate::causal::CausalRecorder::new(store)
-                        .record_evaluation(&identity, &snapshot, decision)
-                        .await
-                        .map_err(|source| StartError::Storage {
-                            run: run.id().clone(),
-                            source,
-                        })?;
+                    if let Some(store) = store {
+                        let snapshot = crate::causal::DecisionSnapshot::from_book(
+                            &book,
+                            cex_metrics.snapshot(),
+                        );
+                        let decision = if verdicts.is_empty() {
+                            crate::causal::DecisionKind::NoAction
+                        } else {
+                            crate::causal::DecisionKind::Actions(verdicts)
+                        };
+                        crate::causal::CausalRecorder::new(store)
+                            .record_evaluation(&identity, &snapshot, decision)
+                            .await
+                            .map_err(|source| StartError::Storage {
+                                run: run.id().clone(),
+                                source,
+                            })?;
+                    }
                 }
             }
             MarketEvent::Fill { .. } if !account_ledger_authoritative => {
@@ -811,6 +954,186 @@ mod recovery_tests {
             assert_eq!(unresolved, 1, "case: {name}");
             store.delete_database()?;
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::{OrderRateLimits, drive_with_rate_limits};
+    use crate::test_support::{config, risk};
+    use async_trait::async_trait;
+    use pmkit_book::Side;
+    use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
+    use pmkit_data::{DataSourceError, LiveDataSource, SourceSignal};
+    use pmkit_event::MarketEvent;
+    use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
+    use pmkit_market::Outcome;
+    use pmkit_runtime::StrategyRegistration;
+    use pmkit_spec::LiveRun;
+    use pmkit_store::TursoTapeStore;
+    use pmkit_strategy::{
+        Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
+    };
+    use rust_decimal::Decimal;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::mpsc::Sender;
+
+    #[derive(Default)]
+    struct RateExecutor {
+        submissions: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Executor for RateExecutor {
+        async fn preflight(&self) -> Result<ExecutionSnapshot, ExecError> {
+            Ok(ExecutionSnapshot::default())
+        }
+
+        async fn reconcile(&self) -> Result<ExecutionSnapshot, ExecError> {
+            Ok(ExecutionSnapshot::default())
+        }
+
+        async fn submit(&self, _order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
+            let sequence = self.submissions.fetch_add(1, Ordering::Relaxed);
+            Ok(OrderId(format!("rate-{sequence}")))
+        }
+
+        async fn cancel(&self, _order_id: &OrderId) -> Result<(), ExecError> {
+            Ok(())
+        }
+
+        async fn cancel_all(&self) -> Result<(), ExecError> {
+            Ok(())
+        }
+    }
+
+    struct RateSource {
+        timestamps_ms: Vec<i64>,
+    }
+
+    #[async_trait]
+    impl LiveDataSource for RateSource {
+        async fn subscribe(
+            &self,
+            market: MarketId,
+            outcome: Outcome,
+            sink: Sender<SourceSignal>,
+        ) -> Result<(), DataSourceError> {
+            if outcome == Outcome::Up {
+                for &timestamp_ms in &self.timestamps_ms {
+                    sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
+                        market: market.clone(),
+                        outcome,
+                        bids: vec![(Decimal::new(49, 2), Decimal::from(50))],
+                        asks: vec![(Decimal::new(51, 2), Decimal::from(50))],
+                        timestamp_ms,
+                    }))
+                    .await
+                    .map_err(|_| DataSourceError::SinkClosed)?;
+                }
+            }
+            sink.send(SourceSignal::Watermark(i64::MAX))
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)?;
+            sink.send(SourceSignal::Eof)
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)?;
+            Ok(())
+        }
+    }
+
+    struct RateStrategy;
+
+    impl Strategy for RateStrategy {
+        fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+            Ok(Actions::place(PlaceOrder {
+                market: context.market.clone(),
+                outcome: Outcome::Up,
+                side: Side::Buy,
+                price: Decimal::new(50, 2),
+                qty: Decimal::from(10),
+                post_only: false,
+            }))
+        }
+    }
+
+    struct RateFactory;
+
+    impl StrategyFactory for RateFactory {
+        fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+            Ok(Box::new(RateStrategy))
+        }
+    }
+
+    fn rate_run(
+        run_id: &str,
+        timestamps_ms: Vec<i64>,
+        executor: Arc<RateExecutor>,
+    ) -> Result<LiveRun, Box<dyn std::error::Error>> {
+        Ok(LiveRun::new(
+            RunId::new(run_id)?,
+            PortfolioId::new("rate-portfolio")?,
+            executor,
+            Arc::new(RateSource { timestamps_ms }),
+            risk()?,
+        )
+        .strategy(StrategyRegistration::new(
+            StrategyId::new("rate-strategy")?,
+            MarketId::new("btc-5m")?,
+            Arc::new(RateFactory),
+        )))
+    }
+
+    #[tokio::test]
+    async fn rate_limit_allows_within_window() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: two orders inside a logical-time window whose limit is two.
+        let executor = Arc::new(RateExecutor::default());
+        let run = rate_run("rate-burst", vec![1_000, 1_050], Arc::clone(&executor))?;
+        let rate_limits = OrderRateLimits::new(2, 2, 100).ok_or("invalid rate limits")?;
+
+        // When: the live risk gate evaluates the burst.
+        let report = drive_with_rate_limits(&run, &config()?, None, rate_limits).await?;
+
+        // Then: every order within the configured allowance reaches the executor.
+        assert_eq!(executor.submissions.load(Ordering::Relaxed), 2);
+        assert_eq!(report.rejected, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
+    async fn rate_limit_rejects_over_and_survives_restart() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Given: two accepted submissions durably recorded in [1_000, 1_100].
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("live-rate-restart.db");
+        let store = TursoTapeStore::open_local(&path).await?;
+        let rate_limits = OrderRateLimits::new(2, 2, 100).ok_or("invalid rate limits")?;
+        let first_executor = Arc::new(RateExecutor::default());
+        let first_run = rate_run(
+            "rate-restart",
+            vec![1_000, 1_050],
+            Arc::clone(&first_executor),
+        )?;
+        drive_with_rate_limits(&first_run, &config()?, Some(&store), rate_limits).await?;
+
+        // When: a restarted driver sees one order at the inclusive end and one after it.
+        let restarted_executor = Arc::new(RateExecutor::default());
+        let restarted_run = rate_run(
+            "rate-restart",
+            vec![1_100, 1_101],
+            Arc::clone(&restarted_executor),
+        )?;
+        let report =
+            drive_with_rate_limits(&restarted_run, &config()?, Some(&store), rate_limits).await?;
+
+        // Then: N+1 is rejected and counted; the next logical millisecond resets the window.
+        assert_eq!(first_executor.submissions.load(Ordering::Relaxed), 2);
+        assert_eq!(restarted_executor.submissions.load(Ordering::Relaxed), 1);
+        assert_eq!(report.rejected, 1);
+        store.delete_database()?;
         Ok(())
     }
 }

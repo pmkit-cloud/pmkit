@@ -157,3 +157,21 @@
   passes the selected plain `RiskLimits` to `passes_aggregated_risk`. Todo 14
   can add its rate state alongside that map; Todo 15 should keep replaying into
   the existing `LiveRiskState` and leave override configuration non-durable.
+
+## 2026-07-24 - Restart-safe logical-time order rate limits
+
+- `OrderRateLimits` is the live-risk companion spec: 100 accepted submissions
+  per strategy and 1,000 per portfolio in a 60,000-ms logical window by
+  default. `OrderRateState` anchors each fixed window at its first accepted
+  event timestamp and includes the exact end (`start + duration`); only a
+  later timestamp opens a new window.
+- The limiter runs only in the `Action::Place` branch after open-order capacity
+  and Todo-13 effective limits pass. A denied submission gets the durable
+  `order submission rate limit` risk verdict and increments `rejected`; market
+  data and intent reconciliation never call the limiter.
+- Live decision identities are strategy-scoped. Startup reconstructs accepted
+  logical timestamps from accepted durable decision verdicts plus pending and
+  unknown intents, deduplicated by causal action identity, then replays them in
+  timestamp order so only the latest fixed window remains in memory. Todo 15
+  should preserve this decision/intent replay before reconciliation; Todo 22
+  can read the portfolio window without making it a second durable authority.

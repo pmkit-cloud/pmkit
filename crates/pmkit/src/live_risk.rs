@@ -1,5 +1,5 @@
 use pmkit_book::Position;
-use pmkit_core::MarketId;
+use pmkit_core::{MarketId, StrategyId};
 use pmkit_event::{MarketEvent, PmAccountEvent};
 use pmkit_exec::PlaceOrder;
 use pmkit_market::Outcome;
@@ -97,6 +97,139 @@ type FillIdentity = (
     i64,
 );
 type SettlementIdentity = (MarketId, Outcome, Decimal, Decimal, i64);
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct OrderRateLimits {
+    max_per_strategy: u32,
+    max_per_portfolio: u32,
+    window_duration_ms: i64,
+}
+
+impl OrderRateLimits {
+    #[cfg(test)]
+    pub(super) const fn new(
+        max_per_strategy: u32,
+        max_per_portfolio: u32,
+        window_duration_ms: i64,
+    ) -> Option<Self> {
+        if max_per_strategy == 0 || max_per_portfolio == 0 || window_duration_ms <= 0 {
+            return None;
+        }
+        Some(Self {
+            max_per_strategy,
+            max_per_portfolio,
+            window_duration_ms,
+        })
+    }
+}
+
+impl Default for OrderRateLimits {
+    fn default() -> Self {
+        Self {
+            max_per_strategy: 100,
+            max_per_portfolio: 1_000,
+            window_duration_ms: 60_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FixedOrderWindow {
+    started_at_ms: i64,
+    accepted: u32,
+}
+
+impl FixedOrderWindow {
+    const fn has_capacity(self, timestamp_ms: i64, duration_ms: i64, maximum: u32) -> bool {
+        timestamp_ms > self.started_at_ms.saturating_add(duration_ms) || self.accepted < maximum
+    }
+
+    const fn record(&mut self, timestamp_ms: i64, duration_ms: i64) {
+        if timestamp_ms > self.started_at_ms.saturating_add(duration_ms) {
+            self.started_at_ms = timestamp_ms;
+            self.accepted = 1;
+        } else {
+            self.accepted = self.accepted.saturating_add(1);
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct OrderRateState {
+    portfolio: Option<FixedOrderWindow>,
+    per_strategy: HashMap<StrategyId, FixedOrderWindow>,
+}
+
+impl OrderRateState {
+    pub(super) fn restore(
+        &mut self,
+        limits: OrderRateLimits,
+        mut accepted: Vec<(Option<StrategyId>, i64)>,
+    ) {
+        accepted.sort_by_key(|(_, timestamp_ms)| *timestamp_ms);
+        for (strategy, timestamp_ms) in accepted {
+            self.record_portfolio(timestamp_ms, limits.window_duration_ms);
+            if let Some(strategy) = strategy {
+                self.record_strategy(strategy, timestamp_ms, limits.window_duration_ms);
+            }
+        }
+    }
+
+    pub(super) fn try_accept(
+        &mut self,
+        strategy: &StrategyId,
+        timestamp_ms: i64,
+        limits: OrderRateLimits,
+    ) -> bool {
+        let portfolio_has_capacity = self.portfolio.is_none_or(|window| {
+            window.has_capacity(
+                timestamp_ms,
+                limits.window_duration_ms,
+                limits.max_per_portfolio,
+            )
+        });
+        let strategy_has_capacity = self.per_strategy.get(strategy).is_none_or(|window| {
+            window.has_capacity(
+                timestamp_ms,
+                limits.window_duration_ms,
+                limits.max_per_strategy,
+            )
+        });
+        if !portfolio_has_capacity || !strategy_has_capacity {
+            return false;
+        }
+        self.record_portfolio(timestamp_ms, limits.window_duration_ms);
+        self.record_strategy(strategy.clone(), timestamp_ms, limits.window_duration_ms);
+        true
+    }
+
+    const fn record_portfolio(&mut self, timestamp_ms: i64, duration_ms: i64) {
+        match &mut self.portfolio {
+            Some(window) => window.record(timestamp_ms, duration_ms),
+            None => {
+                self.portfolio = Some(FixedOrderWindow {
+                    started_at_ms: timestamp_ms,
+                    accepted: 1,
+                });
+            }
+        }
+    }
+
+    fn record_strategy(&mut self, strategy: StrategyId, timestamp_ms: i64, duration_ms: i64) {
+        match self.per_strategy.get_mut(&strategy) {
+            Some(window) => window.record(timestamp_ms, duration_ms),
+            None => {
+                self.per_strategy.insert(
+                    strategy,
+                    FixedOrderWindow {
+                        started_at_ms: timestamp_ms,
+                        accepted: 1,
+                    },
+                );
+            }
+        }
+    }
+}
 
 #[derive(Default)]
 pub(super) struct LiveRiskState {
