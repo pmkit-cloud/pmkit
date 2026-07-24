@@ -14,9 +14,9 @@ use crate::{
     local_files::{remove_database, restrict_permissions},
     migrations::{MIGRATIONS, apply},
     schema::{
-        INSERT_DECISION, INSERT_ENVELOPE, INSERT_PENDING_INTENT, READ_DECISIONS, READ_ENVELOPES,
-        READ_KILL_STATE, READ_PENDING_INTENTS, READ_UNKNOWN_INTENTS, TRANSITION_PENDING_INTENT,
-        UPSERT_KILL_STATE,
+        CAUSAL_DECISION_SCHEMA_VERSION, DURABLE_INTENT_SCHEMA_VERSION, INSERT_DECISION,
+        INSERT_ENVELOPE, INSERT_PENDING_INTENT, READ_DECISIONS, READ_ENVELOPES, READ_KILL_STATE,
+        READ_PENDING_INTENTS, READ_UNKNOWN_INTENTS, TRANSITION_PENDING_INTENT, UPSERT_KILL_STATE,
     },
 };
 
@@ -178,6 +178,7 @@ impl TapeStore for TursoTapeStore {
                 INSERT_DECISION,
                 causal_params(
                     &decision.identity,
+                    CAUSAL_DECISION_SCHEMA_VERSION,
                     serde_json::to_string(&decision.payload).map_err(|error| json_error(&error))?,
                 ),
             )
@@ -199,6 +200,7 @@ impl TapeStore for TursoTapeStore {
                 INSERT_PENDING_INTENT,
                 causal_params(
                     identity,
+                    DURABLE_INTENT_SCHEMA_VERSION,
                     serde_json::to_string(payload).map_err(|error| json_error(&error))?,
                 ),
             )
@@ -298,7 +300,12 @@ impl TapeStore for TursoTapeStore {
             let correlation_id: String = row.get(2)?;
             let source_timestamp_ms: i64 = row.get(3)?;
             let ingest_sequence: i64 = row.get(4)?;
-            let payload_json: String = row.get(5)?;
+            ensure_supported_record_schema_version(
+                "causal_decisions",
+                row.get(5)?,
+                CAUSAL_DECISION_SCHEMA_VERSION,
+            )?;
+            let payload_json: String = row.get(6)?;
             decisions.push(CausalDecision {
                 identity: CausalIdentity {
                     scope: OwnerScope::new(portfolio_id, run_id),
@@ -373,7 +380,12 @@ async fn read_intents_by_state(
         let correlation_id: String = row.get(2)?;
         let source_timestamp_ms: i64 = row.get(3)?;
         let ingest_sequence: i64 = row.get(4)?;
-        let payload_json: String = row.get(5)?;
+        ensure_supported_record_schema_version(
+            "durable_intents",
+            row.get(5)?,
+            DURABLE_INTENT_SCHEMA_VERSION,
+        )?;
+        let payload_json: String = row.get(6)?;
         intents.push(DurableIntent {
             identity: CausalIdentity {
                 scope: OwnerScope::new(portfolio_id, run_id),
@@ -389,16 +401,33 @@ async fn read_intents_by_state(
 
 fn causal_params(
     identity: &CausalIdentity,
+    schema_version: i64,
     payload_json: String,
-) -> (String, String, &str, i64, i64, String) {
+) -> (String, String, &str, i64, i64, i64, String) {
     (
         identity.scope.portfolio_id.to_string(),
         identity.scope.run_id.to_string(),
         identity.correlation_id.as_str(),
         identity.source_timestamp_ms,
         identity.ingest_sequence,
+        schema_version,
         payload_json,
     )
+}
+
+const fn ensure_supported_record_schema_version(
+    record_type: &'static str,
+    schema_version: i64,
+    max_supported_version: i64,
+) -> Result<(), StoreError> {
+    if schema_version != max_supported_version {
+        return Err(StoreError::UnsupportedRecordSchemaVersion {
+            record_type,
+            schema_version,
+            max_supported_version,
+        });
+    }
+    Ok(())
 }
 
 fn json_error(error: &serde_json::Error) -> StoreError {

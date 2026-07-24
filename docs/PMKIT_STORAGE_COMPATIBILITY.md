@@ -11,6 +11,12 @@ they must not silently deserialize an unknown shape or substitute defaults.
 Raw frames and normalized hashes remain immutable evidence for every stored
 envelope.
 
+`causal_decisions.schema_version` and `durable_intents.schema_version` version
+their stored records independently of `payload_json`. Both current record
+versions are `1`; writers persist that version explicitly, and readers return a
+typed `StoreError::UnsupportedRecordSchemaVersion` instead of skipping a row
+whose version they cannot decode. The JSON payload shape is unchanged.
+
 ## Database schema migrations
 
 `TursoTapeStore::open_local` reads `schema_migrations`, whose rows contain a
@@ -20,6 +26,11 @@ migration; the schema changes and version row commit together or roll back
 together. A fresh database and a legacy database created by the former
 `CREATE TABLE IF NOT EXISTS` bootstrap both begin at version `0` and follow the
 same migration path to the current version.
+
+Database migration version `2` adds non-null `schema_version` columns to
+`causal_decisions` and `durable_intents`, each with default `1`. SQLite applies
+that default to pre-column legacy rows, so their existing payloads and causal
+identities remain unchanged while becoming explicit version-1 records.
 
 Opening fails with a typed `StoreError` when the newest on-disk version exceeds
 the binary's maximum supported version. PMKit never auto-downgrades a database.

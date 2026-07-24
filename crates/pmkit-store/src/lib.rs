@@ -44,6 +44,9 @@ mod tests;
 mod migration_tests;
 
 #[cfg(test)]
+mod record_version_tests;
+
+#[cfg(test)]
 mod chain_tests;
 
 pub use bundle::{CacheChecksum, REPLAY_BUNDLE_VERSION, export_replay_bundle};
@@ -83,6 +86,18 @@ pub enum StoreError {
         /// The newest migration recorded on disk.
         database_version: i64,
         /// The newest migration known to this binary.
+        max_supported_version: i64,
+    },
+    /// A causal decision or durable intent uses a record version this binary cannot decode.
+    #[error(
+        "{record_type} schema version {schema_version} is unsupported; maximum supported version is {max_supported_version}"
+    )]
+    UnsupportedRecordSchemaVersion {
+        /// The durable table containing the unsupported record.
+        record_type: &'static str,
+        /// The record schema version stored on disk.
+        schema_version: i64,
+        /// The newest record schema version this binary can decode.
         max_supported_version: i64,
     },
     /// A source identity already exists in its owner scope.

@@ -1,5 +1,7 @@
 pub const PM_ENVELOPE_VERSION: i64 = 1;
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+pub const CAUSAL_DECISION_SCHEMA_VERSION: i64 = 1;
+pub const DURABLE_INTENT_SCHEMA_VERSION: i64 = 1;
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 pub const CREATE_SCHEMA_MIGRATIONS: &str = "
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -101,14 +103,14 @@ LIMIT ?7";
 
 pub const INSERT_DECISION: &str = "
 INSERT INTO causal_decisions (
-    portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence, payload_json
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+    portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence, schema_version, payload_json
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
 ON CONFLICT DO NOTHING";
 
 pub const INSERT_PENDING_INTENT: &str = "
 INSERT INTO durable_intents (
-    portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence, state, payload_json
-) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)
+    portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence, schema_version, state, payload_json
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)
 ON CONFLICT DO NOTHING";
 
 pub const TRANSITION_PENDING_INTENT: &str = "
@@ -155,19 +157,19 @@ WHERE chain_id = ?1
 ORDER BY block_number DESC, transaction_index DESC, log_index DESC LIMIT 1";
 
 pub const READ_PENDING_INTENTS: &str = "
-SELECT portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence, payload_json
+SELECT portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence, schema_version, payload_json
 FROM durable_intents
 WHERE portfolio_id = ?1 AND run_id = ?2 AND state = 'pending'
 ORDER BY source_timestamp_ms, ingest_sequence";
 
 pub const READ_UNKNOWN_INTENTS: &str = "
-SELECT portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence, payload_json
+SELECT portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence, schema_version, payload_json
 FROM durable_intents
 WHERE portfolio_id = ?1 AND run_id = ?2 AND state = 'unknown'
 ORDER BY source_timestamp_ms, ingest_sequence";
 
 pub const READ_DECISIONS: &str = "
-SELECT portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence, payload_json
+SELECT portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence, schema_version, payload_json
 FROM causal_decisions
 WHERE portfolio_id = ?1 AND run_id = ?2
 ORDER BY source_timestamp_ms, ingest_sequence";

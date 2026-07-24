@@ -18,10 +18,19 @@ impl Migration {
     }
 }
 
-const INITIAL_MIGRATION: Migration =
-    Migration::new(CURRENT_SCHEMA_VERSION, &[CREATE_SCHEMA_MIGRATIONS, SCHEMA]);
+const INITIAL_MIGRATION: Migration = Migration::new(1, &[CREATE_SCHEMA_MIGRATIONS, SCHEMA]);
 
-pub const MIGRATIONS: &[Migration] = &[INITIAL_MIGRATION];
+const VERSIONED_CAUSAL_RECORDS_MIGRATION: Migration = Migration::new(
+    2,
+    &[
+        "ALTER TABLE causal_decisions ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE durable_intents ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1",
+    ],
+);
+
+const _: () = assert!(CURRENT_SCHEMA_VERSION == VERSIONED_CAUSAL_RECORDS_MIGRATION.version);
+
+pub const MIGRATIONS: &[Migration] = &[INITIAL_MIGRATION, VERSIONED_CAUSAL_RECORDS_MIGRATION];
 
 pub async fn apply(
     connection: &turso::Connection,
