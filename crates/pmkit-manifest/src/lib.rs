@@ -23,6 +23,7 @@ pub fn build_manifest(run: &RunSpec, config: &RuntimeConfig) -> Value {
             "portfolio": backtest.portfolio().to_string(),
             "initial_cash": backtest.initial_cash().as_decimal().to_string(),
             "risk": risk_json(backtest.risk()),
+            "simulation": simulation_json(backtest.simulation()),
             "strategies": strategies_json(backtest.strategies()),
             "replay": {
                 "from": backtest.replay().from().to_rfc3339(),
@@ -37,6 +38,7 @@ pub fn build_manifest(run: &RunSpec, config: &RuntimeConfig) -> Value {
             "portfolio": paper.portfolio().to_string(),
             "initial_cash": paper.initial_cash().as_decimal().to_string(),
             "risk": risk_json(paper.risk()),
+            "simulation": simulation_json(paper.simulation()),
             "strategies": strategies_json(paper.strategies()),
             "runtime": runtime,
         }),
@@ -51,12 +53,25 @@ pub fn build_manifest(run: &RunSpec, config: &RuntimeConfig) -> Value {
     }
 }
 
+fn simulation_json(config: &pmkit_spec::ConservativeV1Config) -> Value {
+    json!({
+        "activation_latency_ms": config.activation_latency.as_millis(),
+        "maker_queue_ahead_bps": config.maker_queue_ahead_bps,
+        "slippage_bps": config.slippage_bps,
+        "market_impact_bps": config.market_impact_bps,
+    })
+}
+
 fn risk_json(risk: &RiskLimits) -> Value {
     json!({
         "max_order_notional": risk.max_order_notional.as_decimal().to_string(),
         "max_position_notional": risk.max_position_notional.as_decimal().to_string(),
+        "max_portfolio_notional": risk.max_portfolio_notional.as_decimal().to_string(),
+        "max_market_notional": risk.max_market_notional.as_decimal().to_string(),
+        "max_strategy_notional": risk.max_strategy_notional.as_decimal().to_string(),
         "max_open_orders": risk.max_open_orders.get(),
         "max_loss": risk.max_loss.as_decimal().to_string(),
+        "max_daily_loss": risk.max_daily_loss.as_decimal().to_string(),
     })
 }
 
@@ -157,11 +172,18 @@ mod tests {
             RiskLimits {
                 max_order_notional: Money::usdc(100),
                 max_position_notional: Money::usdc(1_000),
+                max_portfolio_notional: Money::usdc(5_000),
+                max_market_notional: Money::usdc(2_000),
+                max_strategy_notional: Money::usdc(1_000),
                 max_open_orders: NonZeroU32::new(10).ok_or("nonzero")?,
                 max_loss: Money::usdc(500),
+                max_daily_loss: Money::usdc(500),
             },
             ConservativeV1Config {
                 activation_latency: Duration::ZERO,
+                maker_queue_ahead_bps: 0,
+                slippage_bps: 0,
+                market_impact_bps: 0,
             },
         )
         .strategy(StrategyRegistration::new(
