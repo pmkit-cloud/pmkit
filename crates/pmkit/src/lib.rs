@@ -19,6 +19,9 @@ mod paper;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tokio::sync::mpsc;
 
 use pmkit_core::{MarketId, RunId, StrategyId};
 use pmkit_data::SourceSignal;
@@ -149,6 +152,77 @@ pub enum RuntimeError {
     UnknownRun(RunId),
 }
 
+/// A cooperative cancellation token shared with a started engine.
+///
+/// Cloneable. Calling [`Cancellation::cancel`] stops each run at its next event
+/// boundary; a cancelled run still returns its partial report and, for live
+/// runs, still applies its configured shutdown policy.
+#[derive(Debug, Clone, Default)]
+pub struct Cancellation {
+    flag: Arc<AtomicBool>,
+}
+
+impl Cancellation {
+    /// Creates an uncancelled token.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Requests cancellation of every run sharing this token.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+    /// Returns `true` once cancellation has been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+}
+
+/// A lifecycle transition observed for one run.
+///
+/// Carries run identity only, never executor or storage internals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunLifecycleEvent {
+    /// The run began consuming its feed.
+    Started {
+        /// The run this event belongs to.
+        run: RunId,
+    },
+    /// The run finished its feed normally.
+    Completed {
+        /// The run this event belongs to.
+        run: RunId,
+    },
+    /// The run stopped early because cancellation was requested.
+    Cancelled {
+        /// The run this event belongs to.
+        run: RunId,
+    },
+}
+
+/// Per-start control shared with every driver: cancellation and lifecycle
+/// subscription.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RunControl {
+    cancel: Option<Cancellation>,
+    subscriber: Option<mpsc::UnboundedSender<RunLifecycleEvent>>,
+}
+
+impl RunControl {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(Cancellation::is_cancelled)
+    }
+
+    pub(crate) fn emit(&self, event: RunLifecycleEvent) {
+        if let Some(subscriber) = &self.subscriber {
+            let _ = subscriber.send(event);
+        }
+    }
+}
+
 /// Entry point to the engine.
 #[derive(Debug)]
 pub struct Pmkit;
@@ -162,6 +236,8 @@ impl Pmkit {
             runs: Vec::new(),
             consent: None,
             store: None,
+            cancel: None,
+            subscriber: None,
         }
     }
 }
@@ -172,6 +248,8 @@ pub struct PmkitBuilder {
     runs: Vec<RunSpec>,
     consent: Option<LiveConsent>,
     store: Option<Arc<dyn TapeStore>>,
+    cancel: Option<Cancellation>,
+    subscriber: Option<mpsc::UnboundedSender<RunLifecycleEvent>>,
 }
 
 impl std::fmt::Debug for PmkitBuilder {
@@ -182,6 +260,11 @@ impl std::fmt::Debug for PmkitBuilder {
             .field("runs", &self.runs)
             .field("consent", &self.consent)
             .field("store", &self.store.as_ref().map(|_| "configured"))
+            .field("cancel", &self.cancel)
+            .field(
+                "subscriber",
+                &self.subscriber.as_ref().map(|_| "subscribed"),
+            )
             .finish()
     }
 }
@@ -208,6 +291,20 @@ impl PmkitBuilder {
         self
     }
 
+    /// Shares a cancellation token with every run this engine starts.
+    #[must_use]
+    pub fn cancellation(mut self, cancellation: Cancellation) -> Self {
+        self.cancel = Some(cancellation);
+        self
+    }
+
+    /// Subscribes to run lifecycle events for every run this engine starts.
+    #[must_use]
+    pub fn subscribe(mut self, subscriber: mpsc::UnboundedSender<RunLifecycleEvent>) -> Self {
+        self.subscriber = Some(subscriber);
+        self
+    }
+
     /// Validates the topology and drives every run to completion.
     ///
     /// # Errors
@@ -221,7 +318,10 @@ impl PmkitBuilder {
             runs,
             consent,
             store,
+            cancel,
+            subscriber,
         } = self;
+        let control = RunControl { cancel, subscriber };
 
         let mut seen = HashSet::new();
         for spec in &runs {
@@ -238,18 +338,21 @@ impl PmkitBuilder {
             let manifest_id = run_id_of(&spec).clone();
             match spec {
                 RunSpec::Backtest(run) => {
-                    let report = backtest::drive(&run, store.as_deref()).await?;
+                    let report =
+                        backtest::drive_with_control(&run, store.as_deref(), &control).await?;
                     reports.insert(run.id().clone(), RunReport::Backtest(report));
                 }
                 RunSpec::Paper(run) => {
-                    let report = paper::drive(&run, store.as_deref()).await?;
+                    let report =
+                        paper::drive_with_control(&run, store.as_deref(), &control).await?;
                     reports.insert(run.id().clone(), RunReport::Paper(report));
                 }
                 RunSpec::Live(run) => {
                     if consent.is_none() {
                         return Err(StartError::LiveConsentMissing(run.id().clone()));
                     }
-                    let report = live::drive_with_store(&run, &config, store.as_deref()).await?;
+                    let report =
+                        live::drive_with_control(&run, &config, store.as_deref(), &control).await?;
                     reports.insert(run.id().clone(), RunReport::Live(report));
                 }
             }

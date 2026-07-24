@@ -1,6 +1,6 @@
 use super::{
-    LiveReport, StartError, StrategyInstance, instantiate_strategies,
-    store_signal as persist_signal,
+    LiveReport, RunControl, RunLifecycleEvent, StartError, StrategyInstance,
+    instantiate_strategies, store_signal as persist_signal,
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_book::OrderBookL2;
@@ -270,14 +270,24 @@ async fn place_order(
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the live run owns one ordered risk, tape, storage, and shutdown lifecycle"
-)]
+#[cfg(test)]
 pub async fn drive_with_store(
     run: &LiveRun,
     runtime: &RuntimeConfig,
     store: Option<&dyn TapeStore>,
+) -> Result<LiveReport, StartError> {
+    drive_with_control(run, runtime, store, &RunControl::default()).await
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the live run owns one ordered risk, tape, storage, and shutdown lifecycle"
+)]
+pub async fn drive_with_control(
+    run: &LiveRun,
+    runtime: &RuntimeConfig,
+    store: Option<&dyn TapeStore>,
+    control: &RunControl,
 ) -> Result<LiveReport, StartError> {
     let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
     let executor = run.executor().clone();
@@ -310,7 +320,36 @@ pub async fn drive_with_store(
     let mut fills = 0_usize;
     let mut rejected = 0_usize;
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
+    control.emit(RunLifecycleEvent::Started {
+        run: run.id().clone(),
+    });
+    if control.is_cancelled() {
+        control.emit(RunLifecycleEvent::Cancelled {
+            run: run.id().clone(),
+        });
+        return finish(
+            run,
+            runtime,
+            &open_orders,
+            &mut tape,
+            [events_processed, fills, rejected],
+        )
+        .await;
+    }
     while let Some(merged) = event_rx.recv().await {
+        if control.is_cancelled() {
+            control.emit(RunLifecycleEvent::Cancelled {
+                run: run.id().clone(),
+            });
+            return finish(
+                run,
+                runtime,
+                &open_orders,
+                &mut tape,
+                [events_processed, fills, rejected],
+            )
+            .await;
+        }
         store_signal(
             run,
             store,
@@ -539,14 +578,18 @@ pub async fn drive_with_store(
             source,
         })?;
 
-    finish(
+    let report = finish(
         run,
         runtime,
         &open_orders,
         &mut tape,
         [events_processed, fills, rejected],
     )
-    .await
+    .await?;
+    control.emit(RunLifecycleEvent::Completed {
+        run: run.id().clone(),
+    });
+    Ok(report)
 }
 
 async fn finish(

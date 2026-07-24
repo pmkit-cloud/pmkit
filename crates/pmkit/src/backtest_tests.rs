@@ -1,5 +1,5 @@
 use crate::{
-    AppHandle, Pmkit, RunReport, RuntimeError,
+    AppHandle, Cancellation, Pmkit, RunLifecycleEvent, RunReport, RuntimeError,
     test_support::{BuyFactory, config, risk},
 };
 use async_trait::async_trait;
@@ -97,7 +97,7 @@ impl HistoricalDataSource for ScriptedHistory {
     }
 }
 
-async fn backtest_app() -> Result<AppHandle, Box<dyn std::error::Error>> {
+fn backtest_run() -> Result<BacktestRun, Box<dyn std::error::Error>> {
     let replay = ReplaySpec::new(
         Arc::new(ScriptedHistory { ticks: vec![1, 2] }),
         "2026-01-01T00:00:00Z".parse()?,
@@ -124,9 +124,13 @@ async fn backtest_app() -> Result<AppHandle, Box<dyn std::error::Error>> {
         MarketId::new("btc-5m")?,
         Arc::new(BuyFactory),
     ));
+    Ok(run)
+}
 
-    let runtime_config = config()?;
-    let app = Pmkit::builder(runtime_config).run(run).start().await?;
+async fn backtest_app() -> Result<AppHandle, Box<dyn std::error::Error>> {
+    let run = backtest_run()?;
+    let runtime = config()?;
+    let app = Pmkit::builder(runtime).run(run).start().await?;
     Ok(app)
 }
 
@@ -230,5 +234,47 @@ async fn backtest_records_one_decision_per_book_event() -> Result<(), Box<dyn st
     );
     drop(store);
     let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_before_start_stops_the_run() -> Result<(), Box<dyn std::error::Error>> {
+    let cancel = Cancellation::new();
+    cancel.cancel();
+    let app = Pmkit::builder(config()?)
+        .cancellation(cancel)
+        .run(backtest_run()?)
+        .start()
+        .await?;
+
+    let RunReport::Backtest(report) = app.wait_for(RunId::new("bt")?).await? else {
+        return Err("expected a backtest report".into());
+    };
+    // The run was cancelled before consuming any event.
+    assert_eq!(report.events_processed, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_events_are_published() -> Result<(), Box<dyn std::error::Error>> {
+    let (subscriber, mut events) = tokio::sync::mpsc::unbounded_channel();
+    Pmkit::builder(config()?)
+        .subscribe(subscriber)
+        .run(backtest_run()?)
+        .start()
+        .await?;
+
+    let mut observed = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        observed.push(event);
+    }
+    let run = RunId::new("bt")?;
+    assert_eq!(
+        observed,
+        vec![
+            RunLifecycleEvent::Started { run: run.clone() },
+            RunLifecycleEvent::Completed { run },
+        ]
+    );
     Ok(())
 }

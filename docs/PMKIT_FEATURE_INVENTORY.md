@@ -249,13 +249,15 @@ repository, not the long-term target.
 - Causal decision recording in all three modes.
 - Durable pending intent before live submission.
 - Accepted/rejected/unknown transitions and restart reconciliation by correlation ID.
+- Cooperative run cancellation via a shared `Cancellation` token and
+  `RunId`-scoped `RunLifecycleEvent` subscriptions, exposed on the builder
+  without leaking executor or storage internals.
 
 **Crate:** `pmkit`.
 
 ### Gaps
 
 - Configured backtest concurrency is currently sequential.
-- Run cancellation and runtime event subscriptions.
 - Structured runtime metrics.
 - CLI runner.
 
@@ -609,8 +611,11 @@ behavioral test and documentation update.
   `account_fill`, `position`), a single-market `Harness` that drives a strategy
   and returns its `Actions`, and action assertions (`assert_no_actions`,
   `assert_placed`, `assert_cancels_all`, `placed_orders`).
-- [ ] **P2-8: add run cancellation and event subscriptions.** Expose lifecycle
-  state without leaking executor or storage internals.
+- [x] **P2-8: add run cancellation and event subscriptions.** A shared
+  `Cancellation` token stops each run at its next event boundary (live runs
+  still route through their shutdown policy so owned orders are handled), and
+  builder `.subscribe(...)` publishes `RunId`-scoped `RunLifecycleEvent`s
+  (`Started`/`Completed`/`Cancelled`) with no executor or storage internals.
 - [ ] **P2-9: add typed CLI only after API stabilizes.** No dynamic plugin or
   untyped config protocol.
 - [ ] **P2-10: add replay bundle export.** Include manifest, raw PM evidence,
@@ -662,5 +667,8 @@ behavioral test and documentation update.
   and asserting its `Actions` against a deterministic scenario.
 - P2-7 adds `pmkit-strategy-testkit` (6 tests) driving a sample strategy through
   the harness with the builders and asserting via the action helpers.
-- P0-1 through P0-5, P1-1 through P1-16, and P2-1 through P2-7 were resolved
-  after review; P2-8 onward remains open.
+- P2-8 adds run cancellation and lifecycle subscriptions (pmkit tests cover a
+  pre-cancelled run stopping with zero events and a normal run publishing
+  `Started` then `Completed`).
+- P0-1 through P0-5, P1-1 through P1-16, and P2-1 through P2-8 were resolved
+  after review; P2-9 onward remains open.

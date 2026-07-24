@@ -1,6 +1,6 @@
 use super::{
-    BacktestReport, StartError, StrategyInstance, absorb_fills, instantiate_strategies,
-    store_signal,
+    BacktestReport, RunControl, RunLifecycleEvent, StartError, StrategyInstance, absorb_fills,
+    instantiate_strategies, store_signal,
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_book::OrderBookL2;
@@ -15,9 +15,10 @@ use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
     clippy::too_many_lines,
     reason = "the backtest owns one ordered replay, sim, strategy, and recording loop"
 )]
-pub async fn drive(
+pub async fn drive_with_control(
     run: &BacktestRun,
     store: Option<&dyn TapeStore>,
+    control: &RunControl,
 ) -> Result<BacktestReport, StartError> {
     let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
 
@@ -75,8 +76,31 @@ pub async fn drive(
     let mut fills = 0_usize;
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
+    control.emit(RunLifecycleEvent::Started {
+        run: run.id().clone(),
+    });
+    if control.is_cancelled() {
+        control.emit(RunLifecycleEvent::Cancelled {
+            run: run.id().clone(),
+        });
+        return Ok(BacktestReport {
+            run: run.id().clone(),
+            events_processed,
+            fills,
+        });
+    }
 
     while let Some(merged) = rx.recv().await {
+        if control.is_cancelled() {
+            control.emit(RunLifecycleEvent::Cancelled {
+                run: run.id().clone(),
+            });
+            return Ok(BacktestReport {
+                run: run.id().clone(),
+                events_processed,
+                fills,
+            });
+        }
         store_signal(
             store,
             &scope,
@@ -159,6 +183,9 @@ pub async fn drive(
             run: run.id().clone(),
             source,
         })?;
+    control.emit(RunLifecycleEvent::Completed {
+        run: run.id().clone(),
+    });
     Ok(BacktestReport {
         run: run.id().clone(),
         events_processed,

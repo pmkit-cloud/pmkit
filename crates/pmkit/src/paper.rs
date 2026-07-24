@@ -1,4 +1,7 @@
-use super::{PaperReport, StartError, absorb_fills, instantiate_strategies, store_signal};
+use super::{
+    PaperReport, RunControl, RunLifecycleEvent, StartError, absorb_fills, instantiate_strategies,
+    store_signal,
+};
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_book::OrderBookL2;
 use pmkit_event::{MarketEvent, SourceEnvelope, StrategyFact};
@@ -24,9 +27,10 @@ fn drain_fills(rx: &mut tokio::sync::mpsc::Receiver<MarketEvent>) -> Vec<MarketE
     clippy::too_many_lines,
     reason = "the paper run owns one ordered feed, executor, strategy, and recording loop"
 )]
-pub async fn drive(
+pub async fn drive_with_control(
     run: &PaperRun,
     store: Option<&dyn TapeStore>,
+    control: &RunControl,
 ) -> Result<PaperReport, StartError> {
     let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
 
@@ -81,8 +85,31 @@ pub async fn drive(
     let mut fills = 0_usize;
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
+    control.emit(RunLifecycleEvent::Started {
+        run: run.id().clone(),
+    });
+    if control.is_cancelled() {
+        control.emit(RunLifecycleEvent::Cancelled {
+            run: run.id().clone(),
+        });
+        return Ok(PaperReport {
+            run: run.id().clone(),
+            events_processed,
+            fills,
+        });
+    }
 
     while let Some(merged) = event_rx.recv().await {
+        if control.is_cancelled() {
+            control.emit(RunLifecycleEvent::Cancelled {
+                run: run.id().clone(),
+            });
+            return Ok(PaperReport {
+                run: run.id().clone(),
+                events_processed,
+                fills,
+            });
+        }
         store_signal(
             store,
             &scope,
@@ -178,6 +205,9 @@ pub async fn drive(
             source,
         })?;
     fills += absorb_fills(&drain_fills(&mut fill_rx), &mut positions);
+    control.emit(RunLifecycleEvent::Completed {
+        run: run.id().clone(),
+    });
 
     Ok(PaperReport {
         run: run.id().clone(),
