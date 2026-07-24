@@ -8,7 +8,7 @@ use pmkit_data::{
 };
 use pmkit_event::{MarketEvent, PmAccountEnvelope, PmMarketEnvelope};
 use pmkit_market::Outcome;
-use pmkit_store::{OwnerScope, PmEnvelope, StoreError, TapeStore};
+use pmkit_store::{OwnerScope, PM_ENVELOPE_VERSION, PmEnvelope, StoreError, TapeStore};
 use polymarket_client_sdk_v2::clob::ws::{BookUpdate, Client, LastTradePrice};
 use polymarket_client_sdk_v2::error::Error as SdkError;
 use thiserror::Error;
@@ -109,7 +109,7 @@ impl RawPolymarketFrameAdapter {
             .map_err(|source| RawFrameAdapterError::Json { source })?;
         self.store
             .store_envelope(&PmEnvelope {
-                schema_version: frame.metadata.schema_version,
+                schema_version: PM_ENVELOPE_VERSION,
                 scope: self.scope.clone(),
                 venue_id: "polymarket".into(),
                 config_hash: self.config_hash.clone(),
@@ -157,7 +157,7 @@ impl RawPolymarketFrameAdapter {
         }
         self.store
             .store_envelope(&PmEnvelope {
-                schema_version: frame.metadata.schema_version,
+                schema_version: PM_ENVELOPE_VERSION,
                 scope: self.scope.clone(),
                 venue_id: "polymarket".into(),
                 config_hash: self.config_hash.clone(),

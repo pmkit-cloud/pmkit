@@ -257,6 +257,20 @@ pub fn account_envelope_json(envelope: &PmAccountEnvelope) -> serde_json::Value 
             "order_id": order_id,
             "status": status,
         }),
+        PmAccountEvent::Settlement {
+            market,
+            outcome,
+            settled_size,
+            proceeds,
+            timestamp_ms,
+        } => json!({
+            "kind": "settlement",
+            "ts": timestamp_ms,
+            "market": market.to_string(),
+            "outcome": outcome.to_string(),
+            "settled_size": settled_size.to_string(),
+            "proceeds": proceeds.to_string(),
+        }),
     };
     let mut value = envelope_json(&envelope.metadata, &payload);
     value["portfolio"] = json!(envelope.portfolio.to_string());

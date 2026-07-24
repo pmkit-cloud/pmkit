@@ -387,7 +387,9 @@ pub async fn drive_with_control(
                     reservations.remove(order_id);
                     open_orders.remove(&OrderId(order_id.clone()));
                 }
-                PmAccountEvent::OrderAck { .. } | PmAccountEvent::OrderStatus { .. } => {}
+                PmAccountEvent::OrderAck { .. }
+                | PmAccountEvent::OrderStatus { .. }
+                | PmAccountEvent::Settlement { .. } => {}
             }
             continue;
         }

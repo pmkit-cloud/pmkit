@@ -147,6 +147,9 @@ impl MarketResolutionEvent {
 }
 
 /// A normalized authenticated-account fact from Polymarket.
+///
+/// Market lifecycle facts remain source-gated: the current PM streams do not
+/// expose authoritative open, paused, or closed transitions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PmAccountEvent {
     /// A fill on one of the portfolio's orders.
@@ -209,6 +212,19 @@ pub enum PmAccountEvent {
         order_id: String,
         /// Provider status value.
         status: String,
+        /// Event timestamp in milliseconds.
+        timestamp_ms: i64,
+    },
+    /// An owner-scoped settlement of outcome tokens into proceeds.
+    Settlement {
+        /// Exact market identity.
+        market: MarketId,
+        /// Settled outcome token.
+        outcome: Outcome,
+        /// Exact outcome-token size consumed by settlement.
+        settled_size: Decimal,
+        /// Exact proceeds credited to the owner.
+        proceeds: Decimal,
         /// Event timestamp in milliseconds.
         timestamp_ms: i64,
     },
@@ -321,9 +337,12 @@ impl StrategyInput for StrategyFact {}
 mod tests {
     use std::any::TypeId;
 
-    use super::{Liquidity, MarketEvent, MarketResolutionEvent, PmMarketEnvelope, StrategyFact};
+    use super::{
+        Liquidity, MarketEvent, MarketResolutionEvent, PmAccountEnvelope, PmAccountEvent,
+        PmMarketEnvelope, SourceEnvelope, StrategyFact, StreamMetadata,
+    };
     use pmkit_book::Side;
-    use pmkit_core::MarketId;
+    use pmkit_core::{MarketId, PortfolioId};
     use pmkit_market::Outcome;
     use rust_decimal::Decimal;
 
@@ -367,6 +386,52 @@ mod tests {
         assert_eq!(event.outcome, Outcome::Up);
         assert_eq!(event.resolution_price, Decimal::ONE);
         assert_eq!(timestamp_ms, 1_700_000_000_000);
+        Ok(())
+    }
+
+    #[test]
+    fn settlement_event_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        // Given an owner-scoped settlement envelope.
+        let market = MarketId::new("btc-5m")?;
+        let source = SourceEnvelope::PmAccount(PmAccountEnvelope {
+            portfolio: PortfolioId::new("paper")?,
+            metadata: StreamMetadata {
+                schema_version: 2,
+                source_id: "polymarket-account".into(),
+                source_time_ms: 1_700_000_000_000,
+                canonical_source_rank: 0,
+                receipt_time_ms: 1_700_000_000_001,
+                connection_id: "account-1".into(),
+                connection_epoch: 1,
+                frame_sequence: 7,
+                ingest_sequence: 7,
+            },
+            raw_frame: Vec::new(),
+            fact: PmAccountEvent::Settlement {
+                market: market.clone(),
+                outcome: Outcome::Up,
+                settled_size: Decimal::from(10),
+                proceeds: Decimal::from(10),
+                timestamp_ms: 1_700_000_000_000,
+            },
+        });
+
+        // When transport metadata is removed at the strategy boundary.
+        let fact = source.into_strategy_fact();
+
+        // Then the complete settlement and its timestamp survive as an account fact.
+        assert!(matches!(
+            fact,
+            StrategyFact::Account(PmAccountEvent::Settlement {
+                market: actual_market,
+                outcome: Outcome::Up,
+                settled_size,
+                proceeds,
+                timestamp_ms: 1_700_000_000_000,
+            }) if actual_market == market
+                && settled_size == Decimal::from(10)
+                && proceeds == Decimal::from(10)
+        ));
         Ok(())
     }
 

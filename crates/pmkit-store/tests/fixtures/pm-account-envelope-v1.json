@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "normalized": {
+    "schema_version": 1,
+    "source_id": "polymarket:user-ws",
+    "source_time_ms": 1001,
+    "canonical_source_rank": 0,
+    "receipt_time_ms": 1002,
+    "connection_id": "account-1",
+    "connection_epoch": 1,
+    "frame_sequence": 1,
+    "ingest_sequence": 1,
+    "portfolio": "paper",
+    "payload": {
+      "kind": "order_ack",
+      "ts": 1001,
+      "strategy": null,
+      "order_id": "order-1"
+    }
+  }
+}

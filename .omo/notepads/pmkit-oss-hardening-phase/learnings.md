@@ -68,6 +68,23 @@
 - Unknown venue status strings fail closed as `ExecError::Transport`, while an
   absent order (HTTP 404) maps to `ExecError::NotFound`.
 
+## 2026-07-24 - Owner-scoped settlement events
+
+- `PmAccountEvent::Settlement` is `{ market: MarketId, outcome: Outcome,
+  settled_size: Decimal, proceeds: Decimal, timestamp_ms: i64 }`. Ownership
+  remains on `PmAccountEnvelope::portfolio`; settlement does not belong to
+  `MarketEvent` and carries no duplicate cancel/reject state.
+- Account-envelope JSON serializes settlement as `kind = "settlement"` with
+  exact decimal strings for `settled_size` and `proceeds`. It routes through
+  `SourceEnvelope::PmAccount` to `StrategyFact::Account` unchanged.
+- `PM_ENVELOPE_VERSION` is `2`; database migration `4` updates only
+  `pm_envelopes.schema_version = 1` rows to `2`. Existing normalized JSON and
+  hashes are preserved, while every other unsupported version remains a typed
+  `ReplayGapReason::UnsupportedSchemaVersion`.
+- Market lifecycle remains source-gated: current Polymarket market streams
+  expose book/trade frames and account streams expose order/trade frames, but
+  neither exposes authoritative open, paused, or closed transitions.
+
 ## 2026-07-24 - Fail-closed intent recovery
 
 - Todo 10 aborts recovery instead of adding another durable intent state.

@@ -6,8 +6,8 @@ use std::error::Error;
 
 use pmkit_core::{PortfolioId, RunId};
 use pmkit_store::{
-    CacheChecksum, CausalDecision, CausalIdentity, OwnerScope, PmEnvelope, TapeStore,
-    TursoTapeStore, export_replay_bundle,
+    CacheChecksum, CausalDecision, CausalIdentity, OwnerScope, PM_ENVELOPE_VERSION, PmEnvelope,
+    TapeStore, TursoTapeStore, export_replay_bundle,
 };
 use serde_json::json;
 
@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let store = TursoTapeStore::open_local(&path).await?;
     store
         .store_envelope(&PmEnvelope {
-            schema_version: 1,
+            schema_version: PM_ENVELOPE_VERSION,
             scope: scope.clone(),
             venue_id: "polymarket".into(),
             config_hash: "config-sha256".into(),

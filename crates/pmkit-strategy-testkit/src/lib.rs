@@ -133,7 +133,8 @@ pub const fn fact_timestamp(fact: &StrategyFact) -> i64 {
             | PmAccountEvent::OrderAck { timestamp_ms, .. }
             | PmAccountEvent::OrderCancelled { timestamp_ms, .. }
             | PmAccountEvent::OrderRejected { timestamp_ms, .. }
-            | PmAccountEvent::OrderStatus { timestamp_ms, .. },
+            | PmAccountEvent::OrderStatus { timestamp_ms, .. }
+            | PmAccountEvent::Settlement { timestamp_ms, .. },
         )
         | StrategyFact::Reference(CexReferenceEvent::Trade { timestamp_ms, .. }) => *timestamp_ms,
     }

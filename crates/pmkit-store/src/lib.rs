@@ -60,6 +60,7 @@ pub use log::{
     OutcomeTokenAmount, TradeSide,
 };
 pub use rpc::{JsonRpcFinalizedProvider, RpcProviderConfig};
+pub use schema::PM_ENVELOPE_VERSION;
 pub use source::{
     BlockHead, CanonicalLogSource, ChainSourceError, FinalizedBlockCoverage, FinalizedBlockRange,
     FinalizedProviderHead, FinalizedRawLogBatch, FinalizedRawLogProvider,

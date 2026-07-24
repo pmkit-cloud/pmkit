@@ -5,8 +5,8 @@ use pmkit_core::{PortfolioId, RunId};
 use serde_json::json;
 
 use crate::{
-    CacheChecksum, CausalDecision, CausalIdentity, IntentOutcome, OwnerScope, PmEnvelope,
-    ReplayCursor, ReplayGapReason, ReplayItem, StoreError, TapeStore, TursoTapeStore,
+    CacheChecksum, CausalDecision, CausalIdentity, IntentOutcome, OwnerScope, PM_ENVELOPE_VERSION,
+    PmEnvelope, ReplayCursor, ReplayGapReason, ReplayItem, StoreError, TapeStore, TursoTapeStore,
     export_replay_bundle,
 };
 
@@ -22,7 +22,7 @@ fn owner_scope(name: &str) -> Result<OwnerScope, Box<dyn std::error::Error>> {
 
 fn envelope(scope: OwnerScope, ingest_sequence: i64) -> PmEnvelope {
     PmEnvelope {
-        schema_version: 1,
+        schema_version: PM_ENVELOPE_VERSION,
         scope,
         venue_id: "polymarket".into(),
         config_hash: "config-sha256".into(),
@@ -164,6 +164,35 @@ async fn corrupt_pm_envelope_is_replay_gap_and_cursor_continues_canonically()
     assert_eq!(second_page.items, vec![ReplayItem::Envelope(intact)]);
     store.delete_database()?;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn unknown_frame_is_gap_not_ignored() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: an envelope claiming a schema version newer than the reader supports.
+    let (_dir, path) = database_path("unknown-frame")?;
+    let scope = owner_scope("paper")?;
+    let mut unknown = envelope(scope.clone(), 7);
+    unknown.schema_version = unknown
+        .schema_version
+        .checked_add(1)
+        .ok_or("schema version overflow")?;
+    let store = TursoTapeStore::open_local(&path).await?;
+    store.store_envelope(&unknown).await?;
+
+    // When: the owner replays the stored frame.
+    let page = store
+        .read_envelopes(&scope, None, NonZeroUsize::MIN)
+        .await?;
+
+    // Then: the unsupported frame is retained as one typed gap, never dropped.
+    assert!(matches!(
+        page.items.as_slice(),
+        [ReplayItem::Gap(gap)]
+            if gap.reason == ReplayGapReason::UnsupportedSchemaVersion
+                && gap.ingest_sequence == unknown.ingest_sequence
+    ));
+    store.delete_database()?;
     Ok(())
 }
 

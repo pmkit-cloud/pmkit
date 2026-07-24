@@ -31,7 +31,7 @@ use pmkit_manifest::build_manifest;
 use pmkit_run::LiveConsent;
 use pmkit_runtime::{RuntimeConfig, StrategyRegistration};
 use pmkit_spec::RunSpec;
-use pmkit_store::{OwnerScope, PmEnvelope, StoreError, TapeStore};
+use pmkit_store::{OwnerScope, PM_ENVELOPE_VERSION, PmEnvelope, StoreError, TapeStore};
 use pmkit_strategy::Strategy;
 use thiserror::Error;
 
@@ -429,7 +429,7 @@ async fn store_signal(
     let envelope = match signal {
         SourceSignal::Data(envelope) => match envelope.as_ref() {
             SourceEnvelope::PmMarket(envelope) => PmEnvelope {
-                schema_version: envelope.metadata.schema_version,
+                schema_version: PM_ENVELOPE_VERSION,
                 scope: scope.clone(),
                 venue_id: "polymarket".into(),
                 config_hash: "runtime".into(),
@@ -449,7 +449,7 @@ async fn store_signal(
                 normalized: pmkit_tape::market_envelope_json(envelope),
             },
             SourceEnvelope::PmAccount(envelope) => PmEnvelope {
-                schema_version: envelope.metadata.schema_version,
+                schema_version: PM_ENVELOPE_VERSION,
                 scope: scope.clone(),
                 venue_id: "polymarket".into(),
                 config_hash: "runtime".into(),

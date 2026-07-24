@@ -3,7 +3,7 @@
 ## Durable version boundary
 
 `pm_envelopes.schema_version` is the version of the normalized envelope and its
-serialized metadata. The current version is `1`, defined by
+serialized metadata. The current version is `2`, defined by
 `pmkit-store::schema::PM_ENVELOPE_VERSION`.
 
 Readers must reject unsupported versions with a typed replay/integrity error;
@@ -40,6 +40,13 @@ hash. An advancing batch must carry complete linked header coverage through the
 reported finalized `BlockHead`. Incomplete evidence is held without canonical
 log writes, and a verified checkpoint advance commits in the same transaction
 as its canonical logs.
+
+Database migration version `4` advances durable PM envelopes from version `1`
+to version `2` for the owner-scoped settlement account-event shape. It updates
+only rows whose `schema_version` is exactly `1`; unsupported versions remain
+untouched and replay as `ReplayGapReason::UnsupportedSchemaVersion`. Existing
+`normalized_json`, raw frames, and integrity hashes remain byte-for-byte
+unchanged because all pre-v2 account variants retain their original shape.
 
 Opening fails with a typed `StoreError` when the newest on-disk version exceeds
 the binary's maximum supported version. PMKit never auto-downgrades a database.

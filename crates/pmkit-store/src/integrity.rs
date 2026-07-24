@@ -25,7 +25,7 @@ pub fn decode_row(
     let Ok(schema_version) = row.get::<i64>(5) else {
         return gap(ReplayGapReason::UnsupportedSchemaVersion);
     };
-    if schema_version != PM_ENVELOPE_VERSION {
+    if schema_version != i64::from(PM_ENVELOPE_VERSION) {
         return gap(ReplayGapReason::UnsupportedSchemaVersion);
     }
     let (Ok(receipt_timestamp_ms), Ok(venue_id), Ok(config_hash), Ok(source_id), Ok(connection_id)) =

@@ -139,7 +139,7 @@ mod tests {
     use pmkit_core::{MarketId, PortfolioId, RunId};
     use pmkit_data::{HistoricalDataSource, ReplayQuery, SourceSignal};
     use pmkit_event::SourceEnvelope;
-    use pmkit_store::{OwnerScope, PmEnvelope, TapeStore, TursoTapeStore};
+    use pmkit_store::{OwnerScope, PM_ENVELOPE_VERSION, PmEnvelope, TapeStore, TursoTapeStore};
     use polymarket_client_sdk_v2::types::U256;
     use serde_json::json;
 
@@ -174,7 +174,7 @@ mod tests {
         raw_frame: &[u8],
     ) -> PmEnvelope {
         PmEnvelope {
-            schema_version: 1,
+            schema_version: PM_ENVELOPE_VERSION,
             scope,
             venue_id: "polymarket".into(),
             config_hash: "fixture".into(),

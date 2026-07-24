@@ -4,9 +4,12 @@ use pmkit_core::{PortfolioId, RunId};
 use serde_json::json;
 
 use crate::{
-    OwnerScope, StoreError, TapeStore, TursoTapeStore,
+    OwnerScope, PmEnvelope, ReplayItem, StoreError, TapeStore, TursoTapeStore,
     migrations::{Migration, apply},
 };
+
+const OLD_PM_ACCOUNT_ENVELOPE: &str = include_str!("../tests/fixtures/pm-account-envelope-v1.json");
+const NEW_PM_ACCOUNT_ENVELOPE: &str = include_str!("../tests/fixtures/pm-account-envelope-v2.json");
 
 fn database_path(name: &str) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
     let dir = tempfile::tempdir()?;
@@ -60,10 +63,16 @@ async fn migration_applies_and_is_idempotent() -> Result<(), Box<dyn std::error:
     // Then: all current migrations are recorded once with timestamps.
     assert!(matches!(
         first_rows.as_slice(),
-        [(1, first_applied_at), (2, second_applied_at), (3, third_applied_at)]
+        [
+            (1, first_applied_at),
+            (2, second_applied_at),
+            (3, third_applied_at),
+            (4, fourth_applied_at)
+        ]
             if !first_applied_at.is_empty()
                 && !second_applied_at.is_empty()
                 && !third_applied_at.is_empty()
+                && !fourth_applied_at.is_empty()
     ));
     assert_eq!(reopened_rows, first_rows);
     Ok(())
@@ -78,7 +87,7 @@ async fn migration_rejects_newer_version() -> Result<(), Box<dyn std::error::Err
     let (database, connection) = open_connection(&path).await?;
     connection
         .execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (4, CURRENT_TIMESTAMP)",
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (5, CURRENT_TIMESTAMP)",
             (),
         )
         .await?;
@@ -90,8 +99,8 @@ async fn migration_rejects_newer_version() -> Result<(), Box<dyn std::error::Err
     assert!(matches!(
         TursoTapeStore::open_local(&path).await,
         Err(StoreError::DatabaseSchemaTooNew {
-            database_version: 4,
-            max_supported_version: 3,
+            database_version: 5,
+            max_supported_version: 4,
         })
     ));
     Ok(())
@@ -100,7 +109,7 @@ async fn migration_rejects_newer_version() -> Result<(), Box<dyn std::error::Err
 #[tokio::test]
 async fn migration_rolls_back_on_failure() -> Result<(), Box<dyn std::error::Error>> {
     const FAILING_MIGRATION: Migration = Migration::new(
-        4,
+        5,
         &[
             "CREATE TABLE migration_partial_change (value INTEGER NOT NULL)",
             "CREATE TABLE migration_partial_change (",
@@ -132,8 +141,92 @@ async fn migration_rolls_back_on_failure() -> Result<(), Box<dyn std::error::Err
 
     // Then: its version and first schema change are both rolled back.
     assert!(matches!(result, Err(StoreError::Storage { .. })));
-    assert!(matches!(migrations.as_slice(), [(1, _), (2, _), (3, _)]));
+    assert!(matches!(
+        migrations.as_slice(),
+        [(1, _), (2, _), (3, _), (4, _)]
+    ));
     assert_eq!(partial_table_count, 0);
+    Ok(())
+}
+
+fn pm_account_fixture(
+    fixture: &str,
+    scope: OwnerScope,
+    frame_sequence: i64,
+) -> Result<PmEnvelope, Box<dyn std::error::Error>> {
+    let fixture: serde_json::Value = serde_json::from_str(fixture)?;
+    let schema_version = fixture["schema_version"]
+        .as_u64()
+        .ok_or("fixture schema_version")?;
+    let normalized = fixture
+        .get("normalized")
+        .cloned()
+        .ok_or("fixture normalized")?;
+    Ok(PmEnvelope {
+        schema_version: u16::try_from(schema_version)?,
+        scope,
+        venue_id: "polymarket".into(),
+        config_hash: "fixture".into(),
+        source_id: "polymarket:user-ws".into(),
+        connection_id: "account-1".into(),
+        source_timestamp_ms: 1_000 + frame_sequence,
+        canonical_source_rank: 0,
+        connection_epoch: 1,
+        frame_sequence,
+        receipt_timestamp_ms: 1_001 + frame_sequence,
+        ingest_sequence: frame_sequence,
+        raw_frame: format!("fixture-{frame_sequence}").into_bytes(),
+        normalized,
+    })
+}
+
+#[tokio::test]
+async fn pm_account_envelope_version_migrates_old_and_reads_new_fixtures()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: a database at the pre-bump version containing a v1 account envelope.
+    let (_dir, path) = database_path("pm-account-envelope-version")?;
+    let scope = OwnerScope::new(PortfolioId::new("paper")?, RunId::new("run")?);
+    let old = pm_account_fixture(OLD_PM_ACCOUNT_ENVELOPE, scope.clone(), 1)?;
+    let store = TursoTapeStore::open_local(&path).await?;
+    store.store_envelope(&old).await?;
+    store
+        .connection
+        .execute("DELETE FROM schema_migrations WHERE version = 4", ())
+        .await?;
+    drop(store);
+
+    // When: the current store migrates the database and appends a v2 settlement envelope.
+    let (items, migrations, new) = {
+        let store = TursoTapeStore::open_local(&path).await?;
+        let new = pm_account_fixture(NEW_PM_ACCOUNT_ENVELOPE, scope.clone(), 2)?;
+        store.store_envelope(&new).await?;
+        let page = store
+            .read_envelopes(
+                &scope,
+                None,
+                std::num::NonZeroUsize::new(2).ok_or("fixture page size")?,
+            )
+            .await?;
+        let migrations = migration_rows(&store.connection).await?;
+        let items = page.items;
+        drop(store);
+        (items, migrations, new)
+    };
+
+    // Then: both fixtures replay under the current envelope version without losing JSON evidence.
+    let mut migrated_old = old;
+    migrated_old.schema_version = 2;
+    assert_eq!(
+        items,
+        vec![
+            ReplayItem::Envelope(migrated_old),
+            ReplayItem::Envelope(new)
+        ]
+    );
+    assert!(matches!(
+        migrations.as_slice(),
+        [(1, _), (2, _), (3, _), (4, _)]
+    ));
     Ok(())
 }
 
@@ -205,7 +298,10 @@ async fn decision_version_round_trip() -> Result<(), Box<dyn std::error::Error>>
     };
 
     // Then: legacy records become version 1 without changing their JSON payloads.
-    assert!(matches!(migrations.as_slice(), [(1, _), (2, _), (3, _)]));
+    assert!(matches!(
+        migrations.as_slice(),
+        [(1, _), (2, _), (3, _), (4, _)]
+    ));
     assert!(killed);
     assert_eq!(decision_version, 1);
     assert_eq!(intent_version, 1);
