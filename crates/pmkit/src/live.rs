@@ -110,11 +110,13 @@ async fn recover_intents(
             continue;
         };
         let outcome = match status {
-            OrderStatus::Open | OrderStatus::Accepted => Some(pmkit_store::IntentOutcome::Accepted),
-            OrderStatus::Rejected | OrderStatus::Cancelled => {
+            OrderStatus::Open(_) | OrderStatus::Accepted(_) => {
+                Some(pmkit_store::IntentOutcome::Accepted)
+            }
+            OrderStatus::Rejected(_) | OrderStatus::Cancelled(_) => {
                 Some(pmkit_store::IntentOutcome::Rejected)
             }
-            OrderStatus::Unknown => None,
+            OrderStatus::Unknown(_) => None,
         };
         if let Some(outcome) = outcome {
             recorder

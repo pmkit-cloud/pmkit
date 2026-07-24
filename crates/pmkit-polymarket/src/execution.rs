@@ -1,9 +1,12 @@
-use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
+use pmkit_exec::{
+    ExecError, ExecutionSnapshot, Executor, OrderId, OrderStatus, OrderStatusDetails, PlaceOrder,
+};
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::{Normal, Signer};
 use polymarket_client_sdk_v2::clob::Client;
-use polymarket_client_sdk_v2::clob::types::OrderType;
 use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
+use polymarket_client_sdk_v2::clob::types::response::OpenOrderResponse;
+use polymarket_client_sdk_v2::clob::types::{OrderStatusType, OrderType};
 use polymarket_client_sdk_v2::error::{Error as SdkError, Kind, Status, StatusCode};
 
 use crate::{MarketTokens, venue_order_inputs};
@@ -67,6 +70,15 @@ where
 
     async fn reconcile(&self) -> Result<ExecutionSnapshot, ExecError> {
         self.snapshot().await
+    }
+
+    async fn query_status(&self, order_id: &OrderId) -> Result<OrderStatus, ExecError> {
+        let order = self
+            .client
+            .order(&order_id.0)
+            .await
+            .map_err(|error| query_error(&error, order_id))?;
+        order_status(order_id, &order)
     }
 
     async fn submit(&self, order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
@@ -137,6 +149,41 @@ where
     }
 }
 
+fn order_status(order_id: &OrderId, order: &OpenOrderResponse) -> Result<OrderStatus, ExecError> {
+    let details = OrderStatusDetails {
+        filled_qty: Some(order.size_matched),
+        price: Some(order.price),
+        fee: None,
+        settlement_reference: None,
+    };
+    let status = match &order.status {
+        OrderStatusType::Live | OrderStatusType::Delayed => {
+            return Ok(OrderStatus::Open(details));
+        }
+        OrderStatusType::Matched => return Ok(OrderStatus::Accepted(details)),
+        OrderStatusType::Canceled => return Ok(OrderStatus::Cancelled(details)),
+        OrderStatusType::Unmatched => return Ok(OrderStatus::Rejected(details)),
+        OrderStatusType::Unknown(status) => status.clone(),
+        status => status.to_string(),
+    };
+    Err(ExecError::Transport {
+        message: format!("ambiguous status {status} for order {}", order_id.0),
+    })
+}
+
+fn query_error(error: &SdkError, order_id: &OrderId) -> ExecError {
+    if error
+        .downcast_ref::<Status>()
+        .is_some_and(|status| status.status_code == StatusCode::NOT_FOUND)
+    {
+        ExecError::NotFound {
+            order_id: order_id.0.clone(),
+        }
+    } else {
+        exec_error(error)
+    }
+}
+
 fn exec_error(error: &SdkError) -> ExecError {
     let message = error.to_string();
     match error.kind() {
@@ -162,10 +209,122 @@ fn exec_error(error: &SdkError) -> ExecError {
 
 #[cfg(test)]
 mod tests {
-    use pmkit_exec::ExecError;
-    use polymarket_client_sdk_v2::error::{Error as SdkError, Kind, Method, StatusCode};
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::str::FromStr as _;
+    use std::thread;
 
-    use super::exec_error;
+    use pmkit_core::MarketId;
+    use pmkit_exec::{ExecError, Executor, OrderId, OrderStatus};
+    use polymarket_client_sdk_v2::POLYGON;
+    use polymarket_client_sdk_v2::auth::{Credentials, LocalSigner, Signer as _, Uuid};
+    use polymarket_client_sdk_v2::clob::{Client, Config};
+    use polymarket_client_sdk_v2::error::{Error as SdkError, Kind, Method, StatusCode};
+    use polymarket_client_sdk_v2::types::U256;
+    use rust_decimal::Decimal;
+
+    use super::{PolymarketExecutor, exec_error};
+    use crate::MarketTokens;
+
+    const PRIVATE_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+    async fn fixture_executor(body: String) -> Result<impl Executor, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0_u8; 4096];
+            let Ok(read) = stream.read(&mut request) else {
+                return;
+            };
+            if !String::from_utf8_lossy(&request[..read]).starts_with("GET /data/order/order-1 ") {
+                return;
+            }
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes());
+            let _ = stream.flush();
+        });
+
+        let signer = LocalSigner::from_str(PRIVATE_KEY)?.with_chain_id(Some(POLYGON));
+        let credentials = Credentials::new(
+            Uuid::nil(),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            "fixture-passphrase".to_owned(),
+        );
+        let client = Client::new(&format!("http://{address}"), Config::default())?
+            .authentication_builder(&signer)
+            .credentials(credentials)
+            .authenticate()
+            .await?;
+        let tokens = MarketTokens::new(MarketId::new("fixture")?, U256::from(1), U256::from(2));
+        Ok(PolymarketExecutor::new(client, signer, tokens))
+    }
+
+    fn order_response(status: &str) -> String {
+        format!(
+            r#"{{
+                "id":"order-1",
+                "status":"{status}",
+                "owner":"00000000-0000-0000-0000-000000000000",
+                "maker_address":"0x0000000000000000000000000000000000000001",
+                "market":"0x0000000000000000000000000000000000000000000000000000000000000001",
+                "asset_id":"1",
+                "side":"BUY",
+                "original_size":"10",
+                "size_matched":"4",
+                "price":"0.52",
+                "associate_trades":["trade-1"],
+                "outcome":"Yes",
+                "created_at":1700000000,
+                "expiration":"0",
+                "order_type":"GTC"
+            }}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn status_query_enriched() -> Result<(), Box<dyn std::error::Error>> {
+        // Given an authenticated venue client returning a matched order fixture.
+        let executor = fixture_executor(order_response("MATCHED")).await?;
+
+        // When status is queried through the Executor seam.
+        let status = executor
+            .query_status(&OrderId("order-1".to_owned()))
+            .await?;
+
+        // Then only fields provided by the order response are populated.
+        let OrderStatus::Accepted(details) = status else {
+            return Err("expected accepted status".into());
+        };
+        assert_eq!(details.filled_qty, Some(Decimal::from(4)));
+        assert_eq!(details.price, Some(Decimal::new(52, 2)));
+        assert_eq!(details.fee, None);
+        assert_eq!(details.settlement_reference, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_ambiguous_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        // Given a venue response whose status is not part of the known lifecycle.
+        let executor = fixture_executor(order_response("PENDING_REVIEW")).await?;
+
+        // When status is queried through the Executor seam.
+        let result = executor.query_status(&OrderId("order-1".to_owned())).await;
+
+        // Then the unknown value is preserved in a typed fail-closed error.
+        match result {
+            Err(ExecError::Transport { message }) => {
+                assert_eq!(message, "ambiguous status PENDING_REVIEW for order order-1");
+            }
+            other => return Err(format!("expected ambiguous status error, got {other:?}").into()),
+        }
+        Ok(())
+    }
 
     #[test]
     fn sdk_errors_preserve_rejection_or_transport_semantics() {

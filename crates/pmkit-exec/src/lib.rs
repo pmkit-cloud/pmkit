@@ -22,19 +22,32 @@ pub struct ExecutionSnapshot {
     pub open_orders: Vec<OrderId>,
 }
 
-/// Authoritative status returned for one venue order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Venue-provided execution details attached to an order status.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OrderStatusDetails {
+    /// Quantity filled at the venue, when reported.
+    pub filled_qty: Option<Decimal>,
+    /// Order price reported by the venue, when reported.
+    pub price: Option<Decimal>,
+    /// Fee charged by the venue, when reported.
+    pub fee: Option<Decimal>,
+    /// Venue settlement reference, when reported.
+    pub settlement_reference: Option<String>,
+}
+
+/// Authoritative status and available execution details for one venue order.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrderStatus {
     /// The order remains open at the venue.
-    Open,
+    Open(OrderStatusDetails),
     /// The venue accepted or filled the order.
-    Accepted,
+    Accepted(OrderStatusDetails),
     /// The venue rejected the order.
-    Rejected,
+    Rejected(OrderStatusDetails),
     /// The venue cancelled the order.
-    Cancelled,
+    Cancelled(OrderStatusDetails),
     /// The venue could not determine the final status.
-    Unknown,
+    Unknown(OrderStatusDetails),
 }
 
 /// An order to place on a single market outcome.
