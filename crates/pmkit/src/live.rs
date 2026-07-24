@@ -95,43 +95,58 @@ async fn recover_intents(
         }
     })?);
     for intent in intents {
-        let Some(order_id) = intent.venue_order_id() else {
-            continue;
-        };
-        let Ok(status) = tokio::time::timeout(
+        let order_id = intent
+            .venue_order_id()
+            .ok_or_else(|| StartError::ExecutionState {
+                run: run.id().clone(),
+                source: ExecError::Transport {
+                    message: format!(
+                        "intent {} has no venue order id",
+                        intent.identity.correlation_id
+                    ),
+                },
+            })?;
+        let status = tokio::time::timeout(
             runtime.shutdown.reconciliation_timeout,
             run.executor().query_status(&order_id),
         )
         .await
-        else {
-            continue;
-        };
-        let Ok(status) = status else {
-            continue;
-        };
+        .map_err(|_| StartError::ExecutionState {
+            run: run.id().clone(),
+            source: ExecError::Transport {
+                message: format!("status query timed out for order {}", order_id.0),
+            },
+        })?
+        .map_err(|source| StartError::ExecutionState {
+            run: run.id().clone(),
+            source,
+        })?;
         let outcome = match status {
-            OrderStatus::Open(_) | OrderStatus::Accepted(_) => {
-                Some(pmkit_store::IntentOutcome::Accepted)
-            }
+            OrderStatus::Open(_) | OrderStatus::Accepted(_) => pmkit_store::IntentOutcome::Accepted,
             OrderStatus::Rejected(_) | OrderStatus::Cancelled(_) => {
-                Some(pmkit_store::IntentOutcome::Rejected)
+                pmkit_store::IntentOutcome::Rejected
             }
-            OrderStatus::Unknown(_) => None,
-        };
-        if let Some(outcome) = outcome {
-            recorder
-                .reconcile(&intent, outcome)
-                .await
-                .map_err(|source| StartError::Storage {
+            OrderStatus::Unknown(_) => {
+                return Err(StartError::ExecutionState {
                     run: run.id().clone(),
-                    source: match source {
-                        crate::causal::RecorderError::Store(source) => source,
-                        _ => StoreError::Storage {
-                            message: source.to_string(),
-                        },
+                    source: ExecError::Transport {
+                        message: format!("venue status is unknown for order {}", order_id.0),
                     },
-                })?;
-        }
+                });
+            }
+        };
+        recorder
+            .reconcile(&intent, outcome)
+            .await
+            .map_err(|source| StartError::Storage {
+                run: run.id().clone(),
+                source: match source {
+                    crate::causal::RecorderError::Store(source) => source,
+                    _ => StoreError::Storage {
+                        message: source.to_string(),
+                    },
+                },
+            })?;
     }
     Ok(())
 }
@@ -603,4 +618,182 @@ async fn finish(
 ) -> Result<LiveReport, StartError> {
     tape.finish(run, runtime, open_orders).await?;
     Ok(report(run, counts))
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::{StartError, recover_intents};
+    use crate::test_support::{config, risk};
+    use async_trait::async_trait;
+    use pmkit_core::{PortfolioId, RunId};
+    use pmkit_data::{DataSourceError, LiveDataSource, SourceSignal};
+    use pmkit_exec::{
+        ExecError, ExecutionSnapshot, Executor, OrderId, OrderStatus, OrderStatusDetails,
+        PlaceOrder,
+    };
+    use pmkit_market::Outcome;
+    use pmkit_spec::LiveRun;
+    use pmkit_store::{CausalIdentity, IntentOutcome, OwnerScope, TapeStore, TursoTapeStore};
+    use serde_json::json;
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::mpsc::Sender;
+
+    #[derive(Clone, Copy)]
+    enum RecoveryResponse {
+        Accepted,
+        Unknown,
+        Failure,
+        Timeout,
+    }
+
+    struct RecoveryExecutor(RecoveryResponse);
+
+    #[async_trait]
+    impl Executor for RecoveryExecutor {
+        async fn preflight(&self) -> Result<ExecutionSnapshot, ExecError> {
+            Ok(ExecutionSnapshot::default())
+        }
+
+        async fn reconcile(&self) -> Result<ExecutionSnapshot, ExecError> {
+            Ok(ExecutionSnapshot::default())
+        }
+
+        async fn query_status(&self, order_id: &OrderId) -> Result<OrderStatus, ExecError> {
+            match self.0 {
+                RecoveryResponse::Accepted => {
+                    Ok(OrderStatus::Accepted(OrderStatusDetails::default()))
+                }
+                RecoveryResponse::Unknown => {
+                    Ok(OrderStatus::Unknown(OrderStatusDetails::default()))
+                }
+                RecoveryResponse::Failure => Err(ExecError::NotFound {
+                    order_id: order_id.0.clone(),
+                }),
+                RecoveryResponse::Timeout => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok(OrderStatus::Accepted(OrderStatusDetails::default()))
+                }
+            }
+        }
+
+        async fn submit(&self, _order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
+            Ok(OrderId("unused".into()))
+        }
+
+        async fn cancel(&self, _order_id: &OrderId) -> Result<(), ExecError> {
+            Ok(())
+        }
+
+        async fn cancel_all(&self) -> Result<(), ExecError> {
+            Ok(())
+        }
+    }
+
+    struct RecoverySource;
+
+    #[async_trait]
+    impl LiveDataSource for RecoverySource {
+        async fn subscribe(
+            &self,
+            _market: pmkit_core::MarketId,
+            _outcome: Outcome,
+            _sink: Sender<SourceSignal>,
+        ) -> Result<(), DataSourceError> {
+            Ok(())
+        }
+    }
+
+    fn recovery_run(
+        run_id: &str,
+        response: RecoveryResponse,
+    ) -> Result<LiveRun, Box<dyn std::error::Error>> {
+        Ok(LiveRun::new(
+            RunId::new(run_id)?,
+            PortfolioId::new("recovery")?,
+            Arc::new(RecoveryExecutor(response)),
+            Arc::new(RecoverySource),
+            risk()?,
+        ))
+    }
+
+    fn recovery_identity(scope: &OwnerScope, correlation_id: &str) -> CausalIdentity {
+        CausalIdentity {
+            scope: scope.clone(),
+            correlation_id: correlation_id.into(),
+            source_timestamp_ms: 1_000,
+            ingest_sequence: 1,
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
+    async fn recover_terminal_intent() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: an unresolved durable intent whose venue reports acceptance.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("recover-terminal.db");
+        let store = TursoTapeStore::open_local(&path).await?;
+        let run = recovery_run("recover-terminal", RecoveryResponse::Accepted)?;
+        let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
+        let identity = recovery_identity(&scope, "terminal");
+        store
+            .store_intent_pending(&identity, &json!({"kind": "place"}))
+            .await?;
+        store
+            .transition_intent_with_order(&identity, IntentOutcome::Unknown, Some("venue-terminal"))
+            .await?;
+
+        // When: restart recovery queries the authoritative venue status.
+        recover_intents(&run, &config()?, &store, &scope).await?;
+
+        // Then: the intent leaves the unresolved set exactly as before.
+        assert!(store.read_unknown_intents(&scope).await?.is_empty());
+        store.delete_database()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
+    async fn recover_unknown_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let mut runtime = config()?;
+        runtime.shutdown.reconciliation_timeout = Duration::from_millis(1);
+        let cases = [
+            ("unknown", RecoveryResponse::Unknown, true),
+            ("timeout", RecoveryResponse::Timeout, true),
+            ("failure", RecoveryResponse::Failure, true),
+            ("missing-id", RecoveryResponse::Accepted, false),
+        ];
+
+        for (name, response, has_venue_id) in cases {
+            // Given: one unresolved durable intent with an unsafe recovery outcome.
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join(format!("recover-{name}.db"));
+            let store = TursoTapeStore::open_local(&path).await?;
+            let run = recovery_run(name, response)?;
+            let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
+            let identity = recovery_identity(&scope, name);
+            store
+                .store_intent_pending(&identity, &json!({"kind": "place"}))
+                .await?;
+            if has_venue_id {
+                store
+                    .transition_intent_with_order(
+                        &identity,
+                        IntentOutcome::Unknown,
+                        Some("venue-unresolved"),
+                    )
+                    .await?;
+            }
+
+            // When: restart recovery cannot establish an authoritative status.
+            let result = recover_intents(&run, &runtime, &store, &scope).await;
+
+            // Then: startup aborts and the intent remains explicitly unresolved.
+            assert!(matches!(result, Err(StartError::ExecutionState { .. })));
+            let unresolved = store.read_pending_intents(&scope).await?.len()
+                + store.read_unknown_intents(&scope).await?.len();
+            assert_eq!(unresolved, 1, "case: {name}");
+            store.delete_database()?;
+        }
+        Ok(())
+    }
 }

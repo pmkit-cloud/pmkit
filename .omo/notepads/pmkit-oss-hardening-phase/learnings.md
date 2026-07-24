@@ -67,3 +67,12 @@
   `None`; associated trade IDs are not relabeled as settlement references.
 - Unknown venue status strings fail closed as `ExecError::Transport`, while an
   absent order (HTTP 404) maps to `ExecError::NotFound`.
+
+## 2026-07-24 - Fail-closed intent recovery
+
+- Todo 10 aborts recovery instead of adding another durable intent state.
+  Missing venue IDs, status-query timeouts or failures, and
+  `OrderStatus::Unknown` return `StartError::ExecutionState`.
+- The existing `pending` or `unknown` row stays unresolved on abort. Only
+  unambiguous `Open`/`Accepted` or `Rejected`/`Cancelled` statuses transition
+  it to the existing accepted or rejected outcome.
