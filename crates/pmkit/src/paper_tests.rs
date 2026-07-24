@@ -56,6 +56,9 @@ async fn paper_run_drives_live_feed_to_fill() -> Result<(), Box<dyn std::error::
         Arc::new(ScriptedLive),
         ConservativeV1Config {
             activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
         },
     )
     .strategy(StrategyRegistration::new(

@@ -6,6 +6,7 @@ use pmkit_exec::Executor;
 use pmkit_market::Outcome;
 use pmkit_paper::PaperExecutor;
 use pmkit_sim::MarketCategory;
+use pmkit_sim::SimulationConfig;
 use pmkit_spec::PaperRun;
 use pmkit_store::{CausalIdentity, OwnerScope, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
@@ -30,23 +31,46 @@ pub async fn drive(
     let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
 
     let (fill_tx, mut fill_rx) = tokio::sync::mpsc::channel(1024);
-    let paper = PaperExecutor::new(fill_tx, "paper", MarketCategory::Crypto);
+    let simulation = run.simulation();
+    let simulation_config = SimulationConfig {
+        activation_latency_ms: i64::try_from(simulation.activation_latency.as_millis())
+            .unwrap_or(i64::MAX),
+        maker_queue_ahead_bps: simulation.maker_queue_ahead_bps,
+        slippage_bps: simulation.slippage_bps,
+        market_impact_bps: simulation.market_impact_bps,
+    };
+    let paper =
+        PaperExecutor::with_config(fill_tx, "paper", MarketCategory::Crypto, simulation_config);
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1024);
     let mut subscribed = HashSet::new();
     let mut sources = Vec::new();
-    for (market, _) in &strategies {
-        if !subscribed.insert(market.clone()) {
+    for instance in &strategies {
+        if !subscribed.insert(instance.market.clone()) {
             continue;
         }
         for outcome in [Outcome::Up, Outcome::Down] {
             let source = run.market_data().clone();
-            let market = market.clone();
+            let market = instance.market.clone();
             let name = format!("pm:{market:?}:{outcome:?}");
             sources.push(SourceTaskDefinition::new(name, move |sink| async move {
                 source.subscribe(market, outcome, sink).await
             }));
         }
+    }
+    if let Some(reference) = run.reference_data_ref() {
+        let reference = reference.clone();
+        sources.push(SourceTaskDefinition::new("cex", move |sink| async move {
+            reference.subscribe_reference(sink).await
+        }));
+    }
+    if let Some(account) = run.account_data_ref() {
+        let account = account.clone();
+        let portfolio = run.portfolio().clone();
+        sources.push(SourceTaskDefinition::new(
+            "pm-account",
+            move |sink| async move { account.subscribe_account(portfolio, sink).await },
+        ));
     }
     let feed = MergedFeed::from_tasks(FeedMode::Paper, sources, None);
     let merge = tokio::spawn(async move { feed.forward(event_tx).await });
@@ -55,6 +79,7 @@ pub async fn drive(
     let mut positions = Vec::new();
     let mut events_processed = 0_usize;
     let mut fills = 0_usize;
+    let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
 
     while let Some(merged) = event_rx.recv().await {
@@ -68,6 +93,10 @@ pub async fn drive(
             run: run.id().clone(),
             source,
         })?;
+        if let SourceEnvelope::CexReference(envelope) = &merged.source {
+            cex_metrics.observe(&envelope.fact);
+            continue;
+        }
         let SourceEnvelope::PmMarket(envelope) = merged.source else {
             continue;
         };
@@ -91,8 +120,8 @@ pub async fn drive(
             let _ = paper.update_book(market, *outcome, book.clone()).await;
             fills += absorb_fills(&drain_fills(&mut fill_rx), &mut positions);
             let mut actions_placed = 0_u32;
-            for (registered_market, strategy) in &mut *strategies {
-                if *registered_market != *market {
+            for instance in &mut *strategies {
+                if instance.market != *market {
                     continue;
                 }
                 let context = StrategyContext {
@@ -102,7 +131,7 @@ pub async fn drive(
                     positions: &positions,
                     now: LogicalTimestamp::from_millis(*timestamp_ms),
                 };
-                if let Ok(actions) = strategy.on_event(context) {
+                if let Ok(actions) = instance.strategy.on_event(context) {
                     for action in actions.as_slice() {
                         if let Action::Place(order) = action {
                             let _ = paper.submit(order, *timestamp_ms).await;
@@ -120,12 +149,19 @@ pub async fn drive(
                     ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
                         .unwrap_or(i64::MAX),
                 };
-                crate::causal::record_book_decision(store, &identity, &book, actions_placed)
-                    .await
-                    .map_err(|source| StartError::Storage {
-                        run: run.id().clone(),
-                        source,
-                    })?;
+                crate::causal::record_book_decision(
+                    store,
+                    &identity,
+                    &book,
+                    cex_metrics.snapshot(),
+                    actions_placed,
+                    Some(simulation_config),
+                )
+                .await
+                .map_err(|source| StartError::Storage {
+                    run: run.id().clone(),
+                    source,
+                })?;
             }
         }
     }

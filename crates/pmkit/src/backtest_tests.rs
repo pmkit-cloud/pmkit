@@ -5,8 +5,10 @@ use crate::{
 use async_trait::async_trait;
 use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
 use pmkit_data::{DataSourceError, HistoricalDataSource, ReplayQuery, SourceSignal};
-use pmkit_event::MarketEvent;
-use pmkit_market::Outcome;
+use pmkit_event::{
+    CexReferenceEnvelope, CexReferenceEvent, MarketEvent, SourceEnvelope, StreamMetadata,
+};
+use pmkit_market::{Asset, Exchange, Outcome};
 use pmkit_money::Money;
 use pmkit_run::{EvidenceRequirement, RetrievalWait};
 use pmkit_runtime::StrategyRegistration;
@@ -19,6 +21,50 @@ use tokio::sync::mpsc::Sender;
 
 struct ScriptedHistory {
     ticks: Vec<i64>,
+}
+
+struct ScriptedReference;
+
+#[async_trait]
+impl HistoricalDataSource for ScriptedReference {
+    async fn replay(
+        &self,
+        _query: ReplayQuery,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        sink.send(SourceSignal::Data(Box::new(SourceEnvelope::CexReference(
+            CexReferenceEnvelope {
+                metadata: StreamMetadata {
+                    schema_version: 1,
+                    source_id: "binance-history".into(),
+                    source_time_ms: 1,
+                    canonical_source_rank: 1,
+                    receipt_time_ms: 1,
+                    connection_id: "archive".into(),
+                    connection_epoch: 0,
+                    frame_sequence: 7,
+                    ingest_sequence: 7,
+                },
+                fact: CexReferenceEvent::Trade {
+                    asset: Asset::Btc,
+                    exchange: Exchange::Binance,
+                    aggregate_trade_id: 7,
+                    price: Decimal::new(42, 2),
+                    qty: Decimal::from(2),
+                    is_buyer_maker: false,
+                    timestamp_ms: 1,
+                },
+            },
+        ))))
+        .await
+        .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
 }
 
 #[async_trait]
@@ -58,7 +104,8 @@ async fn backtest_app() -> Result<AppHandle, Box<dyn std::error::Error>> {
         "2026-02-01T00:00:00Z".parse()?,
         EvidenceRequirement::CorroboratedOnly,
         RetrievalWait::ReturnPending,
-    );
+    )
+    .reference_source(Arc::new(ScriptedReference));
     let run = BacktestRun::new(
         RunId::new("bt")?,
         PortfolioId::new("research")?,
@@ -67,6 +114,9 @@ async fn backtest_app() -> Result<AppHandle, Box<dyn std::error::Error>> {
         risk()?,
         ConservativeV1Config {
             activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
         },
     )
     .strategy(StrategyRegistration::new(
@@ -139,7 +189,8 @@ async fn backtest_records_one_decision_per_book_event() -> Result<(), Box<dyn st
         "2026-02-01T00:00:00Z".parse()?,
         EvidenceRequirement::CorroboratedOnly,
         RetrievalWait::ReturnPending,
-    );
+    )
+    .reference_source(Arc::new(ScriptedReference));
     let run = BacktestRun::new(
         RunId::new("bt-rec")?,
         PortfolioId::new("research")?,
@@ -148,6 +199,9 @@ async fn backtest_records_one_decision_per_book_event() -> Result<(), Box<dyn st
         risk()?,
         ConservativeV1Config {
             activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
         },
     )
     .strategy(StrategyRegistration::new(
@@ -167,6 +221,13 @@ async fn backtest_records_one_decision_per_book_event() -> Result<(), Box<dyn st
     let scope = OwnerScope::new(PortfolioId::new("research")?, RunId::new("bt-rec")?);
     let decisions = store.read_decisions(&scope).await?;
     assert_eq!(decisions.len(), 2);
+    assert!(
+        decisions.iter().any(|decision| {
+            decision.payload["snapshot"]["cex_trade"]["volume"] == "2"
+                && decision.payload["snapshot"]["cex_trade"]["cvd"] == "2"
+        }),
+        "decisions: {decisions:?}"
+    );
     drop(store);
     let _ = std::fs::remove_file(&path);
     Ok(())

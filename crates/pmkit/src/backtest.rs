@@ -6,7 +6,7 @@ use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_book::OrderBookL2;
 use pmkit_data::ReplayQuery;
 use pmkit_event::{MarketEvent, SourceEnvelope, StrategyFact};
-use pmkit_sim::{MarketCategory, SimEngine};
+use pmkit_sim::{MarketCategory, SimEngine, SimulationConfig};
 use pmkit_spec::BacktestRun;
 use pmkit_store::{CausalIdentity, OwnerScope, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
@@ -23,7 +23,7 @@ pub async fn drive(
 
     let markets = strategies
         .iter()
-        .map(|(market, _)| market.clone())
+        .map(|instance| instance.market.clone())
         .collect();
     let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
     let source = run.replay().source().clone();
@@ -34,20 +34,46 @@ pub async fn drive(
         evidence: run.replay().evidence(),
         retrieval_wait: run.replay().retrieval_wait(),
     };
+    let mut sources = vec![SourceTaskDefinition::new("pm", move |sink| async move {
+        source.replay(query, sink).await
+    })];
+    if let Some(reference) = run.replay().reference_source_ref() {
+        let reference = reference.clone();
+        let reference_query = ReplayQuery {
+            markets: strategies
+                .iter()
+                .map(|instance| instance.market.clone())
+                .collect(),
+            from: run.replay().from(),
+            to: run.replay().to(),
+            evidence: run.replay().evidence(),
+            retrieval_wait: run.replay().retrieval_wait(),
+        };
+        sources.push(SourceTaskDefinition::new("cex", move |sink| async move {
+            reference.replay(reference_query, sink).await
+        }));
+    }
     let feed = MergedFeed::from_tasks(
         FeedMode::Backtest,
-        vec![SourceTaskDefinition::new("pm", move |sink| async move {
-            source.replay(query, sink).await
-        })],
+        sources,
         Some(run.replay().to().timestamp_millis()),
     );
     let replay = tokio::spawn(async move { feed.forward(tx).await });
 
     // ponytail: fee category fixed to Crypto; positions tracked from fills.
-    let mut sim = SimEngine::new("bt", 0, MarketCategory::Crypto);
+    let simulation = run.simulation();
+    let simulation_config = SimulationConfig {
+        activation_latency_ms: i64::try_from(simulation.activation_latency.as_millis())
+            .unwrap_or(i64::MAX),
+        maker_queue_ahead_bps: simulation.maker_queue_ahead_bps,
+        slippage_bps: simulation.slippage_bps,
+        market_impact_bps: simulation.market_impact_bps,
+    };
+    let mut sim = SimEngine::with_config("bt", 0, MarketCategory::Crypto, simulation_config);
     let mut positions = Vec::new();
     let mut events_processed = 0_usize;
     let mut fills = 0_usize;
+    let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
 
     while let Some(merged) = rx.recv().await {
@@ -61,6 +87,10 @@ pub async fn drive(
             run: run.id().clone(),
             source,
         })?;
+        if let SourceEnvelope::CexReference(envelope) = &merged.source {
+            cex_metrics.observe(&envelope.fact);
+            continue;
+        }
         let SourceEnvelope::PmMarket(envelope) = merged.source else {
             continue;
         };
@@ -100,12 +130,19 @@ pub async fn drive(
                     ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
                         .unwrap_or(i64::MAX),
                 };
-                crate::causal::record_book_decision(store, &identity, &book, actions_placed)
-                    .await
-                    .map_err(|source| StartError::Storage {
-                        run: run.id().clone(),
-                        source,
-                    })?;
+                crate::causal::record_book_decision(
+                    store,
+                    &identity,
+                    &book,
+                    cex_metrics.snapshot(),
+                    actions_placed,
+                    Some(simulation_config),
+                )
+                .await
+                .map_err(|source| StartError::Storage {
+                    run: run.id().clone(),
+                    source,
+                })?;
             }
         }
     }
@@ -140,8 +177,8 @@ fn run_strategies(
 ) -> (usize, u32) {
     let mut fills = 0;
     let mut actions_placed = 0_u32;
-    for (registered_market, strategy) in &mut *strategies {
-        if *registered_market != *market {
+    for instance in &mut *strategies {
+        if instance.market != *market {
             continue;
         }
         let context = StrategyContext {
@@ -157,7 +194,7 @@ fn run_strategies(
             positions: positions.as_slice(),
             now: LogicalTimestamp::from_millis(timestamp_ms),
         };
-        if let Ok(actions) = strategy.on_event(context) {
+        if let Ok(actions) = instance.strategy.on_event(context) {
             for action in actions.as_slice() {
                 if let Action::Place(order) = action {
                     sim.submit(order, timestamp_ms);
