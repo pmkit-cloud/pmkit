@@ -1,0 +1,50 @@
+Task 23: Verified block header/batch evidence (parent-hash linkage)
+
+Failing-first proof
+===================
+
+$ cargo test -p pmkit-store header_linkage_verifies
+error[E0061]: BlockHead::new expected 3 arguments but 4 were supplied
+error[E0061]: FinalizedRawLogBatch::new expected 5 arguments but 6 were supplied
+error[E0609]: no field `coverage` on type `FinalizedRawLogBatch`
+
+$ cargo test -p pmkit-store broken_linkage_rejected
+error[E0599]: no variant named `BrokenBlockLinkage` found for enum `ChainSourceError`
+
+Focused verification
+====================
+
+$ cargo test -p pmkit-store header_linkage_verifies
+cargo test: 1 passed, 38 filtered out (1 suite, 0.00s)
+
+$ cargo test -p pmkit-store broken_linkage_rejected
+cargo test: 1 passed, 38 filtered out (1 suite, 0.00s)
+
+$ cargo test -p pmkit-store fetches_finalized_heads_and_logs_over_json_rpc
+cargo test: 1 passed, 38 filtered out (1 suite, 0.01s)
+
+$ cargo test -p pmkit-store finalized_raw_batch_is_decoded_and_ingested_transactionally
+cargo test: 1 passed, 38 filtered out (1 suite, 0.02s)
+
+Final gate suite
+================
+
+$ cargo test -p pmkit-store
+test result: ok. 39 passed; 0 failed; 0 ignored
+Doc-tests pmkit_store: 0 failed
+
+$ cargo fmt --all -- --check
+exit 0
+
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+Finished `dev` profile; exit 0 with no warnings
+
+$ cargo test --workspace
+210 unit/integration tests passed across 49 suites
+All workspace doc tests passed
+
+$ cargo doc --workspace --no-deps
+Finished `dev` profile; generated workspace documentation; exit 0
+
+$ git diff --check
+exit 0

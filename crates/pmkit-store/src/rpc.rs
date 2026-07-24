@@ -5,8 +5,8 @@ use serde::Deserialize;
 use tokio::sync::Semaphore;
 
 use crate::{
-    Address, BlockHead, ChainId, ChainSourceError, FinalizedBlockRange, FinalizedRawLogBatch,
-    FinalizedRawLogProvider, ProviderIdentity, RawLogIdentity, RawRpcLog,
+    Address, BlockHead, ChainId, ChainSourceError, FinalizedBlockCoverage, FinalizedBlockRange,
+    FinalizedRawLogBatch, FinalizedRawLogProvider, ProviderIdentity, RawLogIdentity, RawRpcLog,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -151,6 +151,7 @@ impl JsonRpcFinalizedProvider {
             self.chain_id,
             parse_quantity(&block.number).map_err(|error| self.failure(error))?,
             block.hash,
+            block.parent_hash,
         ))
     }
 
@@ -210,7 +211,19 @@ impl FinalizedRawLogProvider for JsonRpcFinalizedProvider {
             .into_iter()
             .map(|log| self.raw_log(log))
             .collect::<Result<Vec<_>, _>>()?;
-        FinalizedRawLogBatch::new(self.provider.clone(), range.clone(), head, finalized, logs)
+        let mut blocks = Vec::new();
+        for block_number in range.from_block..=range.to_block {
+            blocks.push(self.block(&quantity(block_number)).await?);
+        }
+        let coverage = FinalizedBlockCoverage::new(range.clone(), blocks)?;
+        FinalizedRawLogBatch::new(
+            self.provider.clone(),
+            range.clone(),
+            head,
+            finalized,
+            coverage,
+            logs,
+        )
     }
 }
 
@@ -252,6 +265,8 @@ struct RpcError {
 struct RpcBlock {
     number: String,
     hash: String,
+    #[serde(rename = "parentHash")]
+    parent_hash: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,7 +328,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
         let endpoint = format!("http://{}/", listener.local_addr().expect("server address"));
         let server = thread::spawn(move || {
-            for _ in 0..3 {
+            for _ in 0..4 {
                 let (mut stream, _) = listener.accept().expect("accept fixture request");
                 let mut request = [0_u8; 4096];
                 let size = stream.read(&mut request).expect("read fixture request");
@@ -321,9 +336,9 @@ mod tests {
                 let body = if request.contains("eth_getLogs") {
                     r#"{"jsonrpc":"2.0","id":1,"result":[]}"#
                 } else if request.contains("\"latest\"") {
-                    r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x2","hash":"0xhead"}}"#
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x2","hash":"0xhead","parentHash":"0xf1"}}"#
                 } else {
-                    r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x1","hash":"0xf1"}}"#
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x1","hash":"0xf1","parentHash":"0xgenesis"}}"#
                 };
                 write!(
                     stream,
@@ -351,6 +366,7 @@ mod tests {
         // Then: the adapter retains the finalized heads and returns an empty, valid range.
         assert_eq!(batch.head.block_number, 2);
         assert_eq!(batch.finalized.block_number, 1);
+        assert_eq!(batch.coverage.blocks, vec![batch.finalized.clone()]);
         assert!(batch.logs.is_empty());
     }
 
@@ -388,7 +404,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
         let endpoint = format!("http://{}/", listener.local_addr().expect("server address"));
         let server = thread::spawn(move || {
-            for request_number in 0..4 {
+            for request_number in 0..5 {
                 let (mut stream, _) = listener.accept().expect("accept fixture request");
                 let mut request = [0_u8; 4096];
                 let size = stream.read(&mut request).expect("read fixture request");
@@ -398,9 +414,9 @@ mod tests {
                 } else if request.contains("eth_getLogs") {
                     r#"{"jsonrpc":"2.0","id":1,"result":[]}"#
                 } else if request.contains("\"latest\"") {
-                    r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x2","hash":"0xhead"}}"#
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x2","hash":"0xhead","parentHash":"0xf1"}}"#
                 } else {
-                    r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x1","hash":"0xf1"}}"#
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x1","hash":"0xf1","parentHash":"0xgenesis"}}"#
                 };
                 let status = if request_number == 0 {
                     "503 Service Unavailable"

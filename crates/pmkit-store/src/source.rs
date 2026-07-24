@@ -5,7 +5,7 @@ use crate::{CanonicalLogSegment, ChainCheckpoint};
 pub use crate::raw::{
     BlockHead, ChainSourceError, FinalizedBlockCoverage, FinalizedBlockRange,
     FinalizedProviderHead, FinalizedRawLogBatch, FinalizedRawLogProvider, ProviderIdentity,
-    RawLogIdentity, RawRpcLog, agree_on_finalized_heads,
+    RawLogIdentity, RawRpcLog, agree_on_finalized_heads, verify_block_header_linkage,
 };
 
 /// A trait-first source of parsed canonical logs; no RPC client is implied.

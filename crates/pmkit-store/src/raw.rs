@@ -32,18 +32,51 @@ pub struct BlockHead {
     pub block_number: u64,
     /// The provider-reported block hash.
     pub block_hash: String,
+    /// The provider-reported hash of the preceding block.
+    pub parent_hash: String,
 }
 
 impl BlockHead {
     /// Creates a provider-reported block reference.
     #[must_use]
-    pub fn new(chain_id: ChainId, block_number: u64, block_hash: impl Into<String>) -> Self {
+    pub fn new(
+        chain_id: ChainId,
+        block_number: u64,
+        block_hash: impl Into<String>,
+        parent_hash: impl Into<String>,
+    ) -> Self {
         Self {
             chain_id,
             block_number,
             block_hash: block_hash.into(),
+            parent_hash: parent_hash.into(),
         }
     }
+}
+
+/// Verifies parent-hash linkage after the first header in a sequence.
+///
+/// The first header is the sequence boundary: its `parent_hash` is retained as
+/// evidence for a caller that knows the preceding block, but cannot be verified
+/// from this sequence alone.
+///
+/// # Errors
+///
+/// Returns [`ChainSourceError::BrokenBlockLinkage`] at the first header whose
+/// parent does not match the preceding header's block hash.
+pub fn verify_block_header_linkage(blocks: &[BlockHead]) -> Result<(), ChainSourceError> {
+    if let Some((previous, block)) = blocks
+        .iter()
+        .zip(blocks.iter().skip(1))
+        .find(|(previous, block)| block.parent_hash != previous.block_hash)
+    {
+        return Err(ChainSourceError::BrokenBlockLinkage {
+            block_number: block.block_number,
+            expected_parent_hash: previous.block_hash.clone(),
+            actual_parent_hash: block.parent_hash.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// One provider's current and finalized chain observations.
@@ -103,7 +136,7 @@ pub struct FinalizedBlockCoverage {
 }
 
 impl FinalizedBlockCoverage {
-    /// Validates complete, ordered block-header coverage.
+    /// Creates complete, ordered, linked block-header coverage.
     ///
     /// # Errors
     ///
@@ -113,24 +146,37 @@ impl FinalizedBlockCoverage {
         range: FinalizedBlockRange,
         blocks: Vec<BlockHead>,
     ) -> Result<Self, ChainSourceError> {
-        let expected = range
+        let coverage = Self { range, blocks };
+        coverage.verify()?;
+        Ok(coverage)
+    }
+
+    /// Verifies complete range coverage and parent-hash linkage.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed source error when coverage is incomplete, out of order,
+    /// on another chain, or has a broken parent-hash link.
+    pub fn verify(&self) -> Result<(), ChainSourceError> {
+        let expected = self
+            .range
             .to_block
-            .checked_sub(range.from_block)
+            .checked_sub(self.range.from_block)
             .and_then(|width| width.checked_add(1))
             .ok_or_else(|| ChainSourceError::MissingBlockCoverage {
                 message: "block range size overflowed".into(),
             })?;
-        if usize::try_from(expected).ok() != Some(blocks.len())
-            || !blocks.iter().enumerate().all(|(index, block)| {
-                block.chain_id == range.chain_id
-                    && block.block_number == range.from_block + index as u64
+        if usize::try_from(expected).ok() != Some(self.blocks.len())
+            || !self.blocks.iter().enumerate().all(|(index, block)| {
+                block.chain_id == self.range.chain_id
+                    && block.block_number == self.range.from_block + index as u64
             })
         {
             return Err(ChainSourceError::MissingBlockCoverage {
                 message: "coverage does not contain exactly one header per block".into(),
             });
         }
-        Ok(Self { range, blocks })
+        verify_block_header_linkage(&self.blocks)
     }
 }
 
@@ -196,6 +242,8 @@ pub struct FinalizedRawLogBatch {
     pub head: BlockHead,
     /// The provider's finalized block, which must cover `range.to_block`.
     pub finalized: BlockHead,
+    /// Complete, linked block headers for the requested range.
+    pub coverage: FinalizedBlockCoverage,
     /// The raw logs in the requested range.
     pub logs: Vec<RawRpcLog>,
 }
@@ -212,45 +260,71 @@ impl FinalizedRawLogBatch {
         range: FinalizedBlockRange,
         head: BlockHead,
         finalized: BlockHead,
+        coverage: FinalizedBlockCoverage,
         logs: Vec<RawRpcLog>,
     ) -> Result<Self, ChainSourceError> {
-        if head.chain_id != range.chain_id || finalized.chain_id != range.chain_id {
+        let batch = Self {
+            provider,
+            range,
+            head,
+            finalized,
+            coverage,
+            logs,
+        };
+        batch.verify()?;
+        Ok(batch)
+    }
+
+    /// Re-verifies a finalized provider response after construction or decoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed source error when the provider reports inconsistent chain,
+    /// finality, range, coverage, linkage, or raw-log identity data.
+    pub fn verify(&self) -> Result<(), ChainSourceError> {
+        if self.head.chain_id != self.range.chain_id
+            || self.finalized.chain_id != self.range.chain_id
+        {
             return Err(ChainSourceError::InvalidRawLog {
                 message: "provider block heads disagree with requested chain".into(),
             });
         }
-        if finalized.block_number > head.block_number {
+        if self.finalized.block_number > self.head.block_number {
             return Err(ChainSourceError::InvalidRawLog {
                 message: "finalized block is ahead of provider head".into(),
             });
         }
-        if range.to_block > finalized.block_number {
+        if self.range.to_block > self.finalized.block_number {
             return Err(ChainSourceError::FinalityViolation {
-                requested_to_block: range.to_block,
-                finalized_block: finalized.block_number,
+                requested_to_block: self.range.to_block,
+                finalized_block: self.finalized.block_number,
             });
         }
-        if logs.iter().any(|log| {
-            log.identity.provider != provider
-                || log.identity.chain_id != range.chain_id
-                || log.identity.block_number < range.from_block
-                || log.identity.block_number > range.to_block
+        if self.coverage.range != self.range {
+            return Err(ChainSourceError::MissingBlockCoverage {
+                message: "coverage range does not match the finalized response".into(),
+            });
+        }
+        self.coverage.verify()?;
+        if self.logs.iter().any(|log| {
+            log.identity.provider != self.provider
+                || log.identity.chain_id != self.range.chain_id
+                || log.identity.block_number < self.range.from_block
+                || log.identity.block_number > self.range.to_block
         }) {
             return Err(ChainSourceError::InvalidRawLog {
                 message: "raw log identity is outside the finalized response".into(),
             });
         }
-        let mut identities = HashSet::with_capacity(logs.len());
-        if logs.iter().any(|log| !identities.insert(&log.identity)) {
+        let mut identities = HashSet::with_capacity(self.logs.len());
+        if self
+            .logs
+            .iter()
+            .any(|log| !identities.insert(&log.identity))
+        {
             return Err(ChainSourceError::DuplicateRawLog);
         }
-        Ok(Self {
-            provider,
-            range,
-            head,
-            finalized,
-            logs,
-        })
+        Ok(())
     }
 }
 
@@ -316,6 +390,18 @@ pub enum ChainSourceError {
     MissingBlockCoverage {
         /// The coverage validation detail.
         message: String,
+    },
+    /// One block header does not name the preceding block's hash as its parent.
+    #[error(
+        "block {block_number} has parent hash {actual_parent_hash}; expected {expected_parent_hash}"
+    )]
+    BrokenBlockLinkage {
+        /// The block whose parent hash is inconsistent.
+        block_number: u64,
+        /// The preceding block's hash.
+        expected_parent_hash: String,
+        /// The inconsistent parent hash reported for the block.
+        actual_parent_hash: String,
     },
     /// A raw batch repeated one provider log identity.
     #[error("raw provider batch contains a duplicate log identity")]

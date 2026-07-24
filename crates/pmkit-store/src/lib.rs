@@ -62,7 +62,7 @@ pub use source::{
     BlockHead, CanonicalLogSource, ChainSourceError, FinalizedBlockCoverage, FinalizedBlockRange,
     FinalizedProviderHead, FinalizedRawLogBatch, FinalizedRawLogProvider,
     FixtureCanonicalLogSource, ProviderIdentity, RawLogIdentity, RawRpcLog,
-    agree_on_finalized_heads,
+    agree_on_finalized_heads, verify_block_header_linkage,
 };
 pub use turso_store::TursoTapeStore;
 pub use wallet::{

@@ -6,9 +6,9 @@ use rust_decimal::Decimal;
 use crate::wallet::rebuild_wallet;
 use crate::{
     Address, BlockHead, CanonicalChainLog, CanonicalLogSegment, CanonicalLogStore, ChainCheckpoint,
-    ChainEvent, ChainId, ContractRegistry, FinalizedBlockRange, FinalizedRawLogBatch,
-    ProviderIdentity, RawLogIdentity, RawRpcLog, TradeSide, TursoTapeStore, WalletQuery,
-    ingest_finalized_batch,
+    ChainEvent, ChainId, ContractRegistry, FinalizedBlockCoverage, FinalizedBlockRange,
+    FinalizedRawLogBatch, ProviderIdentity, RawLogIdentity, RawRpcLog, TradeSide, TursoTapeStore,
+    WalletQuery, ingest_finalized_batch,
 };
 
 fn database_path(name: &str) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
@@ -400,11 +400,17 @@ async fn finalized_raw_batch_is_decoded_and_ingested_transactionally()
         ],
         data: format!("0x{:064x}", 42),
     };
+    let range = FinalizedBlockRange::new(ChainId::POLYGON, 1, 1)?;
+    let coverage = FinalizedBlockCoverage::new(
+        range.clone(),
+        vec![BlockHead::new(ChainId::POLYGON, 1, "0xblock1", "0xgenesis")],
+    )?;
     let batch = FinalizedRawLogBatch::new(
         provider,
-        FinalizedBlockRange::new(ChainId::POLYGON, 1, 1)?,
-        BlockHead::new(ChainId::POLYGON, 2, "0xhead"),
-        BlockHead::new(ChainId::POLYGON, 1, "0xblock1"),
+        range,
+        BlockHead::new(ChainId::POLYGON, 2, "0xhead", "0xblock1"),
+        BlockHead::new(ChainId::POLYGON, 1, "0xblock1", "0xgenesis"),
+        coverage,
         vec![raw],
     )?;
     let store = TursoTapeStore::open_local(&path).await?;
