@@ -9,9 +9,10 @@ use pmkit_exec::{ExecError, Executor, OrderId, OrderStatus, PlaceOrder};
 use pmkit_market::Outcome;
 use pmkit_runtime::{LiveOrderPolicy, RuntimeConfig, StrategyRegistration};
 use pmkit_spec::LiveRun;
-use pmkit_store::{CausalIdentity, OwnerScope, StoreError, TapeStore};
+use pmkit_store::{CausalIdentity, OwnerScope, ReplayItem, StoreError, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 
 #[path = "live_risk.rs"]
 mod live_risk;
@@ -20,7 +21,8 @@ mod live_tape;
 #[cfg(test)]
 pub use live_risk::mark_positions;
 use live_risk::{
-    LiveRiskState, OrderRateLimits, OrderRateState, PortfolioRiskExposure, passes_aggregated_risk,
+    LiveRiskState, OrderRateLimits, OrderRateState, PortfolioRiskExposure, RiskStateError,
+    passes_aggregated_risk,
 };
 #[cfg(test)]
 pub use live_risk::{
@@ -324,6 +326,46 @@ async fn accepted_submissions(
     Ok(submissions)
 }
 
+fn risk_storage_error(source: &RiskStateError) -> StoreError {
+    StoreError::Storage {
+        message: source.to_string(),
+    }
+}
+
+async fn reconstruct_risk_state(
+    store: &dyn TapeStore,
+    scope: &OwnerScope,
+    limits: &pmkit_runtime::RiskLimits,
+) -> Result<LiveRiskState, StoreError> {
+    let page_size = NonZeroUsize::new(256).unwrap_or(NonZeroUsize::MIN);
+    let mut cursor = None;
+    let mut state = LiveRiskState::default();
+    loop {
+        let page = store.read_envelopes(scope, cursor, page_size).await?;
+        let next_cursor = page.next_cursor;
+        for item in page.items {
+            match item {
+                ReplayItem::Envelope(envelope) => state
+                    .apply_durable_account_record(&envelope.normalized, &scope.portfolio_id, limits)
+                    .map_err(|source| risk_storage_error(&source))?,
+                ReplayItem::Gap(gap) => {
+                    return Err(StoreError::Storage {
+                        message: format!(
+                            "durable risk history has a replay gap at ingest {}: {:?}",
+                            gap.ingest_sequence, gap.reason
+                        ),
+                    });
+                }
+            }
+        }
+        let Some(next_cursor) = next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+    Ok(state)
+}
+
 #[cfg(test)]
 pub async fn drive(run: &LiveRun, runtime: &RuntimeConfig) -> Result<LiveReport, StartError> {
     drive_with_store(run, runtime, None).await
@@ -469,7 +511,14 @@ async fn drive_with_control_and_rate_limits(
     let merge = tokio::spawn(async move { feed.forward(event_tx).await });
     let mut tape = LiveTape::open(run, runtime)?;
     let mut order_rate_state = OrderRateState::default();
+    let mut risk_state = LiveRiskState::default();
     if let Some(store) = store {
+        risk_state = reconstruct_risk_state(store, &scope, &limits)
+            .await
+            .map_err(|source| StartError::Storage {
+                run: run.id().clone(),
+                source,
+            })?;
         let submissions = accepted_submissions(store, &scope, run.strategies())
             .await
             .map_err(|source| StartError::Storage {
@@ -480,7 +529,6 @@ async fn drive_with_control_and_rate_limits(
         recover_intents(run, runtime, store, &scope).await?;
     }
 
-    let mut risk_state = LiveRiskState::default();
     let mut reservations: HashMap<String, Reservation> = HashMap::new();
     let mut events_processed = 0_usize;
     let mut rejected = 0_usize;
@@ -528,7 +576,12 @@ async fn drive_with_control_and_rate_limits(
         }
         if let SourceEnvelope::PmAccount(envelope) = &merged.source {
             tape.append_account(run, envelope)?;
-            risk_state.apply_account_event(&envelope.fact, &limits);
+            risk_state
+                .apply_account_event(&envelope.fact, &limits)
+                .map_err(|source| StartError::Storage {
+                    run: run.id().clone(),
+                    source: risk_storage_error(&source),
+                })?;
             match &envelope.fact {
                 PmAccountEvent::Fill { order_id, .. }
                 | PmAccountEvent::OrderCancelled { order_id, .. }
@@ -1133,6 +1186,151 @@ mod rate_limit_tests {
         assert_eq!(first_executor.submissions.load(Ordering::Relaxed), 2);
         assert_eq!(restarted_executor.submissions.load(Ordering::Relaxed), 1);
         assert_eq!(report.rejected, 1);
+        store.delete_database()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod risk_reconstruction_tests {
+    use super::reconstruct_risk_state;
+    use crate::test_support::risk;
+    use pmkit_book::OrderBookL2;
+    use pmkit_core::{MarketId, PortfolioId, RunId};
+    use pmkit_market::Outcome;
+    use pmkit_store::{
+        OwnerScope, PM_ENVELOPE_VERSION, PmEnvelope, StoreError, TapeStore, TursoTapeStore,
+    };
+    use rust_decimal::Decimal;
+    use serde_json::{Value, json};
+
+    fn account_envelope(scope: &OwnerScope, sequence: i64, payload: &Value) -> PmEnvelope {
+        PmEnvelope {
+            schema_version: PM_ENVELOPE_VERSION,
+            scope: scope.clone(),
+            venue_id: "polymarket".into(),
+            config_hash: "runtime".into(),
+            source_id: "account".into(),
+            connection_id: "account-1".into(),
+            source_timestamp_ms: sequence * 1_000,
+            canonical_source_rank: 0,
+            connection_epoch: 1,
+            frame_sequence: sequence,
+            receipt_timestamp_ms: sequence * 1_000,
+            ingest_sequence: sequence,
+            raw_frame: Vec::new(),
+            normalized: json!({
+                "portfolio": scope.portfolio_id.to_string(),
+                "payload": payload,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
+    async fn risk_state_reconstructs_from_durable() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: one owner-scoped fill and partial settlement in durable canonical order.
+        let dir = tempfile::tempdir()?;
+        let store = TursoTapeStore::open_local(dir.path().join("risk-restart.db")).await?;
+        let scope = OwnerScope::new(
+            PortfolioId::new("risk-portfolio")?,
+            RunId::new("risk-restart")?,
+        );
+        let market = MarketId::new("btc-5m")?;
+        store
+            .store_envelope(&account_envelope(
+                &scope,
+                1,
+                &json!({
+                    "kind": "fill",
+                    "ts": 1_000,
+                    "strategy": null,
+                    "order_id": "venue-1",
+                    "market": market.to_string(),
+                    "outcome": "up",
+                    "price": "0.4",
+                    "size": "10",
+                    "side": "buy",
+                    "fee": "0.1",
+                    "liquidity": "taker",
+                }),
+            ))
+            .await?;
+        store
+            .store_envelope(&account_envelope(
+                &scope,
+                2,
+                &json!({
+                    "kind": "settlement",
+                    "ts": 2_000,
+                    "market": market.to_string(),
+                    "outcome": "up",
+                    "settled_size": "4",
+                    "proceeds": "4",
+                }),
+            ))
+            .await?;
+        let limits = risk()?;
+
+        // When: startup reconstructs a fresh ledger and the first book marks it.
+        let mut state = reconstruct_risk_state(&store, &scope, &limits).await?;
+        state.update_book(
+            &market,
+            Outcome::Up,
+            &OrderBookL2 {
+                bids: vec![(Decimal::new(5, 1), Decimal::ONE)],
+                asks: vec![(Decimal::new(5, 1), Decimal::ONE)],
+                timestamp_ms: 3_000,
+                last_trade_price: None,
+            },
+            &limits,
+        );
+
+        // Then: position, exposure, accumulated PnL, and fill count equal fresh replay.
+        let position = state
+            .positions(&market)
+            .first()
+            .ok_or("missing reconstructed position")?;
+        assert_eq!(position.qty, Decimal::from(6));
+        assert_eq!(state.portfolio_notional(), Decimal::from(3));
+        assert_eq!(state.market_notional(&market), Decimal::from(3));
+        assert_eq!(state.realized_pnl(), Decimal::new(24, 1));
+        assert_eq!(state.daily_pnl(), Some(Decimal::new(29, 1)));
+        assert_eq!(state.fill_count(), 1);
+        store.delete_database()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
+    async fn risk_state_corrupt_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: an owner-scoped settlement with no matching durable position context.
+        let dir = tempfile::tempdir()?;
+        let store = TursoTapeStore::open_local(dir.path().join("risk-corrupt.db")).await?;
+        let scope = OwnerScope::new(
+            PortfolioId::new("risk-portfolio")?,
+            RunId::new("risk-corrupt")?,
+        );
+        store
+            .store_envelope(&account_envelope(
+                &scope,
+                1,
+                &json!({
+                    "kind": "settlement",
+                    "ts": 1_000,
+                    "market": "btc-5m",
+                    "outcome": "up",
+                    "settled_size": "1",
+                    "proceeds": "1",
+                }),
+            ))
+            .await?;
+
+        // When: startup attempts authoritative reconstruction.
+        let result = reconstruct_risk_state(&store, &scope, &risk()?).await;
+
+        // Then: startup fails closed through the typed storage error path.
+        assert!(matches!(result, Err(StoreError::Storage { .. })));
         store.delete_database()?;
         Ok(())
     }

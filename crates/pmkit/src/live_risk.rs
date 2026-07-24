@@ -1,11 +1,13 @@
 use pmkit_book::Position;
-use pmkit_core::{MarketId, StrategyId};
+use pmkit_core::{MarketId, PortfolioId, StrategyId};
 use pmkit_event::{MarketEvent, PmAccountEvent};
 use pmkit_exec::PlaceOrder;
 use pmkit_market::Outcome;
 use pmkit_runtime::RiskLimits;
 use rust_decimal::Decimal;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 
 #[must_use]
 pub fn passes_risk(
@@ -97,6 +99,41 @@ type FillIdentity = (
     i64,
 );
 type SettlementIdentity = (MarketId, Outcome, Decimal, Decimal, i64);
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum RiskStateError {
+    #[error("durable risk history is corrupt or inconsistent: {message}")]
+    CorruptRecord { message: String },
+}
+
+impl RiskStateError {
+    fn corrupt(message: impl Into<String>) -> Self {
+        Self::CorruptRecord {
+            message: message.into(),
+        }
+    }
+}
+
+fn string_field<'a>(payload: &'a Value, field: &str) -> Result<&'a str, RiskStateError> {
+    payload[field]
+        .as_str()
+        .ok_or_else(|| RiskStateError::corrupt(format!("{field} is missing or invalid")))
+}
+
+fn decimal_field(payload: &Value, field: &str) -> Result<Decimal, RiskStateError> {
+    Decimal::from_str(string_field(payload, field)?)
+        .map_err(|error| RiskStateError::corrupt(format!("{field} is invalid: {error}")))
+}
+
+fn outcome_field(payload: &Value) -> Result<Outcome, RiskStateError> {
+    match string_field(payload, "outcome")? {
+        "up" => Ok(Outcome::Up),
+        "down" => Ok(Outcome::Down),
+        outcome => Err(RiskStateError::corrupt(format!(
+            "unsupported outcome {outcome}"
+        ))),
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct OrderRateLimits {
@@ -318,7 +355,105 @@ impl LiveRiskState {
         self.refresh_marks(limits);
     }
 
-    pub(super) fn apply_account_event(&mut self, event: &PmAccountEvent, limits: &RiskLimits) {
+    pub(super) fn apply_durable_account_record(
+        &mut self,
+        record: &Value,
+        portfolio: &PortfolioId,
+        limits: &RiskLimits,
+    ) -> Result<(), RiskStateError> {
+        let Some(record_portfolio) = record.get("portfolio") else {
+            return Ok(());
+        };
+        let record_portfolio = record_portfolio
+            .as_str()
+            .ok_or_else(|| RiskStateError::corrupt("portfolio is invalid"))?;
+        if record_portfolio != portfolio.to_string() {
+            return Err(RiskStateError::corrupt(format!(
+                "record owner {record_portfolio} does not match {portfolio}"
+            )));
+        }
+        let payload = record
+            .get("payload")
+            .ok_or_else(|| RiskStateError::corrupt("account payload is missing"))?;
+        let timestamp_ms = payload["ts"]
+            .as_i64()
+            .ok_or_else(|| RiskStateError::corrupt("event timestamp is missing or invalid"))?;
+        let event = match string_field(payload, "kind")? {
+            "fill" => {
+                let strategy = match payload.get("strategy") {
+                    Some(Value::Null) => None,
+                    Some(Value::String(strategy)) => Some(
+                        StrategyId::new(strategy)
+                            .map_err(|error| RiskStateError::corrupt(error.to_string()))?,
+                    ),
+                    Some(_) | None => {
+                        return Err(RiskStateError::corrupt("strategy is missing or invalid"));
+                    }
+                };
+                let market = MarketId::new(string_field(payload, "market")?)
+                    .map_err(|error| RiskStateError::corrupt(error.to_string()))?;
+                let price = decimal_field(payload, "price")?;
+                let size = decimal_field(payload, "size")?;
+                let fee = decimal_field(payload, "fee")?;
+                if price < Decimal::ZERO || size <= Decimal::ZERO || fee < Decimal::ZERO {
+                    return Err(RiskStateError::corrupt(
+                        "fill price, size, or fee is outside its valid range",
+                    ));
+                }
+                PmAccountEvent::Fill {
+                    strategy,
+                    order_id: string_field(payload, "order_id")?.to_owned(),
+                    market,
+                    outcome: outcome_field(payload)?,
+                    price,
+                    size,
+                    side: match string_field(payload, "side")? {
+                        "buy" => pmkit_book::Side::Buy,
+                        "sell" => pmkit_book::Side::Sell,
+                        side_value => {
+                            return Err(RiskStateError::corrupt(format!(
+                                "unsupported side {side_value}"
+                            )));
+                        }
+                    },
+                    fee,
+                    liquidity: match string_field(payload, "liquidity")? {
+                        "maker" => pmkit_event::Liquidity::Maker,
+                        "taker" => pmkit_event::Liquidity::Taker,
+                        liquidity => {
+                            return Err(RiskStateError::corrupt(format!(
+                                "unsupported liquidity {liquidity}"
+                            )));
+                        }
+                    },
+                    timestamp_ms,
+                }
+            }
+            "settlement" => PmAccountEvent::Settlement {
+                market: MarketId::new(string_field(payload, "market")?)
+                    .map_err(|error| RiskStateError::corrupt(error.to_string()))?,
+                outcome: outcome_field(payload)?,
+                settled_size: decimal_field(payload, "settled_size")?,
+                proceeds: decimal_field(payload, "proceeds")?,
+                timestamp_ms,
+            },
+            "order_ack" | "order_cancelled" | "order_rejected" | "order_status" => {
+                return Ok(());
+            }
+            kind => {
+                return Err(RiskStateError::corrupt(format!(
+                    "unsupported account event kind {kind}"
+                )));
+            }
+        };
+        self.apply_account_event(&event, limits)
+    }
+
+    pub(super) fn apply_account_event(
+        &mut self,
+        event: &PmAccountEvent,
+        limits: &RiskLimits,
+    ) -> Result<(), RiskStateError> {
         match event {
             PmAccountEvent::Fill {
                 strategy,
@@ -331,21 +466,24 @@ impl LiveRiskState {
                 fee,
                 liquidity,
                 timestamp_ms,
-            } => self.apply_fill(
-                &MarketEvent::Fill {
-                    strategy: strategy.clone(),
-                    order_id: order_id.clone(),
-                    market: market.clone(),
-                    outcome: *outcome,
-                    price: *price,
-                    size: *size,
-                    side: *side,
-                    fee: *fee,
-                    liquidity: *liquidity,
-                    timestamp_ms: *timestamp_ms,
-                },
-                limits,
-            ),
+            } => {
+                self.apply_fill(
+                    &MarketEvent::Fill {
+                        strategy: strategy.clone(),
+                        order_id: order_id.clone(),
+                        market: market.clone(),
+                        outcome: *outcome,
+                        price: *price,
+                        size: *size,
+                        side: *side,
+                        fee: *fee,
+                        liquidity: *liquidity,
+                        timestamp_ms: *timestamp_ms,
+                    },
+                    limits,
+                );
+                Ok(())
+            }
             PmAccountEvent::Settlement {
                 market,
                 outcome,
@@ -365,20 +503,42 @@ impl LiveRiskState {
             PmAccountEvent::OrderAck { .. }
             | PmAccountEvent::OrderCancelled { .. }
             | PmAccountEvent::OrderRejected { .. }
-            | PmAccountEvent::OrderStatus { .. } => {}
+            | PmAccountEvent::OrderStatus { .. } => Ok(()),
         }
     }
 
-    fn apply_settlement(&mut self, settlement: SettlementIdentity, limits: &RiskLimits) {
-        if !self.applied_settlements.insert(settlement.clone()) {
-            return;
+    fn apply_settlement(
+        &mut self,
+        settlement: SettlementIdentity,
+        limits: &RiskLimits,
+    ) -> Result<(), RiskStateError> {
+        if self.applied_settlements.contains(&settlement) {
+            return Ok(());
         }
+        let (market, outcome, settled_size, proceeds, _) = &settlement;
+        if *settled_size <= Decimal::ZERO || *proceeds < Decimal::ZERO {
+            return Err(RiskStateError::corrupt(
+                "settlement size or proceeds is outside its valid range",
+            ));
+        }
+        let position = self
+            .positions_by_market
+            .get(market)
+            .and_then(|positions| {
+                positions
+                    .iter()
+                    .find(|position| position.outcome == *outcome)
+            })
+            .ok_or_else(|| RiskStateError::corrupt("settlement has no matching position"))?;
+        if position.qty < *settled_size {
+            return Err(RiskStateError::corrupt(
+                "settlement exceeds the matching position",
+            ));
+        }
+        let average_entry = position.avg_entry;
+        self.applied_settlements.insert(settlement.clone());
         let (market, outcome, settled_size, proceeds, _) = settlement;
         let positions = self.positions_by_market.entry(market).or_default();
-        let average_entry = positions
-            .iter()
-            .find(|position| position.outcome == outcome)
-            .map_or(Decimal::ZERO, |position| position.avg_entry);
         self.realized_pnl += proceeds - average_entry * settled_size;
         if let Some(position) = positions
             .iter_mut()
@@ -388,6 +548,7 @@ impl LiveRiskState {
         }
         positions.retain(|position| !position.qty.is_zero());
         self.refresh_marks(limits);
+        Ok(())
     }
 
     pub(super) const fn fill_count(&self) -> usize {
@@ -497,8 +658,8 @@ mod ledger_tests {
         let event = fill(market.clone());
 
         // When: both deliveries pass through the authoritative account ledger.
-        state.apply_account_event(&event, &limits);
-        state.apply_account_event(&event, &limits);
+        state.apply_account_event(&event, &limits)?;
+        state.apply_account_event(&event, &limits)?;
 
         // Then: position, marked exposure, PnL, and fill count change exactly once.
         let position = state
@@ -530,7 +691,7 @@ mod ledger_tests {
 
         // When: reconstruction sees each durable record more than once.
         for event in [&fill, &settlement, &fill, &settlement] {
-            state.apply_account_event(event, &limits);
+            state.apply_account_event(event, &limits)?;
         }
 
         // Then: only one fill and settlement affect the reconstructed ledger.
