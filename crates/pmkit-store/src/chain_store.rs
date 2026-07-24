@@ -1,46 +1,14 @@
 use async_trait::async_trait;
 
 use crate::{
-    CanonicalChainLog, CanonicalLogSegment, ChainCheckpoint, ContractRegistry, DecodeError,
-    FinalizedRawLogBatch, StoreError, TursoTapeStore, WalletQuery, WalletSnapshot, decode_raw_log,
+    CanonicalChainLog, CanonicalLogSegment, ChainCheckpoint, ContractRegistry, StoreError,
+    TursoTapeStore, WalletQuery, WalletSnapshot,
     schema::{
         DELETE_CANONICAL_LOGS_AFTER, INSERT_CANONICAL_LOG, READ_CANONICAL_CHECKPOINT,
-        READ_CANONICAL_LOGS, UPSERT_CANONICAL_CHECKPOINT,
+        READ_CANONICAL_LOGS, READ_CANONICAL_TIP, UPSERT_CANONICAL_CHECKPOINT,
     },
     wallet::rebuild_wallet,
 };
-
-/// Decodes and transactionally ingests one validated finalized raw-log batch.
-///
-/// The common ancestor is supplied by the caller that owns provider/checkpoint
-/// coordination. Durable validation and replacement remain delegated to
-/// [`CanonicalLogStore::replace_canonical_segment`].
-///
-/// # Errors
-///
-/// Returns [`StoreError::CanonicalLogDecode`] when a raw log cannot be decoded,
-/// or the store's canonical segment validation fails.
-pub async fn ingest_finalized_batch(
-    store: &TursoTapeStore,
-    registry: &ContractRegistry,
-    batch: &FinalizedRawLogBatch,
-    common_ancestor: ChainCheckpoint,
-) -> Result<(), StoreError> {
-    let logs = batch
-        .logs
-        .iter()
-        .map(|raw| decode_raw_log(registry, raw).map_err(|error| decode_error(&error)))
-        .collect::<Result<Vec<_>, _>>()?;
-    store
-        .replace_canonical_segment(registry, &CanonicalLogSegment::new(common_ancestor, logs))
-        .await
-}
-
-fn decode_error(error: &DecodeError) -> StoreError {
-    StoreError::CanonicalLogDecode {
-        message: error.to_string(),
-    }
-}
 
 /// Durable canonical-log operations and deterministic wallet reconstruction.
 #[async_trait]
@@ -68,54 +36,7 @@ impl CanonicalLogStore for TursoTapeStore {
             i64::try_from(registry.chain_id.get()).map_err(|_| StoreError::LimitTooLarge)?;
         validate_stored_chain(&self.connection, chain_id, &segment.common_ancestor).await?;
         let transaction = self.connection.unchecked_transaction().await?;
-        transaction
-            .execute(
-                DELETE_CANONICAL_LOGS_AFTER,
-                (
-                    chain_id,
-                    i64::try_from(segment.common_ancestor.block_number)
-                        .map_err(|_| StoreError::LimitTooLarge)?,
-                ),
-            )
-            .await?;
-        for log in &segment.logs {
-            transaction
-                .execute(
-                    INSERT_CANONICAL_LOG,
-                    (
-                        i64::try_from(log.identity.chain_id.get())
-                            .map_err(|_| StoreError::LimitTooLarge)?,
-                        i64::try_from(log.identity.block_number)
-                            .map_err(|_| StoreError::LimitTooLarge)?,
-                        log.identity.block_hash.as_str(),
-                        log.identity.transaction_hash.as_str(),
-                        i64::try_from(log.identity.transaction_index)
-                            .map_err(|_| StoreError::LimitTooLarge)?,
-                        i64::try_from(log.identity.log_index)
-                            .map_err(|_| StoreError::LimitTooLarge)?,
-                        log.contract_address.as_str(),
-                        serde_json::to_string(&log.event).map_err(|error| {
-                            StoreError::CanonicalLogDecode {
-                                message: error.to_string(),
-                            }
-                        })?,
-                    ),
-                )
-                .await?;
-        }
-        let checkpoint = segment_tip(segment);
-        transaction
-            .execute(
-                UPSERT_CANONICAL_CHECKPOINT,
-                (
-                    i64::try_from(checkpoint.chain_id.get())
-                        .map_err(|_| StoreError::LimitTooLarge)?,
-                    i64::try_from(checkpoint.block_number)
-                        .map_err(|_| StoreError::LimitTooLarge)?,
-                    checkpoint.block_hash.as_str(),
-                ),
-            )
-            .await?;
+        write_canonical_segment(&transaction, registry, segment).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -145,7 +66,61 @@ impl CanonicalLogStore for TursoTapeStore {
     }
 }
 
-fn validate_segment(
+pub async fn write_canonical_segment(
+    transaction: &turso::transaction::Transaction<'_>,
+    registry: &ContractRegistry,
+    segment: &CanonicalLogSegment,
+) -> Result<(), StoreError> {
+    let chain_id = i64::try_from(registry.chain_id.get()).map_err(|_| StoreError::LimitTooLarge)?;
+    transaction
+        .execute(
+            DELETE_CANONICAL_LOGS_AFTER,
+            (
+                chain_id,
+                i64::try_from(segment.common_ancestor.block_number)
+                    .map_err(|_| StoreError::LimitTooLarge)?,
+            ),
+        )
+        .await?;
+    for log in &segment.logs {
+        transaction
+            .execute(
+                INSERT_CANONICAL_LOG,
+                (
+                    i64::try_from(log.identity.chain_id.get())
+                        .map_err(|_| StoreError::LimitTooLarge)?,
+                    i64::try_from(log.identity.block_number)
+                        .map_err(|_| StoreError::LimitTooLarge)?,
+                    log.identity.block_hash.as_str(),
+                    log.identity.transaction_hash.as_str(),
+                    i64::try_from(log.identity.transaction_index)
+                        .map_err(|_| StoreError::LimitTooLarge)?,
+                    i64::try_from(log.identity.log_index).map_err(|_| StoreError::LimitTooLarge)?,
+                    log.contract_address.as_str(),
+                    serde_json::to_string(&log.event).map_err(|error| {
+                        StoreError::CanonicalLogDecode {
+                            message: error.to_string(),
+                        }
+                    })?,
+                ),
+            )
+            .await?;
+    }
+    let checkpoint = segment_tip(segment);
+    transaction
+        .execute(
+            UPSERT_CANONICAL_CHECKPOINT,
+            (
+                i64::try_from(checkpoint.chain_id.get()).map_err(|_| StoreError::LimitTooLarge)?,
+                i64::try_from(checkpoint.block_number).map_err(|_| StoreError::LimitTooLarge)?,
+                checkpoint.block_hash.as_str(),
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+pub fn validate_segment(
     registry: &ContractRegistry,
     segment: &CanonicalLogSegment,
 ) -> Result<(), StoreError> {
@@ -171,13 +146,13 @@ fn validate_segment(
     Ok(())
 }
 
-async fn validate_stored_chain(
+pub async fn validate_stored_chain(
     connection: &turso::Connection,
     chain_id: i64,
     ancestor: &ChainCheckpoint,
 ) -> Result<(), StoreError> {
-    let checkpoint = read_checkpoint(connection, chain_id).await?;
-    let tip = read_tip(connection, chain_id).await?;
+    let checkpoint = read_chain_checkpoint(connection, chain_id, READ_CANONICAL_CHECKPOINT).await?;
+    let tip = read_chain_checkpoint(connection, chain_id, READ_CANONICAL_TIP).await?;
     if checkpoint != tip {
         return Err(StoreError::InvalidCanonicalSegment);
     }
@@ -260,33 +235,12 @@ fn decode_log(row: &turso::Row) -> Result<CanonicalChainLog, StoreError> {
     })
 }
 
-async fn read_checkpoint(
+async fn read_chain_checkpoint(
     connection: &turso::Connection,
     chain_id: i64,
+    sql: &str,
 ) -> Result<Option<ChainCheckpoint>, StoreError> {
-    let mut rows = connection
-        .query(READ_CANONICAL_CHECKPOINT, [chain_id])
-        .await?;
-    let Some(row) = rows.next().await? else {
-        return Ok(None);
-    };
-    let block_number: i64 = row.get(0)?;
-    Ok(Some(ChainCheckpoint::new(
-        crate::ChainId::POLYGON,
-        u64::try_from(block_number).map_err(|_| StoreError::CanonicalLogDecode {
-            message: "negative checkpoint block".into(),
-        })?,
-        row.get::<String>(1)?,
-    )))
-}
-
-async fn read_tip(
-    connection: &turso::Connection,
-    chain_id: i64,
-) -> Result<Option<ChainCheckpoint>, StoreError> {
-    let mut rows = connection
-        .query(crate::schema::READ_CANONICAL_TIP, [chain_id])
-        .await?;
+    let mut rows = connection.query(sql, [chain_id]).await?;
     let Some(row) = rows.next().await? else {
         return Ok(None);
     };

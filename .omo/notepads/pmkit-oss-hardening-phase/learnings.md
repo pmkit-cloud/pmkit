@@ -39,3 +39,16 @@
   `outcome: Outcome`, exact `resolution_price: Decimal`, and
   `timestamp_ms: i64`; Todo 8/11 can consume this shape without introducing
   floating-point settlement values.
+
+## 2026-07-24 - Persisted finalized progression
+
+- Migration 3 creates `finalized_chain_checkpoints(chain_id PRIMARY KEY,
+  block_number, block_hash, updated_at)`. `TursoTapeStore::finalized_checkpoint`
+  restores the per-chain checkpoint after restart for Todo 25/27 coordination.
+- `ingest_finalized_batch` rejects a lower provider finalized height with
+  `StoreError::FinalizedHeadRegression`. Equal heights require the persisted
+  hash; advancing heights require coverage through the full finalized
+  `BlockHead` and Todo-23 parent linkage back to the persisted hash.
+- Incomplete coverage is held with no canonical writes. A verified advance
+  filters logs at or below the effective finalized head and commits canonical
+  replacement plus the monotonic checkpoint upsert in one transaction.

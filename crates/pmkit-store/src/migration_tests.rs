@@ -57,11 +57,13 @@ async fn migration_applies_and_is_idempotent() -> Result<(), Box<dyn std::error:
         rows
     };
 
-    // Then: both current migrations are recorded once with timestamps.
+    // Then: all current migrations are recorded once with timestamps.
     assert!(matches!(
         first_rows.as_slice(),
-        [(1, first_applied_at), (2, second_applied_at)]
-            if !first_applied_at.is_empty() && !second_applied_at.is_empty()
+        [(1, first_applied_at), (2, second_applied_at), (3, third_applied_at)]
+            if !first_applied_at.is_empty()
+                && !second_applied_at.is_empty()
+                && !third_applied_at.is_empty()
     ));
     assert_eq!(reopened_rows, first_rows);
     Ok(())
@@ -76,7 +78,7 @@ async fn migration_rejects_newer_version() -> Result<(), Box<dyn std::error::Err
     let (database, connection) = open_connection(&path).await?;
     connection
         .execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (3, CURRENT_TIMESTAMP)",
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (4, CURRENT_TIMESTAMP)",
             (),
         )
         .await?;
@@ -88,8 +90,8 @@ async fn migration_rejects_newer_version() -> Result<(), Box<dyn std::error::Err
     assert!(matches!(
         TursoTapeStore::open_local(&path).await,
         Err(StoreError::DatabaseSchemaTooNew {
-            database_version: 3,
-            max_supported_version: 2,
+            database_version: 4,
+            max_supported_version: 3,
         })
     ));
     Ok(())
@@ -98,7 +100,7 @@ async fn migration_rejects_newer_version() -> Result<(), Box<dyn std::error::Err
 #[tokio::test]
 async fn migration_rolls_back_on_failure() -> Result<(), Box<dyn std::error::Error>> {
     const FAILING_MIGRATION: Migration = Migration::new(
-        3,
+        4,
         &[
             "CREATE TABLE migration_partial_change (value INTEGER NOT NULL)",
             "CREATE TABLE migration_partial_change (",
@@ -130,7 +132,7 @@ async fn migration_rolls_back_on_failure() -> Result<(), Box<dyn std::error::Err
 
     // Then: its version and first schema change are both rolled back.
     assert!(matches!(result, Err(StoreError::Storage { .. })));
-    assert!(matches!(migrations.as_slice(), [(1, _), (2, _)]));
+    assert!(matches!(migrations.as_slice(), [(1, _), (2, _), (3, _)]));
     assert_eq!(partial_table_count, 0);
     Ok(())
 }
@@ -203,7 +205,7 @@ async fn decision_version_round_trip() -> Result<(), Box<dyn std::error::Error>>
     };
 
     // Then: legacy records become version 1 without changing their JSON payloads.
-    assert!(matches!(migrations.as_slice(), [(1, _), (2, _)]));
+    assert!(matches!(migrations.as_slice(), [(1, _), (2, _), (3, _)]));
     assert!(killed);
     assert_eq!(decision_version, 1);
     assert_eq!(intent_version, 1);

@@ -25,6 +25,7 @@ mod bundle;
 mod chain;
 mod chain_store;
 mod decoder;
+mod finalized_store;
 mod integrity;
 mod local_files;
 mod log;
@@ -51,8 +52,9 @@ mod chain_tests;
 
 pub use bundle::{CacheChecksum, REPLAY_BUNDLE_VERSION, export_replay_bundle};
 pub use chain::{Address, AddressError, ChainId, ContractRegistry, LegacyV1Contracts};
-pub use chain_store::{CanonicalLogStore, ingest_finalized_batch};
+pub use chain_store::CanonicalLogStore;
 pub use decoder::{DecodeError, decode_raw_log};
+pub use finalized_store::ingest_finalized_batch;
 pub use log::{
     CanonicalChainLog, CanonicalLogIdentity, CanonicalLogSegment, ChainCheckpoint, ChainEvent,
     OutcomeTokenAmount, TradeSide,
@@ -87,6 +89,31 @@ pub enum StoreError {
         database_version: i64,
         /// The newest migration known to this binary.
         max_supported_version: i64,
+    },
+    /// A provider response failed finalized range or header validation.
+    #[error(transparent)]
+    ChainSource(#[from] ChainSourceError),
+    /// A provider attempted to move the durable finalized head backward.
+    #[error(
+        "chain {chain_id} finalized head regressed from block {persisted_block_number} to {proposed_block_number}"
+    )]
+    FinalizedHeadRegression {
+        /// The chain whose finalized progression regressed.
+        chain_id: u64,
+        /// The durable finalized height before this batch.
+        persisted_block_number: u64,
+        /// The lower provider-reported finalized height.
+        proposed_block_number: u64,
+    },
+    /// A reported finalized head contradicts its persisted or covered hash.
+    #[error(
+        "chain {chain_id} finalized head at block {block_number} is not linked to persisted canonical evidence"
+    )]
+    FinalizedHeadNotLinked {
+        /// The chain whose finalized evidence did not link.
+        chain_id: u64,
+        /// The contradictory finalized height.
+        block_number: u64,
     },
     /// A causal decision or durable intent uses a record version this binary cannot decode.
     #[error(

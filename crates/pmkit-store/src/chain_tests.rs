@@ -434,3 +434,197 @@ async fn finalized_raw_batch_is_decoded_and_ingested_transactionally()
     store.delete_database()?;
     Ok(())
 }
+
+fn raw_transfer(block_number: u64, block_hash: &str, amount: u64) -> RawRpcLog {
+    RawRpcLog {
+        identity: RawLogIdentity {
+            provider: ProviderIdentity::new("fixture-rpc"),
+            chain_id: ChainId::POLYGON,
+            block_number,
+            block_hash: block_hash.into(),
+            transaction_hash: format!("0xtx{block_number}"),
+            transaction_index: 0,
+            log_index: 0,
+        },
+        contract_address: ContractRegistry::polygon().collateral,
+        topics: vec![
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a8df523b3ef".into(),
+            "0x0000000000000000000000000000000000000000000000000000000000000001".into(),
+            "0x00000000000000000000000000000000000000000000000000000000000000aa".into(),
+        ],
+        data: format!("0x{amount:064x}"),
+    }
+}
+
+fn finalized_batch(
+    blocks: Vec<BlockHead>,
+    finalized: BlockHead,
+    logs: Vec<RawRpcLog>,
+) -> Result<FinalizedRawLogBatch, Box<dyn std::error::Error>> {
+    let from_block = blocks
+        .first()
+        .ok_or("finalized batch fixture needs a first block")?
+        .block_number;
+    let to_block = blocks
+        .last()
+        .ok_or("finalized batch fixture needs a last block")?
+        .block_number;
+    let range = FinalizedBlockRange::new(ChainId::POLYGON, from_block, to_block)?;
+    let coverage = FinalizedBlockCoverage::new(range.clone(), blocks)?;
+    Ok(FinalizedRawLogBatch::new(
+        ProviderIdentity::new("fixture-rpc"),
+        range,
+        finalized.clone(),
+        finalized,
+        coverage,
+        logs,
+    )?)
+}
+
+#[tokio::test]
+async fn finality_progresses_across_restart() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: finalized block two persisted even though its batch has no block-two log.
+    let (_dir, path) = database_path("finality-restart")?;
+    let registry = ContractRegistry::polygon();
+    let store = TursoTapeStore::open_local(&path).await?;
+    let first = finalized_batch(
+        vec![
+            BlockHead::new(ChainId::POLYGON, 1, "0xblock1", "0xgenesis"),
+            BlockHead::new(ChainId::POLYGON, 2, "0xblock2", "0xblock1"),
+        ],
+        BlockHead::new(ChainId::POLYGON, 2, "0xblock2", "0xblock1"),
+        vec![raw_transfer(1, "0xblock1", 10)],
+    )?;
+    ingest_finalized_batch(
+        &store,
+        &registry,
+        &first,
+        ChainCheckpoint::new(ChainId::POLYGON, 0, "0xgenesis"),
+    )
+    .await?;
+    drop(store);
+
+    // When: the store reopens, holds an incompletely proven advance, then receives linked batches.
+    let store = TursoTapeStore::open_local(&path).await?;
+    assert_eq!(
+        store.finalized_checkpoint(ChainId::POLYGON).await?,
+        Some(ChainCheckpoint::new(ChainId::POLYGON, 2, "0xblock2"))
+    );
+    let held = finalized_batch(
+        vec![BlockHead::new(ChainId::POLYGON, 3, "0xblock3", "0xblock2")],
+        BlockHead::new(ChainId::POLYGON, 4, "0xblock4", "0xblock3"),
+        vec![raw_transfer(3, "0xblock3", 20)],
+    )?;
+    ingest_finalized_batch(
+        &store,
+        &registry,
+        &held,
+        ChainCheckpoint::new(ChainId::POLYGON, 2, "0xblock2"),
+    )
+    .await?;
+    assert_eq!(
+        store.finalized_checkpoint(ChainId::POLYGON).await?,
+        Some(ChainCheckpoint::new(ChainId::POLYGON, 2, "0xblock2"))
+    );
+    let held_snapshot = store
+        .wallet_snapshot(&WalletQuery::new(address(
+            "0x00000000000000000000000000000000000000aa",
+        )))
+        .await?;
+    assert_eq!(held_snapshot.collateral_balance, Decimal::from(10));
+
+    let second = finalized_batch(
+        vec![
+            BlockHead::new(ChainId::POLYGON, 3, "0xblock3", "0xblock2"),
+            BlockHead::new(ChainId::POLYGON, 4, "0xblock4", "0xblock3"),
+        ],
+        BlockHead::new(ChainId::POLYGON, 4, "0xblock4", "0xblock3"),
+        vec![raw_transfer(3, "0xblock3", 20)],
+    )?;
+    ingest_finalized_batch(
+        &store,
+        &registry,
+        &second,
+        ChainCheckpoint::new(ChainId::POLYGON, 2, "0xblock2"),
+    )
+    .await?;
+    let third = finalized_batch(
+        vec![BlockHead::new(ChainId::POLYGON, 5, "0xblock5", "0xblock4")],
+        BlockHead::new(ChainId::POLYGON, 5, "0xblock5", "0xblock4"),
+        vec![raw_transfer(5, "0xblock5", 30)],
+    )?;
+    ingest_finalized_batch(
+        &store,
+        &registry,
+        &third,
+        ChainCheckpoint::new(ChainId::POLYGON, 4, "0xblock4"),
+    )
+    .await?;
+
+    // Then: progression resumes from the durable head and only linked finalized logs surface.
+    assert_eq!(
+        store.finalized_checkpoint(ChainId::POLYGON).await?,
+        Some(ChainCheckpoint::new(ChainId::POLYGON, 5, "0xblock5"))
+    );
+    let snapshot = store
+        .wallet_snapshot(&WalletQuery::new(address(
+            "0x00000000000000000000000000000000000000aa",
+        )))
+        .await?;
+    assert_eq!(snapshot.collateral_balance, Decimal::from(60));
+    store.delete_database()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn finality_regression_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: a store whose durable finalized head is block two.
+    let (_dir, path) = database_path("finality-regression")?;
+    let registry = ContractRegistry::polygon();
+    let store = TursoTapeStore::open_local(&path).await?;
+    let first = finalized_batch(
+        vec![
+            BlockHead::new(ChainId::POLYGON, 1, "0xblock1", "0xgenesis"),
+            BlockHead::new(ChainId::POLYGON, 2, "0xblock2", "0xblock1"),
+        ],
+        BlockHead::new(ChainId::POLYGON, 2, "0xblock2", "0xblock1"),
+        vec![raw_transfer(1, "0xblock1", 10)],
+    )?;
+    ingest_finalized_batch(
+        &store,
+        &registry,
+        &first,
+        ChainCheckpoint::new(ChainId::POLYGON, 0, "0xgenesis"),
+    )
+    .await?;
+    let regressed = finalized_batch(
+        vec![BlockHead::new(ChainId::POLYGON, 1, "0xblock1", "0xgenesis")],
+        BlockHead::new(ChainId::POLYGON, 1, "0xblock1", "0xgenesis"),
+        Vec::new(),
+    )?;
+
+    // When: a provider attempts to move finality backward to block one.
+    let result = ingest_finalized_batch(
+        &store,
+        &registry,
+        &regressed,
+        ChainCheckpoint::new(ChainId::POLYGON, 1, "0xblock1"),
+    )
+    .await;
+
+    // Then: the typed error rejects the move and preserves the durable checkpoint.
+    assert!(matches!(
+        result,
+        Err(crate::StoreError::FinalizedHeadRegression {
+            chain_id: 137,
+            persisted_block_number: 2,
+            proposed_block_number: 1,
+        })
+    ));
+    assert_eq!(
+        store.finalized_checkpoint(ChainId::POLYGON).await?,
+        Some(ChainCheckpoint::new(ChainId::POLYGON, 2, "0xblock2"))
+    );
+    store.delete_database()?;
+    Ok(())
+}

@@ -1,7 +1,7 @@
 pub const PM_ENVELOPE_VERSION: i64 = 1;
 pub const CAUSAL_DECISION_SCHEMA_VERSION: i64 = 1;
 pub const DURABLE_INTENT_SCHEMA_VERSION: i64 = 1;
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 pub const CREATE_SCHEMA_MIGRATIONS: &str = "
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -11,6 +11,14 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 pub const RECORD_SCHEMA_MIGRATION: &str = "
 INSERT INTO schema_migrations (version) VALUES (?1)";
+
+pub const CREATE_FINALIZED_CHAIN_CHECKPOINTS: &str = "
+CREATE TABLE finalized_chain_checkpoints (
+    chain_id INTEGER PRIMARY KEY,
+    block_number INTEGER NOT NULL CHECK (block_number >= 0),
+    block_hash TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+)";
 
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS pm_envelopes (
@@ -155,6 +163,20 @@ pub const READ_CANONICAL_TIP: &str = "
 SELECT block_number, block_hash FROM canonical_chain_logs
 WHERE chain_id = ?1
 ORDER BY block_number DESC, transaction_index DESC, log_index DESC LIMIT 1";
+
+pub const READ_FINALIZED_CHAIN_CHECKPOINT: &str = "
+SELECT block_number, block_hash FROM finalized_chain_checkpoints WHERE chain_id = ?1";
+
+pub const UPSERT_FINALIZED_CHAIN_CHECKPOINT: &str = "
+INSERT INTO finalized_chain_checkpoints (chain_id, block_number, block_hash)
+VALUES (?1, ?2, ?3)
+ON CONFLICT(chain_id) DO UPDATE SET
+    block_number = excluded.block_number,
+    block_hash = excluded.block_hash,
+    updated_at = CURRENT_TIMESTAMP
+WHERE excluded.block_number > finalized_chain_checkpoints.block_number
+   OR (excluded.block_number = finalized_chain_checkpoints.block_number
+       AND excluded.block_hash = finalized_chain_checkpoints.block_hash)";
 
 pub const READ_PENDING_INTENTS: &str = "
 SELECT portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence, schema_version, payload_json

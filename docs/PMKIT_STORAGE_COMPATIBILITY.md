@@ -32,6 +32,15 @@ Database migration version `2` adds non-null `schema_version` columns to
 that default to pre-column legacy rows, so their existing payloads and causal
 identities remain unchanged while becoming explicit version-1 records.
 
+Database migration version `3` creates `finalized_chain_checkpoints`, keyed by
+`chain_id`, with the durable finalized block number, block hash, and update
+timestamp. Finalized ingestion rejects a lower block number with
+`StoreError::FinalizedHeadRegression`; equal-height updates require the same
+hash. An advancing batch must carry complete linked header coverage through the
+reported finalized `BlockHead`. Incomplete evidence is held without canonical
+log writes, and a verified checkpoint advance commits in the same transaction
+as its canonical logs.
+
 Opening fails with a typed `StoreError` when the newest on-disk version exceeds
 the binary's maximum supported version. PMKit never auto-downgrades a database.
 
