@@ -66,6 +66,7 @@ pub enum BinanceAggTradeParseError {
 }
 
 const VISION_MICROSECOND_THRESHOLD: i64 = 1_735_689_600_000_000;
+pub const BINANCE_REFERENCE_SOURCE_ID: &str = "binance:aggTrade";
 
 #[derive(Debug, Clone, Copy)]
 struct BinanceAggTradeFields {
@@ -181,6 +182,18 @@ const fn binance_trade_from_fields(
     })
 }
 
+pub fn reference_trade_identity(fact: &CexReferenceEvent) -> Result<(i64, u64), DataSourceError> {
+    let CexReferenceEvent::Trade {
+        aggregate_trade_id, ..
+    } = fact;
+    Ok((
+        i64::try_from(*aggregate_trade_id).map_err(|_| DataSourceError::ReplayGap {
+            message: "Binance aggregate trade ID exceeds frame range".into(),
+        })?,
+        *aggregate_trade_id,
+    ))
+}
+
 fn json_field<'a>(
     object: &'a Map<String, Value>,
     field: &'static str,
@@ -201,8 +214,8 @@ fn vision_column<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        BinanceAggTradeParseError, binance_history_source, parse_binance_agg_trade_live,
-        parse_binance_vision_agg_trade_row,
+        BINANCE_REFERENCE_SOURCE_ID, BinanceAggTradeParseError, binance_history_source,
+        parse_binance_agg_trade_live, parse_binance_vision_agg_trade_row, reference_trade_identity,
     };
     use crate::DataSourceError;
     use pmkit_event::{CexReferenceEnvelope, CexReferenceEvent, StreamMetadata};
@@ -221,28 +234,28 @@ mod tests {
         let live_envelope = CexReferenceEnvelope {
             metadata: StreamMetadata {
                 schema_version: 1,
-                source_id: "binance:btcusdt@aggTrade".into(),
+                source_id: BINANCE_REFERENCE_SOURCE_ID.into(),
                 source_time_ms: 1_710_000_000_123,
                 canonical_source_rank: 0,
                 receipt_time_ms: 1_710_000_000_200,
                 connection_id: "live-1".into(),
                 connection_epoch: 0,
-                frame_sequence: 1,
-                ingest_sequence: 1,
+                frame_sequence: 12345,
+                ingest_sequence: 12345,
             },
             fact: live,
         };
         let history_envelope = CexReferenceEnvelope {
             metadata: StreamMetadata {
                 schema_version: 1,
-                source_id: "binance-vision:BTCUSDT-aggTrades".into(),
+                source_id: BINANCE_REFERENCE_SOURCE_ID.into(),
                 source_time_ms: 1_710_000_000_123,
                 canonical_source_rank: 0,
                 receipt_time_ms: 1_710_000_001_000,
                 connection_id: "archive-1".into(),
                 connection_epoch: 0,
-                frame_sequence: 1,
-                ingest_sequence: 1,
+                frame_sequence: 12345,
+                ingest_sequence: 12345,
             },
             fact: history,
         };
@@ -298,10 +311,23 @@ mod tests {
 
         // Then: both sources produce the same normalized timestamp.
         assert_eq!(live, history);
-        let CexReferenceEvent::Trade { timestamp_ms, .. } = history else {
-            panic!("expected trade event");
+        let timestamp_ms = match history {
+            CexReferenceEvent::Trade { timestamp_ms, .. } => timestamp_ms,
         };
         assert_eq!(timestamp_ms, 1_735_689_600_123);
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_trade_identity_is_shared_by_live_and_history()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fact = parse_binance_agg_trade_live(
+            r#"{"e":"aggTrade","a":7,"p":"0.42","q":"1","T":1735689600123,"m":false}"#,
+            Asset::Btc,
+        )?;
+
+        assert!(matches!(reference_trade_identity(&fact), Ok((7, 7))));
+        assert_eq!(BINANCE_REFERENCE_SOURCE_ID, "binance:aggTrade");
         Ok(())
     }
 }
