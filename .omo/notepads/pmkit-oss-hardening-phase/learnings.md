@@ -76,3 +76,15 @@
 - The existing `pending` or `unknown` row stays unresolved on abort. Only
   unambiguous `Open`/`Accepted` or `Rejected`/`Cancelled` statuses transition
   it to the existing accepted or rejected outcome.
+
+## 2026-07-24 - Multi-provider finality quorum
+
+- `agree_on_finalized_heads(configured_provider_count: usize, provider_heads:
+  &[FinalizedProviderHead]) -> Result<BlockHead, ChainSourceError>` uses a
+  strict majority of configured providers with a minimum of two corroborating
+  identities. Two configured providers retain exact legacy head/finality
+  equality; larger configurations quorum on the complete finalized block.
+- `agree_on_finalized_log_batches(configured_provider_count: usize, batches:
+  &[FinalizedRawLogBatch]) -> Result<FinalizedRawLogBatch, ChainSourceError>`
+  requires the same quorum on verified range, coverage, and provider-neutral
+  logs ending at the agreed finalized height.
