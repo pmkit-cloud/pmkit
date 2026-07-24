@@ -1,7 +1,10 @@
+use pmkit_core::{EmptyIdError, MarketId};
+use polymarket_client_sdk_v2::error::Error as SdkError;
 use polymarket_client_sdk_v2::gamma::Client as SdkGammaClient;
 use polymarket_client_sdk_v2::gamma::types::request::MarketsRequest;
 use polymarket_client_sdk_v2::gamma::types::response::Market;
 use polymarket_client_sdk_v2::types::U256;
+use thiserror::Error;
 
 /// Market metadata returned by Gamma.
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +84,23 @@ impl GammaMarket {
     }
 }
 
+#[derive(Debug, Error)]
+pub enum DiscoveryError {
+    /// The Gamma API returned a transport or request failure.
+    #[error("gamma market listing failed: {source}")]
+    Listing {
+        #[source]
+        source: SdkError,
+    },
+
+    /// A discovered market contained an empty or whitespace-only identifier.
+    #[error("gamma market identifier was invalid: {source}")]
+    InvalidMarketId {
+        #[source]
+        source: EmptyIdError,
+    },
+}
+
 /// A Gamma client using the official Polymarket SDK.
 #[derive(Debug, Clone)]
 pub struct GammaClient {
@@ -100,6 +120,29 @@ impl GammaClient {
         Self {
             client: SdkGammaClient::default(),
         }
+    }
+
+    /// Lists active Gamma markets.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error if the SDK request fails, a malformed payload error if Gamma
+    /// returns invalid market data, or an invalid market id error if a market id is empty.
+    pub async fn list_active_markets(&self) -> Result<Vec<MarketId>, DiscoveryError> {
+        let request = MarketsRequest::builder().closed(false).build();
+        let markets = self
+            .client
+            .markets(&request)
+            .await
+            .map_err(|source| DiscoveryError::Listing { source })?;
+
+        markets
+            .into_iter()
+            .map(|market| {
+                MarketId::new(market.id)
+                    .map_err(|source| DiscoveryError::InvalidMarketId { source })
+            })
+            .collect()
     }
 
     /// Finds metadata by CLOB token id.
@@ -160,26 +203,4 @@ fn parse_timestamp(value: &str) -> Option<i64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::GammaMarket;
-
-    #[test]
-    fn binary_market_helpers_use_token_order() {
-        let market = GammaMarket {
-            event_id: "event".into(),
-            end_date_iso: None,
-            negative_risk: false,
-            outcomes: vec!["Yes".into(), "No".into()],
-            clob_token_ids: vec!["a".into(), "b".into()],
-            closed: true,
-            closed_time: Some(1),
-            outcome_prices: vec![1.0, 0.0],
-            title: "Question".into(),
-            slug: "market".into(),
-            event_slug: "event".into(),
-        };
-        assert_eq!(market.opposite_token("a"), Some("b"));
-        assert_eq!(market.outcome_for_token("b"), Some("No"));
-        assert_eq!(market.resolution_price("a"), Some(1.0));
-    }
-}
+mod tests;
