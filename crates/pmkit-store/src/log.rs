@@ -39,6 +39,19 @@ pub enum TradeSide {
     Sell,
 }
 
+impl TradeSide {
+    pub(crate) const fn from_collateral_flow(
+        maker_asset_is_collateral: bool,
+        taker_asset_is_collateral: bool,
+    ) -> Option<Self> {
+        match (maker_asset_is_collateral, taker_asset_is_collateral) {
+            (true, false) => Some(Self::Buy),
+            (false, true) => Some(Self::Sell),
+            (true, true) | (false, false) => None,
+        }
+    }
+}
+
 /// A typed Polymarket event parsed from a canonical EVM log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

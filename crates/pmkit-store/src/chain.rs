@@ -97,6 +97,20 @@ impl ContractRegistry {
         self
     }
 
+    pub(crate) fn is_conditional_tokens(&self, address: &Address) -> bool {
+        address == &self.conditional_tokens
+    }
+
+    pub(crate) fn is_current_exchange(&self, address: &Address) -> bool {
+        address == &self.ctf_exchange || address == &self.neg_risk_exchange
+    }
+
+    pub(crate) fn is_legacy_exchange(&self, address: &Address) -> bool {
+        self.legacy_v1.as_ref().is_some_and(|legacy| {
+            address == &legacy.ctf_exchange || address == &legacy.neg_risk_exchange
+        })
+    }
+
     /// Returns whether this registry accepts the log's chain, contract, and event family.
     #[must_use]
     pub fn accepts(&self, log: &CanonicalChainLog) -> bool {
@@ -110,17 +124,13 @@ impl ContractRegistry {
             | ChainEvent::PositionSplit { .. }
             | ChainEvent::PositionsMerge { .. }
             | ChainEvent::PayoutRedemption { .. } => {
-                log.contract_address == self.conditional_tokens
+                self.is_conditional_tokens(&log.contract_address)
             }
             ChainEvent::OrderFilled { .. }
             | ChainEvent::OrdersMatched { .. }
             | ChainEvent::FeeCharged { .. } => {
-                log.contract_address == self.ctf_exchange
-                    || log.contract_address == self.neg_risk_exchange
-                    || self.legacy_v1.as_ref().is_some_and(|legacy| {
-                        log.contract_address == legacy.ctf_exchange
-                            || log.contract_address == legacy.neg_risk_exchange
-                    })
+                self.is_current_exchange(&log.contract_address)
+                    || self.is_legacy_exchange(&log.contract_address)
             }
         }
     }
