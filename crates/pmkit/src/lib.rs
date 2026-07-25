@@ -84,7 +84,7 @@ pub struct LiveReport {
     pub events_processed: usize,
     /// Total venue fills observed.
     pub fills: usize,
-    /// Orders rejected by the risk gate before reaching the venue.
+    /// Orders rejected by a risk gate or execution boundary.
     pub rejected: usize,
     /// Typed terminal metrics for this run.
     pub metrics: RunMetricsSnapshot,
@@ -630,9 +630,20 @@ pub(crate) fn observe_reconnect(
     else {
         return false;
     };
-    connection_epochs
-        .insert(stream_id, connection_epoch)
-        .is_some_and(|previous| connection_epoch > previous)
+    match connection_epochs.entry(stream_id) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(connection_epoch);
+            false
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if connection_epoch > *entry.get() {
+                entry.insert(connection_epoch);
+                true
+            } else {
+                false
+            }
+        }
+    }
 }
 
 async fn store_signal(

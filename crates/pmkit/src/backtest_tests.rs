@@ -397,6 +397,10 @@ fn reconnects_follow_connection_epoch() {
         &mut epochs
     ));
     assert!(!crate::observe_reconnect(
+        &source(Outcome::Up, 0),
+        &mut epochs
+    ));
+    assert!(!crate::observe_reconnect(
         &source(Outcome::Up, 1),
         &mut epochs
     ));
