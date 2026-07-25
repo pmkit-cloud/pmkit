@@ -202,6 +202,8 @@ pub struct ReplayCursor {
     pub canonical_source_rank: i64,
     /// The market identity of the last replayed record when available.
     pub canonical_market_id: String,
+    /// The stable typed PM stream identity of the last replayed record.
+    pub stream_id: String,
     /// The connection epoch of the last replayed record.
     pub connection_epoch: i64,
     /// The frame sequence of the last replayed record.
@@ -217,6 +219,7 @@ impl ReplayCursor {
             source_timestamp_ms: envelope.source_timestamp_ms,
             canonical_source_rank: envelope.canonical_source_rank,
             canonical_market_id: envelope.canonical_market_id().into(),
+            stream_id: envelope.canonical_stream_id(),
             connection_epoch: envelope.connection_epoch,
             frame_sequence: envelope.frame_sequence,
         }
@@ -261,9 +264,31 @@ impl PmEnvelope {
     #[must_use]
     pub fn canonical_market_id(&self) -> &str {
         self.normalized
-            .pointer("/payload/market")
+            .get("canonical_market_id")
+            .or_else(|| self.normalized.pointer("/payload/market"))
             .and_then(Value::as_str)
             .unwrap_or("")
+    }
+
+    /// Returns the stable envelope-kind and market/outcome stream identity.
+    #[must_use]
+    pub fn canonical_stream_id(&self) -> String {
+        if let Some(stream_id) = self.normalized.get("stream_id").and_then(Value::as_str) {
+            return stream_id.to_owned();
+        }
+        if let Some(portfolio) = self.normalized.get("portfolio").and_then(Value::as_str) {
+            return format!("account:{portfolio}");
+        }
+        let market = self.canonical_market_id();
+        if market.is_empty() {
+            return format!("market-source:{}", self.source_id);
+        }
+        let outcome = self
+            .normalized
+            .pointer("/payload/outcome")
+            .and_then(Value::as_str)
+            .map_or_else(|| "unknown".to_owned(), str::to_lowercase);
+        format!("market:{market}:{outcome}")
     }
 }
 

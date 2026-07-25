@@ -348,9 +348,7 @@ fn compare_pm_envelopes(left: &SourceEnvelope, right: &SourceEnvelope) -> Orderi
             .then_with(|| {
                 market_event_kind_rank(&left.fact).cmp(&market_event_kind_rank(&right.fact))
             })
-            .then_with(|| {
-                market_event_detail_key(&left.fact).cmp(&market_event_detail_key(&right.fact))
-            }),
+            .then_with(|| compare_market_event_detail(&left.fact, &right.fact)),
         (SourceEnvelope::PmAccount(left), SourceEnvelope::PmAccount(right)) => left
             .portfolio
             .to_string()
@@ -437,6 +435,29 @@ fn market_event_detail_key(event: &pmkit_event::MarketEvent) -> String {
     }
 }
 
+fn compare_market_event_detail(
+    left: &pmkit_event::MarketEvent,
+    right: &pmkit_event::MarketEvent,
+) -> Ordering {
+    match (left, right) {
+        (
+            pmkit_event::MarketEvent::BookUpdate {
+                bids: left_bids,
+                asks: left_asks,
+                ..
+            },
+            pmkit_event::MarketEvent::BookUpdate {
+                bids: right_bids,
+                asks: right_asks,
+                ..
+            },
+        ) => left_bids
+            .cmp(right_bids)
+            .then_with(|| left_asks.cmp(right_asks)),
+        _ => market_event_detail_key(left).cmp(&market_event_detail_key(right)),
+    }
+}
+
 const fn account_event_kind_rank(event: &pmkit_event::PmAccountEvent) -> u8 {
     match event {
         pmkit_event::PmAccountEvent::Fill { .. } => 0,
@@ -518,14 +539,18 @@ mod tests {
         }
     }
 
-    fn queued(market: &str) -> Result<QueuedFact, Box<dyn std::error::Error>> {
+    fn queued(
+        market: &str,
+        outcome: Outcome,
+        bid: Decimal,
+    ) -> Result<QueuedFact, Box<dyn std::error::Error>> {
         let envelope = SourceEnvelope::PmMarket(PmMarketEnvelope {
             metadata: metadata(),
             raw_frame: Vec::new(),
             fact: MarketEvent::BookUpdate {
                 market: MarketId::new(market)?,
-                outcome: Outcome::Up,
-                bids: vec![(Decimal::new(49, 2), Decimal::ONE)],
+                outcome,
+                bids: vec![(bid, Decimal::ONE)],
                 asks: vec![(Decimal::new(51, 2), Decimal::ONE)],
                 timestamp_ms: 10,
             },
@@ -539,13 +564,42 @@ mod tests {
     #[test]
     fn cross_market_key_collision_regression() -> Result<(), Box<dyn std::error::Error>> {
         // Given: two PM envelopes with identical durable replay metadata but different markets.
-        let left = queued("btc-5m")?;
-        let right = queued("eth-5m")?;
+        let left = queued("btc-5m", Outcome::Up, Decimal::new(49, 2))?;
+        let right = queued("eth-5m", Outcome::Up, Decimal::new(49, 2))?;
 
         // When: the merge queue compares them for release ordering.
         let ordering = left.cmp(&right);
 
         // Then: the in-process merge must not treat them as the same sortable item.
+        assert_ne!(ordering, Ordering::Equal);
+        assert_ne!(left, right);
+        Ok(())
+    }
+
+    #[test]
+    fn opposite_outcomes_have_distinct_stream_keys() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: one market's outcomes with otherwise identical transport metadata.
+        let up = queued("btc-5m", Outcome::Up, Decimal::new(49, 2))?;
+        let down = queued("btc-5m", Outcome::Down, Decimal::new(49, 2))?;
+
+        // When: their canonical source keys are compared.
+        let ordering = up.key.cmp(&down.key);
+
+        // Then: market plus outcome identifies two distinct PM streams.
+        assert_ne!(ordering, Ordering::Equal);
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_same_market_books_have_total_order() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: two same-stream books whose depth differs.
+        let left = queued("btc-5m", Outcome::Up, Decimal::new(48, 2))?;
+        let right = queued("btc-5m", Outcome::Up, Decimal::new(49, 2))?;
+
+        // When: the merge queue compares them.
+        let ordering = left.cmp(&right);
+
+        // Then: distinct book content cannot collapse to equal ordering identities.
         assert_ne!(ordering, Ordering::Equal);
         assert_ne!(left, right);
         Ok(())

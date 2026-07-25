@@ -4,12 +4,15 @@ use pmkit_core::{PortfolioId, RunId};
 use serde_json::json;
 
 use crate::{
-    OwnerScope, PmEnvelope, ReplayItem, StoreError, TapeStore, TursoTapeStore,
-    migrations::{Migration, apply},
+    OwnerScope, PM_ENVELOPE_VERSION, PmEnvelope, ReplayItem, StoreError, TapeStore, TursoTapeStore,
+    integrity::sha256_hex,
+    migrations::{MIGRATIONS, Migration, apply},
 };
 
 const OLD_PM_ACCOUNT_ENVELOPE: &str = include_str!("../tests/fixtures/pm-account-envelope-v1.json");
 const NEW_PM_ACCOUNT_ENVELOPE: &str = include_str!("../tests/fixtures/pm-account-envelope-v2.json");
+const PM_MARKET_ENVELOPE_V3: &str = include_str!("../tests/fixtures/pm-market-envelope-v3.json");
+const PM_MARKET_ENVELOPE_V4: &str = include_str!("../tests/fixtures/pm-market-envelope-v4.json");
 const OLD_CAUSAL_DECISION: &str = include_str!("../tests/fixtures/causal-decision-v1.json");
 const NEW_CAUSAL_DECISION: &str = include_str!("../tests/fixtures/causal-decision-v2.json");
 
@@ -71,7 +74,8 @@ async fn migration_applies_and_is_idempotent() -> Result<(), Box<dyn std::error:
             (3, third_applied_at),
             (4, fourth_applied_at),
             (5, fifth_applied_at),
-            (6, sixth_applied_at)
+            (6, sixth_applied_at),
+            (7, seventh_applied_at)
         ]
             if !first_applied_at.is_empty()
                 && !second_applied_at.is_empty()
@@ -79,6 +83,7 @@ async fn migration_applies_and_is_idempotent() -> Result<(), Box<dyn std::error:
                 && !fourth_applied_at.is_empty()
                 && !fifth_applied_at.is_empty()
                 && !sixth_applied_at.is_empty()
+                && !seventh_applied_at.is_empty()
     ));
     assert_eq!(reopened_rows, first_rows);
     Ok(())
@@ -93,7 +98,7 @@ async fn migration_rejects_newer_version() -> Result<(), Box<dyn std::error::Err
     let (database, connection) = open_connection(&path).await?;
     connection
         .execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (7, CURRENT_TIMESTAMP)",
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (8, CURRENT_TIMESTAMP)",
             (),
         )
         .await?;
@@ -105,9 +110,164 @@ async fn migration_rejects_newer_version() -> Result<(), Box<dyn std::error::Err
     assert!(matches!(
         TursoTapeStore::open_local(&path).await,
         Err(StoreError::DatabaseSchemaTooNew {
-            database_version: 7,
-            max_supported_version: 6,
+            database_version: 8,
+            max_supported_version: 7,
         })
+    ));
+    Ok(())
+}
+
+async fn seed_pm_market_v3(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let (database, connection) = open_connection(path).await?;
+    apply(&connection, &MIGRATIONS[..6]).await?;
+    let fixture: serde_json::Value = serde_json::from_str(PM_MARKET_ENVELOPE_V3)?;
+    let normalized = serde_json::to_string(&fixture["normalized"])?;
+    connection
+        .execute(
+            "INSERT INTO pm_envelopes (
+                portfolio_id, run_id, source_id, connection_id, source_timestamp_ms,
+                canonical_source_rank, canonical_market_id, connection_epoch, frame_sequence,
+                ingest_sequence, schema_version, receipt_timestamp_ms, venue_id, config_hash,
+                raw_frame, raw_sha256, normalized_json, normalized_sha256
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            turso::params![
+                "paper",
+                "run",
+                "polymarket:market-ws",
+                "market-1",
+                1_i64,
+                0_i64,
+                "btc-5m",
+                0_i64,
+                1_i64,
+                1_i64,
+                3_i64,
+                2_i64,
+                "polymarket",
+                "fixture",
+                Vec::<u8>::new(),
+                sha256_hex(&[]),
+                normalized.clone(),
+                sha256_hex(normalized.as_bytes()),
+            ],
+        )
+        .await?;
+    drop(connection);
+    drop(database);
+    Ok(())
+}
+
+fn current_pm_streams(
+    scope: &OwnerScope,
+) -> Result<(PmEnvelope, PmEnvelope), Box<dyn std::error::Error>> {
+    let current_fixture: serde_json::Value = serde_json::from_str(PM_MARKET_ENVELOPE_V4)?;
+    let down = PmEnvelope {
+        schema_version: u16::try_from(
+            current_fixture["schema_version"]
+                .as_u64()
+                .ok_or("current PM schema version")?,
+        )?,
+        scope: scope.clone(),
+        venue_id: "polymarket".into(),
+        config_hash: "fixture".into(),
+        source_id: "polymarket:market-ws".into(),
+        connection_id: "market-1".into(),
+        source_timestamp_ms: 1,
+        canonical_source_rank: 0,
+        connection_epoch: 0,
+        frame_sequence: 1,
+        receipt_timestamp_ms: 2,
+        ingest_sequence: 2,
+        raw_frame: Vec::new(),
+        normalized: current_fixture["normalized"].clone(),
+    };
+    let account = PmEnvelope {
+        schema_version: PM_ENVELOPE_VERSION,
+        scope: scope.clone(),
+        venue_id: "polymarket".into(),
+        config_hash: "fixture".into(),
+        source_id: "polymarket:user-ws".into(),
+        connection_id: "account-1".into(),
+        source_timestamp_ms: 1,
+        canonical_source_rank: 0,
+        connection_epoch: 0,
+        frame_sequence: 1,
+        receipt_timestamp_ms: 2,
+        ingest_sequence: 3,
+        raw_frame: Vec::new(),
+        normalized: json!({
+            "portfolio": "paper",
+            "payload": {
+                "kind": "fill",
+                "market": "btc-5m",
+                "outcome": "up"
+            }
+        }),
+    };
+    Ok((down, account))
+}
+
+#[tokio::test]
+async fn migration_adds_stream_identity_and_limit_one_cursor()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: a v3 database containing one checked-in market/outcome envelope.
+    let (_dir, path) = database_path("pm-stream-v4")?;
+    seed_pm_market_v3(&path).await?;
+    let scope = OwnerScope::new(PortfolioId::new("paper")?, RunId::new("run")?);
+    let (down, account) = current_pm_streams(&scope)?;
+    assert_eq!(down.schema_version, PM_ENVELOPE_VERSION);
+
+    // When: the current store migrates it, appends the opposite outcome, and pages by one.
+    let (first_items, second_items, third_items) = {
+        let store = TursoTapeStore::open_local(&path).await?;
+        let mut rows = store
+            .connection
+            .query(
+                "SELECT canonical_market_id, stream_id, schema_version FROM pm_envelopes",
+                (),
+            )
+            .await?;
+        let row = rows.next().await?.ok_or("migrated PM row")?;
+        assert_eq!(row.get::<String>(0)?, "btc-5m");
+        assert_eq!(row.get::<String>(1)?, "market:btc-5m:up");
+        assert_eq!(row.get::<i64>(2)?, 4);
+        drop(rows);
+        store.store_envelope(&down).await?;
+        store.store_envelope(&account).await?;
+        let first = store
+            .read_envelopes(&scope, None, std::num::NonZeroUsize::MIN)
+            .await?;
+        let second = store
+            .read_envelopes(
+                &scope,
+                first.next_cursor.clone(),
+                std::num::NonZeroUsize::MIN,
+            )
+            .await?;
+        let third = store
+            .read_envelopes(
+                &scope,
+                second.next_cursor.clone(),
+                std::num::NonZeroUsize::MIN,
+            )
+            .await?;
+        let items = (first.items, second.items, third.items);
+        store.delete_database()?;
+        items
+    };
+
+    // Then: the cursor reaches account, down, and migrated-up streams without losing the market key.
+    assert!(matches!(
+        first_items.as_slice(),
+        [ReplayItem::Envelope(envelope)] if envelope.normalized["portfolio"] == "paper"
+    ));
+    assert!(matches!(
+        second_items.as_slice(),
+        [ReplayItem::Envelope(envelope)] if envelope.normalized["payload"]["outcome"] == "down"
+    ));
+    assert!(matches!(
+        third_items.as_slice(),
+        [ReplayItem::Envelope(envelope)] if envelope.normalized["payload"]["outcome"] == "up"
     ));
     Ok(())
 }
@@ -115,7 +275,7 @@ async fn migration_rejects_newer_version() -> Result<(), Box<dyn std::error::Err
 #[tokio::test]
 async fn migration_rolls_back_on_failure() -> Result<(), Box<dyn std::error::Error>> {
     const FAILING_MIGRATION: Migration = Migration::new(
-        7,
+        8,
         &[
             "CREATE TABLE migration_partial_change (value INTEGER NOT NULL)",
             "CREATE TABLE migration_partial_change (",
@@ -149,7 +309,7 @@ async fn migration_rolls_back_on_failure() -> Result<(), Box<dyn std::error::Err
     assert!(matches!(result, Err(StoreError::Storage { .. })));
     assert!(matches!(
         migrations.as_slice(),
-        [(1, _), (2, _), (3, _), (4, _), (5, _), (6, _)]
+        [(1, _), (2, _), (3, _), (4, _), (5, _), (6, _), (7, _)]
     ));
     assert_eq!(partial_table_count, 0);
     Ok(())
@@ -198,17 +358,17 @@ async fn pm_account_envelope_version_migrates_old_and_reads_new_fixtures()
     store
         .connection
         .execute(
-            "DELETE FROM schema_migrations WHERE version IN (4, 5, 6)",
+            "DELETE FROM schema_migrations WHERE version IN (4, 5, 6, 7)",
             (),
         )
         .await?;
     drop(store);
 
-    // When: the current store migrates the database and appends a v2 settlement envelope.
+    // When: the current store migrates the database and appends a current settlement envelope.
     let (items, migrations, new) = {
         let store = TursoTapeStore::open_local(&path).await?;
         let mut new = pm_account_fixture(NEW_PM_ACCOUNT_ENVELOPE, scope.clone(), 2)?;
-        new.schema_version = 3;
+        new.schema_version = 4;
         store.store_envelope(&new).await?;
         let page = store
             .read_envelopes(
@@ -225,7 +385,7 @@ async fn pm_account_envelope_version_migrates_old_and_reads_new_fixtures()
 
     // Then: both fixtures replay under the current envelope version without losing JSON evidence.
     let mut migrated_old = old;
-    migrated_old.schema_version = 3;
+    migrated_old.schema_version = 4;
     assert_eq!(
         items,
         vec![
@@ -235,7 +395,7 @@ async fn pm_account_envelope_version_migrates_old_and_reads_new_fixtures()
     );
     assert!(matches!(
         migrations.as_slice(),
-        [(1, _), (2, _), (3, _), (4, _), (5, _), (6, _)]
+        [(1, _), (2, _), (3, _), (4, _), (5, _), (6, _), (7, _)]
     ));
     Ok(())
 }
@@ -310,7 +470,7 @@ async fn decision_version_round_trip() -> Result<(), Box<dyn std::error::Error>>
     // Then: legacy decisions advance to v2 while intents remain v1 without payload changes.
     assert!(matches!(
         migrations.as_slice(),
-        [(1, _), (2, _), (3, _), (4, _), (5, _), (6, _)]
+        [(1, _), (2, _), (3, _), (4, _), (5, _), (6, _), (7, _)]
     ));
     assert!(killed);
     assert_eq!(decision_version, 2);
@@ -346,7 +506,10 @@ async fn decision_schema_v1_migrates_and_v2_reads() -> Result<(), Box<dyn std::e
         .await?;
     store
         .connection
-        .execute("DELETE FROM schema_migrations WHERE version IN (5, 6)", ())
+        .execute(
+            "DELETE FROM schema_migrations WHERE version IN (5, 6, 7)",
+            (),
+        )
         .await?;
     drop(store);
 
@@ -391,7 +554,7 @@ async fn decision_schema_v1_migrates_and_v2_reads() -> Result<(), Box<dyn std::e
     assert_eq!(decisions[1].payload, new_payload);
     assert!(matches!(
         migrations.as_slice(),
-        [(1, _), (2, _), (3, _), (4, _), (5, _), (6, _)]
+        [(1, _), (2, _), (3, _), (4, _), (5, _), (6, _), (7, _)]
     ));
     drop(store);
     Ok(())

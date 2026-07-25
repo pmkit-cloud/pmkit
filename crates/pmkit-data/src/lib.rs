@@ -44,6 +44,10 @@ pub use binance_live::BinanceAggTradeLive;
 /// An unmodified PM public-market frame plus the metadata needed to audit it.
 #[derive(Debug, Clone)]
 pub struct RawPmMarketFrame {
+    /// Market whose public stream produced this frame.
+    pub market: MarketId,
+    /// Outcome-token stream that produced this frame.
+    pub outcome: Outcome,
     /// Preserved transport metadata.
     pub metadata: StreamMetadata,
     /// Byte-identical provider text before venue adaptation.

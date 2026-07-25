@@ -1,0 +1,24 @@
+{
+  "schema_version": 4,
+  "normalized": {
+    "schema_version": 4,
+    "source_id": "polymarket:market-ws",
+    "stream_id": "market:btc-5m:down",
+    "canonical_market_id": "btc-5m",
+    "source_time_ms": 1,
+    "canonical_source_rank": 0,
+    "receipt_time_ms": 2,
+    "connection_id": "market-1",
+    "connection_epoch": 0,
+    "frame_sequence": 1,
+    "ingest_sequence": 2,
+    "payload": {
+      "kind": "book_update",
+      "ts": 1,
+      "market": "btc-5m",
+      "outcome": "down",
+      "bids": [["0.48", "4"]],
+      "asks": [["0.52", "5"]]
+    }
+  }
+}

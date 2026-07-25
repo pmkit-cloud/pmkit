@@ -3,8 +3,13 @@
 ## Durable version boundary
 
 `pm_envelopes.schema_version` is the version of the normalized envelope and its
-serialized metadata. The current version is `3`, defined by
+serialized metadata. The current version is `4`, defined by
 `pmkit-store::schema::PM_ENVELOPE_VERSION`.
+
+Version `4` adds a stable stream identity that includes the envelope kind and,
+for public-market envelopes, the exact market and outcome. Market streams use
+`market:<market-id>:<up|down>` and account streams use
+`account:<portfolio-id>`.
 
 Readers must reject unsupported versions with a typed replay/integrity error;
 they must not silently deserialize an unknown shape or substitute defaults.
@@ -63,12 +68,21 @@ replay in a total deterministic order. Version-2 envelope rows advance to
 version 3; records without a market retain the empty key, and raw/normalized
 evidence remains byte-for-byte unchanged.
 
+Database migration version `7` preserves migration 6's
+`canonical_market_id` and adds `stream_id` as the next replay-cursor and
+uniqueness discriminator. Existing v3 market rows derive market/outcome streams,
+account rows derive owner streams, and legacy rows without enough typed evidence
+fall back to their stable source identity. Version-3 rows advance to version 4;
+raw frames, normalized JSON, and both integrity hashes remain byte-for-byte
+unchanged. Checked-in v3/v4 fixtures and a limit-1 cursor test lock the migration.
+
 Opening fails with a typed `StoreError` when the newest on-disk version exceeds
 the binary's maximum supported version. PMKit never auto-downgrades a database.
 
 Rollback is operational: stop the process and restore the prior database file
 from backup, then run the prior binary. In-process migrations are forward-only;
-there is no reverse-migration or automatic downgrade path.
+there is no reverse-migration or automatic downgrade path. A pre-v7 binary
+rejects a v7 database as too new, so rollback requires the pre-v7 backup.
 
 ## Change policy
 

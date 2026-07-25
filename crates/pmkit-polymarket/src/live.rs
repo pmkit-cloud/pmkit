@@ -1,4 +1,10 @@
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use futures::StreamExt as _;
@@ -6,7 +12,9 @@ use pmkit_core::MarketId;
 use pmkit_data::{
     DataSourceError, LiveDataSource, RawPmAccountFrame, RawPmMarketFrame, SourceSignal,
 };
-use pmkit_event::{MarketEvent, PmAccountEnvelope, PmMarketEnvelope};
+use pmkit_event::{
+    MarketEvent, PmAccountEnvelope, PmMarketEnvelope, SourceEnvelope, StreamMetadata,
+};
 use pmkit_market::Outcome;
 use pmkit_store::{OwnerScope, PM_ENVELOPE_VERSION, PmEnvelope, StoreError, TapeStore};
 use polymarket_client_sdk_v2::clob::ws::{BookUpdate, Client, LastTradePrice};
@@ -15,6 +23,8 @@ use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 
 use crate::{MarketTokens, from_venue_side};
+
+const MARKET_SOURCE_ID: &str = "polymarket:market-ws";
 
 /// Adapts raw Polymarket frames into typed PM stream envelopes.
 pub trait PolymarketFrameAdapter {
@@ -105,8 +115,17 @@ impl RawPolymarketFrameAdapter {
     where
         F: FnOnce(&[u8]) -> Result<MarketEvent, DataSourceError>,
     {
-        let normalized = serde_json::from_slice(&frame.text)
+        let payload: serde_json::Value = serde_json::from_slice(&frame.text)
             .map_err(|source| RawFrameAdapterError::Json { source })?;
+        let normalized = serde_json::json!({
+            "stream_id": format!(
+                "market:{}:{}",
+                frame.market,
+                frame.outcome.to_string().to_lowercase()
+            ),
+            "canonical_market_id": frame.market.to_string(),
+            "payload": payload,
+        });
         self.store
             .store_envelope(&PmEnvelope {
                 schema_version: PM_ENVELOPE_VERSION,
@@ -150,11 +169,16 @@ impl RawPolymarketFrameAdapter {
     where
         F: FnOnce(&[u8]) -> Result<pmkit_event::PmAccountEvent, DataSourceError>,
     {
-        let normalized = serde_json::from_slice(&frame.text)
+        let payload: serde_json::Value = serde_json::from_slice(&frame.text)
             .map_err(|source| RawFrameAdapterError::Json { source })?;
         if frame.portfolio != self.scope.portfolio_id {
             return Err(RawFrameAdapterError::ScopeMismatch);
         }
+        let normalized = serde_json::json!({
+            "stream_id": format!("account:{}", frame.portfolio),
+            "portfolio": frame.portfolio.to_string(),
+            "payload": payload,
+        });
         self.store
             .store_envelope(&PmEnvelope {
                 schema_version: PM_ENVELOPE_VERSION,
@@ -192,13 +216,18 @@ impl RawPolymarketFrameAdapter {
 pub struct PolymarketLiveData {
     client: Client,
     tokens: MarketTokens,
+    connection_epoch: Arc<AtomicI64>,
 }
 
 impl PolymarketLiveData {
     /// Creates a live source from an SDK WebSocket client and market token map.
     #[must_use]
-    pub const fn new(client: Client, tokens: MarketTokens) -> Self {
-        Self { client, tokens }
+    pub fn new(client: Client, tokens: MarketTokens) -> Self {
+        Self {
+            client,
+            tokens,
+            connection_epoch: Arc::new(AtomicI64::new(0)),
+        }
     }
 }
 
@@ -222,6 +251,7 @@ impl LiveDataSource for PolymarketLiveData {
         if &market != self.tokens.market() {
             return Err(DataSourceError::NotAvailable);
         }
+        let connection_epoch = next_connection_epoch(&self.connection_epoch)?;
         let token = self.tokens.token(outcome);
         let books = self
             .client
@@ -238,12 +268,21 @@ impl LiveDataSource for PolymarketLiveData {
         };
         let mut books = Box::pin(books);
         let mut trades = Box::pin(trades);
+        let mut sequence = 0;
 
         let result = loop {
             tokio::select! {
                 update = books.next() => match update {
                     Some(Ok(update)) => {
-                        if sink.send(SourceSignal::market_event(book_event(market.clone(), outcome, update))).await.is_err() {
+                        let signal = match sequenced_market_signal(
+                            &mut sequence,
+                            connection_epoch,
+                            book_event(market.clone(), outcome, update),
+                        ) {
+                            Ok(signal) => signal,
+                            Err(error) => break Err(error),
+                        };
+                        if sink.send(signal).await.is_err() {
                             break Err(DataSourceError::SinkClosed);
                         }
                     }
@@ -253,9 +292,18 @@ impl LiveDataSource for PolymarketLiveData {
                 update = trades.next() => match update {
                     Some(Ok(update)) => {
                         if let Some(event) = trade_event(market.clone(), outcome, &update)
-                            && sink.send(SourceSignal::market_event(event)).await.is_err()
                         {
-                            break Err(DataSourceError::SinkClosed);
+                            let signal = match sequenced_market_signal(
+                                &mut sequence,
+                                connection_epoch,
+                                event,
+                            ) {
+                                Ok(signal) => signal,
+                                Err(error) => break Err(error),
+                            };
+                            if sink.send(signal).await.is_err() {
+                                break Err(DataSourceError::SinkClosed);
+                            }
                         }
                     }
                     Some(Err(error)) => break Err(data_error(&error)),
@@ -272,6 +320,49 @@ impl LiveDataSource for PolymarketLiveData {
         book_cleanup.map_err(|error| data_error(&error))?;
         trade_cleanup.map_err(|error| data_error(&error))
     }
+}
+
+fn next_connection_epoch(epoch: &AtomicI64) -> Result<i64, DataSourceError> {
+    epoch
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| DataSourceError::ReplayGap {
+            message: "Polymarket market connection epoch overflow".into(),
+        })
+}
+
+fn sequenced_market_signal(
+    sequence: &mut u64,
+    connection_epoch: i64,
+    fact: MarketEvent,
+) -> Result<SourceSignal, DataSourceError> {
+    *sequence = sequence
+        .checked_add(1)
+        .ok_or_else(|| DataSourceError::ReplayGap {
+            message: "Polymarket market frame sequence overflow".into(),
+        })?;
+    let frame_sequence = i64::try_from(*sequence).map_err(|_| DataSourceError::ReplayGap {
+        message: "Polymarket market frame sequence exceeds signed range".into(),
+    })?;
+    let timestamp_ms = fact.timestamp_ms();
+    Ok(SourceSignal::Data(Box::new(SourceEnvelope::PmMarket(
+        PmMarketEnvelope {
+            metadata: StreamMetadata {
+                schema_version: 1,
+                source_id: MARKET_SOURCE_ID.into(),
+                source_time_ms: timestamp_ms,
+                canonical_source_rank: 0,
+                receipt_time_ms: timestamp_ms,
+                connection_id: MARKET_SOURCE_ID.into(),
+                connection_epoch,
+                frame_sequence,
+                ingest_sequence: *sequence,
+            },
+            raw_frame: Vec::new(),
+            fact,
+        },
+    ))))
 }
 
 fn book_event(market: MarketId, outcome: Outcome, update: BookUpdate) -> MarketEvent {
@@ -356,15 +447,15 @@ mod tests {
         path::PathBuf,
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicI64, Ordering},
         },
     };
 
     use async_trait::async_trait;
     use pmkit_book::Side;
     use pmkit_core::{MarketId, PortfolioId, RunId};
-    use pmkit_data::{RawPmAccountFrame, RawPmMarketFrame};
-    use pmkit_event::{MarketEvent, PmAccountEvent, StreamMetadata};
+    use pmkit_data::{RawPmAccountFrame, RawPmMarketFrame, SourceSignal};
+    use pmkit_event::{MarketEvent, PmAccountEvent, SourceEnvelope, StreamMetadata};
 
     use pmkit_market::Outcome;
     use pmkit_store::{
@@ -374,7 +465,10 @@ mod tests {
     use polymarket_client_sdk_v2::clob::ws::{BookUpdate, LastTradePrice};
     use rust_decimal::Decimal;
 
-    use super::{RawFrameAdapterError, RawPolymarketFrameAdapter, book_event, trade_event};
+    use super::{
+        RawFrameAdapterError, RawPolymarketFrameAdapter, book_event, next_connection_epoch,
+        sequenced_market_signal, trade_event,
+    };
 
     fn metadata(sequence: i64) -> StreamMetadata {
         StreamMetadata {
@@ -442,6 +536,71 @@ mod tests {
         assert_eq!(timestamp_ms, 43);
         Ok(())
     }
+
+    #[test]
+    fn production_sequence_increases_and_reconnect_epoch_advances()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Given: equal-timestamp frames across one subscription and a reconnect.
+        let market = MarketId::new("btc-5m")?;
+        let mut sequence = 0;
+        let mut reconnected_sequence = 0;
+        let epochs = AtomicI64::new(0);
+        let first_epoch = next_connection_epoch(&epochs)?;
+        let second_epoch = next_connection_epoch(&epochs)?;
+        let event = || MarketEvent::BookUpdate {
+            market: market.clone(),
+            outcome: Outcome::Up,
+            bids: vec![(Decimal::new(49, 2), Decimal::ONE)],
+            asks: vec![(Decimal::new(51, 2), Decimal::ONE)],
+            timestamp_ms: 42,
+        };
+
+        // When: the production source assigns both frame identities.
+        let first = sequenced_market_signal(&mut sequence, first_epoch, event())?;
+        let second = sequenced_market_signal(&mut sequence, first_epoch, event())?;
+        let reconnected =
+            sequenced_market_signal(&mut reconnected_sequence, second_epoch, event())?;
+        let (
+            SourceSignal::Data(first),
+            SourceSignal::Data(second),
+            SourceSignal::Data(reconnected),
+        ) = (first, second, reconnected)
+        else {
+            return Err("expected market data signals".into());
+        };
+        let (
+            SourceEnvelope::PmMarket(first),
+            SourceEnvelope::PmMarket(second),
+            SourceEnvelope::PmMarket(reconnected),
+        ) = (*first, *second, *reconnected)
+        else {
+            return Err("expected PM market envelopes".into());
+        };
+
+        // Then: sequence advances within an epoch and reconnect starts a distinct epoch.
+        assert_eq!(
+            (
+                first.metadata.connection_epoch,
+                first.metadata.frame_sequence
+            ),
+            (0, 1)
+        );
+        assert_eq!(
+            (
+                second.metadata.connection_epoch,
+                second.metadata.frame_sequence
+            ),
+            (0, 2)
+        );
+        assert_eq!(
+            (
+                reconnected.metadata.connection_epoch,
+                reconnected.metadata.frame_sequence,
+            ),
+            (1, 1)
+        );
+        Ok(())
+    }
     #[test]
     fn parse_market_frame_accepts_book_update_json() -> Result<(), Box<dyn std::error::Error>> {
         use crate::MarketTokens;
@@ -470,6 +629,8 @@ mod tests {
         let frame = adapter
             .market(
                 RawPmMarketFrame {
+                    market: MarketId::new("btc-5m")?,
+                    outcome: Outcome::Up,
                     metadata: metadata(7),
                     text: text.clone(),
                 },
@@ -487,6 +648,8 @@ mod tests {
         };
         assert_eq!(frame.raw_frame, text);
         assert_eq!(stored.raw_frame, text);
+        assert_eq!(stored.canonical_market_id(), "btc-5m");
+        assert_eq!(stored.canonical_stream_id(), "market:btc-5m:up");
         drop(adapter);
         drop(page);
         Arc::try_unwrap(store)
@@ -536,6 +699,8 @@ mod tests {
         let result = recorder
             .market(
                 RawPmMarketFrame {
+                    market: MarketId::new("btc-5m")?,
+                    outcome: Outcome::Up,
                     metadata: metadata(8),
                     text: br"{}".to_vec(),
                 },

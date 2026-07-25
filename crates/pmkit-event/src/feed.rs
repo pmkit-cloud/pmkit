@@ -12,6 +12,8 @@ pub enum CanonicalSourceKey {
         source_timestamp_ms: i64,
         /// Configured deterministic rank.
         canonical_source_rank: i64,
+        /// Stable typed PM stream identity.
+        stream_id: String,
         /// Connection generation.
         connection_epoch: i64,
         /// Frame position in the connection generation.
@@ -49,17 +51,20 @@ impl Ord for CanonicalSourceKey {
         match (self, other) {
             (
                 Self::Pm {
+                    stream_id: left_stream,
                     connection_epoch: left_epoch,
                     frame_sequence: left_frame,
                     ..
                 },
                 Self::Pm {
+                    stream_id: right_stream,
                     connection_epoch: right_epoch,
                     frame_sequence: right_frame,
                     ..
                 },
-            ) => left_epoch
-                .cmp(right_epoch)
+            ) => left_stream
+                .cmp(right_stream)
+                .then_with(|| left_epoch.cmp(right_epoch))
                 .then_with(|| left_frame.cmp(right_frame)),
             (
                 Self::Cex {
@@ -131,12 +136,20 @@ impl SourceEnvelope {
 
     /// Returns the canonical ordering key for this envelope.
     #[must_use]
-    pub const fn canonical_key(&self) -> CanonicalSourceKey {
+    pub fn canonical_key(&self) -> CanonicalSourceKey {
         let metadata = self.metadata();
         match self {
-            Self::PmMarket(_) | Self::PmAccount(_) => CanonicalSourceKey::Pm {
+            Self::PmMarket(envelope) => CanonicalSourceKey::Pm {
                 source_timestamp_ms: metadata.source_time_ms,
                 canonical_source_rank: metadata.canonical_source_rank,
+                stream_id: market_stream_id(envelope),
+                connection_epoch: metadata.connection_epoch,
+                frame_sequence: metadata.frame_sequence,
+            },
+            Self::PmAccount(envelope) => CanonicalSourceKey::Pm {
+                source_timestamp_ms: metadata.source_time_ms,
+                canonical_source_rank: metadata.canonical_source_rank,
+                stream_id: format!("account:{}", envelope.portfolio),
                 connection_epoch: metadata.connection_epoch,
                 frame_sequence: metadata.frame_sequence,
             },
@@ -161,6 +174,26 @@ impl SourceEnvelope {
             Self::PmMarket(envelope) => StrategyFact::Market(envelope.fact),
             Self::PmAccount(envelope) => StrategyFact::Account(envelope.fact),
             Self::CexReference(envelope) => StrategyFact::Reference(envelope.fact),
+        }
+    }
+}
+
+fn market_stream_id(envelope: &PmMarketEnvelope) -> String {
+    match &envelope.fact {
+        crate::MarketEvent::BookUpdate {
+            market, outcome, ..
+        }
+        | crate::MarketEvent::BestBidAsk {
+            market, outcome, ..
+        }
+        | crate::MarketEvent::LastTrade {
+            market, outcome, ..
+        }
+        | crate::MarketEvent::Fill {
+            market, outcome, ..
+        } => format!("market:{market}:{}", outcome.to_string().to_lowercase()),
+        crate::MarketEvent::OrderAck { .. } | crate::MarketEvent::Tick { .. } => {
+            format!("market-source:{}", envelope.metadata.source_id)
         }
     }
 }

@@ -84,29 +84,32 @@ async fn lossless_pm_envelope_round_trip() -> Result<(), Box<dyn std::error::Err
 }
 
 #[tokio::test]
-async fn cross_market_envelopes_with_matching_transport_identity_both_replay()
+async fn cross_outcome_envelopes_survive_restart_and_limit_one_cursor_replay()
 -> Result<(), Box<dyn std::error::Error>> {
-    // Given: two market facts with a colliding legacy transport identity.
-    let (_dir, path) = database_path("cross-market-identity")?;
+    // Given: one market's outcomes with identical transport and market identity.
+    let (_dir, path) = database_path("cross-outcome-identity")?;
     let scope = owner_scope("paper")?;
-    let mut first = envelope(scope.clone(), 1);
-    first.normalized = json!({"payload": {"market": "btc-5m"}});
-    let mut second = envelope(scope.clone(), 2);
-    second.normalized = json!({"payload": {"market": "eth-5m"}});
+    let mut up = envelope(scope.clone(), 1);
+    up.normalized = json!({"payload": {"market": "btc-5m", "outcome": "up"}});
+    let mut down = envelope(scope.clone(), 2);
+    down.normalized = json!({"payload": {"market": "btc-5m", "outcome": "down"}});
     let store = TursoTapeStore::open_local(&path).await?;
 
-    // When: both market envelopes are persisted and replayed.
-    store.store_envelope(&first).await?;
-    store.store_envelope(&second).await?;
-    let page = store
-        .read_envelopes(&scope, None, NonZeroUsize::new(2).ok_or("limit")?)
+    // When: both streams persist, the store restarts, and replay pages one row at a time.
+    store.store_envelope(&up).await?;
+    store.store_envelope(&down).await?;
+    drop(store);
+    let store = TursoTapeStore::open_local(&path).await?;
+    let first_page = store
+        .read_envelopes(&scope, None, NonZeroUsize::MIN)
+        .await?;
+    let second_page = store
+        .read_envelopes(&scope, first_page.next_cursor.clone(), NonZeroUsize::MIN)
         .await?;
 
-    // Then: market identity prevents collision and orders the replay deterministically.
-    assert_eq!(
-        page.items,
-        vec![ReplayItem::Envelope(first), ReplayItem::Envelope(second)]
-    );
+    // Then: both outcome streams are reached exactly once through the durable cursor.
+    assert_eq!(first_page.items, vec![ReplayItem::Envelope(down)]);
+    assert_eq!(second_page.items, vec![ReplayItem::Envelope(up)]);
     store.delete_database()?;
     Ok(())
 }
