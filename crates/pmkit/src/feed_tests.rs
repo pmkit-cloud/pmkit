@@ -9,6 +9,7 @@ use pmkit_event::{
 use pmkit_market::{Asset, Exchange, Outcome};
 use rust_decimal::Decimal;
 
+mod health;
 mod mode_parity;
 
 fn metadata(source_id: &str, timestamp_ms: i64, rank: i64, sequence: i64) -> StreamMetadata {

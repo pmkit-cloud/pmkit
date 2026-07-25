@@ -198,7 +198,9 @@ impl HistoricalDataSource for FailingHistory {
         _query: ReplayQuery,
         _sink: Sender<SourceSignal>,
     ) -> Result<(), DataSourceError> {
-        Err(DataSourceError::NotAvailable)
+        Err(DataSourceError::ReplayGap {
+            message: "missing test replay segment".to_owned(),
+        })
     }
 }
 

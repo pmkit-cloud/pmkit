@@ -1,12 +1,12 @@
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 
 use pmkit_data::{DataSourceError, SourceSignal};
 use pmkit_event::{CanonicalSourceKey, SourceEnvelope, StrategyFact, StreamMetadata};
 use tokio::sync::mpsc;
-use tokio::task::JoinSet;
+use tokio::task::{Id, JoinSet};
 
 use crate::{FeedHealthSnapshot, RunMetrics};
 
@@ -87,6 +87,7 @@ pub struct MergedFact {
 
 #[derive(Debug)]
 struct QueuedFact {
+    source: String,
     key: CanonicalSourceKey,
     fact: MergedFact,
 }
@@ -199,6 +200,31 @@ impl MergedFeed {
         let (tx, mut rx) = mpsc::channel(128);
         let mut tasks: JoinSet<(String, Result<(), DataSourceError>)> = JoinSet::new();
         let mut states = HashMap::new();
+        let mut source_names = BTreeSet::new();
+        match &sources {
+            Sources::Fixtures(definitions) => {
+                for definition in definitions {
+                    if !source_names.insert(&definition.name) {
+                        return Err(replay_gap(&format!(
+                            "duplicate source name: {}",
+                            definition.name
+                        )));
+                    }
+                }
+            }
+            Sources::Tasks(definitions) => {
+                for definition in definitions {
+                    if !source_names.insert(&definition.name) {
+                        return Err(replay_gap(&format!(
+                            "duplicate source name: {}",
+                            definition.name
+                        )));
+                    }
+                }
+            }
+        }
+        drop(source_names);
+        let mut task_sources: HashMap<Id, String> = HashMap::new();
         match sources {
             Sources::Fixtures(definitions) => {
                 for definition in definitions {
@@ -206,19 +232,23 @@ impl MergedFeed {
                     let sender = tx.clone();
                     let name = definition.name;
                     let signals = definition.signals;
-                    tasks.spawn(async move {
-                        let result = async {
-                            for signal in signals {
-                                sender
-                                    .send((name.clone(), signal))
-                                    .await
-                                    .map_err(|_| DataSourceError::SinkClosed)?;
+                    let task_name = name.clone();
+                    let task_id = tasks
+                        .spawn(async move {
+                            let result = async {
+                                for signal in signals {
+                                    sender
+                                        .send((name.clone(), signal))
+                                        .await
+                                        .map_err(|_| DataSourceError::SinkClosed)?;
+                                }
+                                Ok(())
                             }
-                            Ok(())
-                        }
-                        .await;
-                        (name, result)
-                    });
+                            .await;
+                            (name, result)
+                        })
+                        .id();
+                    task_sources.insert(task_id, task_name);
                 }
             }
             Sources::Tasks(definitions) => {
@@ -227,37 +257,41 @@ impl MergedFeed {
                     let sender = tx.clone();
                     let name = definition.name;
                     let task = definition.task;
-                    tasks.spawn(async move {
-                        let (source_tx, mut source_rx) = mpsc::channel(128);
-                        let source = task(source_tx);
-                        tokio::pin!(source);
-                        let result = loop {
-                            tokio::select! {
-                                signal = source_rx.recv() => match signal {
-                                    Some(signal) => {
-                                        if sender.send((name.clone(), signal)).await.is_err() {
-                                            break Err(DataSourceError::SinkClosed);
+                    let task_name = name.clone();
+                    let task_id = tasks
+                        .spawn(async move {
+                            let (source_tx, mut source_rx) = mpsc::channel(128);
+                            let source = task(source_tx);
+                            tokio::pin!(source);
+                            let result = loop {
+                                tokio::select! {
+                                    signal = source_rx.recv() => match signal {
+                                        Some(signal) => {
+                                            if sender.send((name.clone(), signal)).await.is_err() {
+                                                break Err(DataSourceError::SinkClosed);
+                                            }
                                         }
-                                    }
-                                    None => break source.await,
-                                },
-                                result = &mut source => {
-                                    let pending = async {
-                                        while let Ok(signal) = source_rx.try_recv() {
-                                            sender
-                                                .send((name.clone(), signal))
-                                                .await
-                                                .map_err(|_| DataSourceError::SinkClosed)?;
+                                        None => break source.await,
+                                    },
+                                    result = &mut source => {
+                                        let pending = async {
+                                            while let Ok(signal) = source_rx.try_recv() {
+                                                sender
+                                                    .send((name.clone(), signal))
+                                                    .await
+                                                    .map_err(|_| DataSourceError::SinkClosed)?;
+                                            }
+                                            Ok(())
                                         }
-                                        Ok(())
+                                        .await;
+                                        break pending.and(result);
                                     }
-                                    .await;
-                                    break pending.and(result);
                                 }
-                            }
-                        };
-                        (name, result)
-                    });
+                            };
+                            (name, result)
+                        })
+                        .id();
+                    task_sources.insert(task_id, task_name);
                 }
             }
         }
@@ -271,27 +305,35 @@ impl MergedFeed {
                 biased;
                 Some((source, signal)) = rx.recv(), if completed < source_count => {
                     let Some(state) = states.get_mut(&source) else {
-                        states.insert(source, SourceState { gap_count: 1, ..SourceState::default() });
-                        report_health(metrics.as_ref(), &states);
+                        record_gap(&source, &mut states, metrics.as_ref());
                         return abort(&mut tasks, replay_gap("unknown source")).await;
                     };
-                    let gap = match signal {
+                    let error = match signal {
                         SourceSignal::Data(envelope) => {
                             let envelope = *envelope;
                             let key = envelope.canonical_key();
                             if state.watermark.is_some_and(|watermark| key.timestamp_ms() <= watermark) {
-                                state.gap_count += 1;
-                                Some("late record")
+                                Some(replay_gap("late record"))
                             } else {
-                                state.last_event_timestamp_ms = Some(key.timestamp_ms());
-                                queued.push(Reverse(QueuedFact { key, fact: merged_fact(envelope) }));
+                                state.last_event_timestamp_ms = Some(
+                                    state
+                                        .last_event_timestamp_ms
+                                        .map_or_else(
+                                            || key.timestamp_ms(),
+                                            |previous| previous.max(key.timestamp_ms()),
+                                        ),
+                                );
+                                queued.push(Reverse(QueuedFact {
+                                    source: source.clone(),
+                                    key,
+                                    fact: merged_fact(envelope),
+                                }));
                                 None
                             }
                         }
                         SourceSignal::Watermark(watermark) => {
                             if state.watermark.is_some_and(|previous| watermark < previous) {
-                                state.gap_count += 1;
-                                Some("watermark regressed")
+                                Some(replay_gap("watermark regressed"))
                             } else {
                                 state.watermark = Some(watermark);
                                 None
@@ -302,54 +344,66 @@ impl MergedFeed {
                             None
                         }
                     };
-                    report_health(metrics.as_ref(), &states);
-                    if let Some(message) = gap {
-                        return abort(&mut tasks, replay_gap(message)).await;
+                    if let Some(error) = error {
+                        record_gap(&source, &mut states, metrics.as_ref());
+                        return abort(&mut tasks, error).await;
                     }
+                    report_health(metrics.as_ref(), &states);
                     release_safe(&mut queued, &states, &output).await?;
                 }
-                joined = tasks.join_next(), if completed < source_count => {
-                    let (source, result) = joined
-                        .ok_or_else(|| replay_gap("source task set ended early"))?
-                        .map_err(|error| replay_gap(&format!("source task failed: {error}")))?;
+                joined = tasks.join_next_with_id(), if completed < source_count => {
+                    let Some(joined) = joined else {
+                        record_unattributable_gap(&mut states, metrics.as_ref());
+                        return abort(&mut tasks, replay_gap("source task set ended early")).await;
+                    };
+                    let (task_id, source, result) = match joined {
+                        Ok((task_id, (source, result))) => (task_id, source, result),
+                        Err(error) => {
+                            let source = task_sources.remove(&error.id());
+                            if let Some(source) = source {
+                                record_gap(&source, &mut states, metrics.as_ref());
+                                return abort(&mut tasks, replay_gap("source task failed")).await;
+                            }
+                            record_unattributable_gap(&mut states, metrics.as_ref());
+                            return abort(&mut tasks, replay_gap("source task failed without identity")).await;
+                        }
+                    };
+                    task_sources.remove(&task_id);
                     if let Err(error) = result {
-                        record_gap(&source, &mut states, metrics.as_ref());
-                        return abort(&mut tasks, replay_gap(&format!("source task failed: {error}"))).await;
+                        if matches!(&error, DataSourceError::ReplayGap { .. }) {
+                            record_gap(&source, &mut states, metrics.as_ref());
+                        }
+                        return abort(&mut tasks, error).await;
                     }
                     let state = states.get(&source).ok_or_else(|| replay_gap("completed unknown source"))?;
-                    let gap = if !state.eof_seen {
-                        Some("premature EOF")
+                    let error = if !state.eof_seen {
+                        Some(replay_gap("premature EOF"))
                     } else if matches!(mode, FeedMode::Backtest)
                         && replay_end_ms.is_some_and(|end| state.watermark.unwrap_or(i64::MIN) < end)
                     {
-                        Some("historical coverage ends before replay end")
+                        Some(replay_gap("historical coverage ends before replay end"))
                     } else {
                         None
                     };
-                    if let Some(message) = gap {
+                    if let Some(error) = error {
                         record_gap(&source, &mut states, metrics.as_ref());
-                        return abort(&mut tasks, replay_gap(message)).await;
+                        return abort(&mut tasks, error).await;
                     }
                     completed += 1;
                     release_safe(&mut queued, &states, &output).await?;
                 }
                 else => {
-                    for state in states.values_mut().filter(|state| !state.eof_seen) {
-                        state.gap_count += 1;
+                    if completed == source_count {
+                        record_queued_gaps(&queued, &mut states, metrics.as_ref());
+                        return abort(&mut tasks, replay_gap("queued event exceeds terminal merge frontier")).await;
                     }
-                    report_health(metrics.as_ref(), &states);
+                    record_unattributable_gap(&mut states, metrics.as_ref());
                     return abort(&mut tasks, replay_gap("source channel closed before source completion")).await;
                 }
             }
         }
         if states.values().any(|state| state.watermark.is_none()) {
-            for state in states
-                .values_mut()
-                .filter(|state| state.watermark.is_none())
-            {
-                state.gap_count += 1;
-            }
-            report_health(metrics.as_ref(), &states);
+            record_missing_watermark_gaps(&mut states, metrics.as_ref());
             return Err(replay_gap("source did not warm up"));
         }
         Ok(())
@@ -432,8 +486,62 @@ fn record_gap(
     states: &mut HashMap<String, SourceState>,
     metrics: Option<&RunMetrics>,
 ) {
-    if let Some(state) = states.get_mut(source) {
-        state.gap_count += 1;
+    record_gaps(BTreeSet::from([source.to_owned()]), states, metrics);
+}
+
+fn record_queued_gaps(
+    queued: &BinaryHeap<Reverse<QueuedFact>>,
+    states: &mut HashMap<String, SourceState>,
+    metrics: Option<&RunMetrics>,
+) {
+    record_gaps(
+        queued
+            .iter()
+            .map(|fact| fact.0.source.clone())
+            .collect::<BTreeSet<_>>(),
+        states,
+        metrics,
+    );
+}
+
+fn record_unattributable_gap(
+    states: &mut HashMap<String, SourceState>,
+    metrics: Option<&RunMetrics>,
+) {
+    record_gaps(
+        states
+            .iter()
+            .filter(|(_, state)| !state.eof_seen)
+            .map(|(source, _)| source.clone())
+            .collect::<BTreeSet<_>>(),
+        states,
+        metrics,
+    );
+}
+
+fn record_missing_watermark_gaps(
+    states: &mut HashMap<String, SourceState>,
+    metrics: Option<&RunMetrics>,
+) {
+    record_gaps(
+        states
+            .iter()
+            .filter(|(_, state)| state.watermark.is_none())
+            .map(|(source, _)| source.clone())
+            .collect::<BTreeSet<_>>(),
+        states,
+        metrics,
+    );
+}
+
+fn record_gaps(
+    sources: BTreeSet<String>,
+    states: &mut HashMap<String, SourceState>,
+    metrics: Option<&RunMetrics>,
+) {
+    for source in sources {
+        let state = states.entry(source).or_default();
+        state.gap_count = state.gap_count.saturating_add(1);
     }
     report_health(metrics, states);
 }
@@ -452,7 +560,9 @@ fn report_health(metrics: Option<&RunMetrics>, states: &HashMap<String, SourceSt
                 last_event_timestamp_ms: state.last_event_timestamp_ms,
                 watermark_ms: state.watermark,
                 logical_lag_ms: frontier.zip(state.last_event_timestamp_ms).map(
-                    |(frontier, event_timestamp_ms)| frontier.saturating_sub(event_timestamp_ms),
+                    |(frontier, event_timestamp_ms)| {
+                        frontier.saturating_sub(event_timestamp_ms).max(0)
+                    },
                 ),
                 gap_count: state.gap_count,
             },
@@ -691,6 +801,7 @@ mod tests {
             },
         });
         Ok(QueuedFact {
+            source: "pm".to_owned(),
             key: envelope.canonical_key(),
             fact: merged_fact(envelope),
         })
