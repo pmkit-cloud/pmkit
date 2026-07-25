@@ -1,6 +1,6 @@
 use super::{
     LiveReport, RunControl, RunLifecycleEvent, StartError, StrategyInstance,
-    instantiate_strategies, store_signal as persist_signal,
+    instantiate_strategies, observe_reconnect, store_signal as persist_signal,
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_accounting::{ExposureReservation, aggregate_exposure};
@@ -218,14 +218,15 @@ fn sources(run: &LiveRun, strategies: &[StrategyInstance]) -> Vec<SourceTaskDefi
 
 fn report(
     run: &LiveRun,
-    counts: [usize; 3],
+    metrics: crate::RunMetricsSnapshot,
     exposure: pmkit_accounting::PortfolioExposure,
 ) -> LiveReport {
     LiveReport {
         run: run.id().clone(),
-        events_processed: counts[0],
-        fills: counts[1],
-        rejected: counts[2],
+        events_processed: metrics.events_processed,
+        fills: metrics.fills,
+        rejected: metrics.rejected,
+        metrics,
         exposure,
     }
 }
@@ -587,6 +588,7 @@ async fn drive_with_control_and_rate_limits(
     control: &RunControl,
     rate_limits: OrderRateLimits,
 ) -> Result<LiveReport, StartError> {
+    let metrics = control.metrics_for(run.id());
     let effective_limits_by_strategy: HashMap<_, _> = run
         .strategies()
         .iter()
@@ -643,8 +645,7 @@ async fn drive_with_control_and_rate_limits(
     }
 
     let mut reservations: HashMap<String, Reservation> = HashMap::new();
-    let mut events_processed = 0_usize;
-    let mut rejected = 0_usize;
+    let mut connection_epochs = HashMap::new();
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     control.emit(RunLifecycleEvent::Started {
         run: run.id().clone(),
@@ -658,7 +659,7 @@ async fn drive_with_control_and_rate_limits(
             runtime,
             &open_orders,
             &mut tape,
-            [events_processed, risk_state.fill_count(), rejected],
+            &metrics,
             &risk_state,
             &mut reservations,
         )
@@ -674,11 +675,14 @@ async fn drive_with_control_and_rate_limits(
                 runtime,
                 &open_orders,
                 &mut tape,
-                [events_processed, risk_state.fill_count(), rejected],
+                &metrics,
                 &risk_state,
                 &mut reservations,
             )
             .await;
+        }
+        if observe_reconnect(&merged.source, &mut connection_epochs) {
+            metrics.reconnect();
         }
         store_signal(
             run,
@@ -699,6 +703,7 @@ async fn drive_with_control_and_rate_limits(
                     run: run.id().clone(),
                     source: risk_storage_error(&source),
                 })?;
+            metrics.set_fills(risk_state.fill_count());
             match &envelope.fact {
                 PmAccountEvent::Fill { order_id, size, .. } => {
                     if fill_was_applied {
@@ -730,7 +735,7 @@ async fn drive_with_control_and_rate_limits(
         };
         let event = envelope.fact;
         tape.append(run, &event)?;
-        events_processed += 1;
+        metrics.event();
         match &event {
             MarketEvent::BookUpdate {
                 market,
@@ -798,7 +803,7 @@ async fn drive_with_control_and_rate_limits(
                                         action_index,
                                         "open order capacity",
                                     ));
-                                    rejected += 1;
+                                    metrics.reject();
                                     continue;
                                 }
                                 let reserved_portfolio: rust_decimal::Decimal =
@@ -837,7 +842,7 @@ async fn drive_with_control_and_rate_limits(
                                         action_index,
                                         "risk gate",
                                     ));
-                                    rejected += 1;
+                                    metrics.reject();
                                     continue;
                                 }
                                 if !order_rate_state.try_accept(
@@ -849,7 +854,7 @@ async fn drive_with_control_and_rate_limits(
                                         action_index,
                                         "order submission rate limit",
                                     ));
-                                    rejected += 1;
+                                    metrics.reject();
                                     continue;
                                 }
                                 verdicts
@@ -915,11 +920,13 @@ async fn drive_with_control_and_rate_limits(
                                 source,
                             })?;
                     }
+                    metrics.decision();
                 }
             }
             MarketEvent::Fill { order_id, size, .. }
                 if !account_ledger_authoritative && risk_state.apply_fill(&event, &limits) =>
             {
+                metrics.set_fills(risk_state.fill_count());
                 apply_reservation_fill(&mut reservations, &mut open_orders, order_id, *size)
                     .map_err(|source| StartError::Storage {
                         run: run.id().clone(),
@@ -948,7 +955,7 @@ async fn drive_with_control_and_rate_limits(
         runtime,
         &open_orders,
         &mut tape,
-        [events_processed, risk_state.fill_count(), rejected],
+        &metrics,
         &risk_state,
         &mut reservations,
     )
@@ -964,7 +971,7 @@ async fn finish(
     runtime: &RuntimeConfig,
     open_orders: &HashSet<OrderId>,
     tape: &mut LiveTape,
-    counts: [usize; 3],
+    metrics: &crate::RunMetrics,
     risk_state: &LiveRiskState,
     reservations: &mut HashMap<String, Reservation>,
 ) -> Result<LiveReport, StartError> {
@@ -983,7 +990,7 @@ async fn finish(
             })
             .collect::<Vec<_>>(),
     );
-    Ok(report(run, counts, exposure))
+    Ok(report(run, metrics.snapshot(), exposure))
 }
 
 #[cfg(test)]

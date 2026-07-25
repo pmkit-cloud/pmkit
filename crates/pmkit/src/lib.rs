@@ -19,7 +19,7 @@ mod paper;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tokio::{sync::mpsc, task::JoinSet};
 
@@ -54,6 +54,8 @@ pub struct BacktestReport {
     pub events_processed: usize,
     /// Total simulated fills produced.
     pub fills: usize,
+    /// Typed terminal metrics for this run.
+    pub metrics: RunMetricsSnapshot,
     /// Portfolio-wide exposure aggregation over positions and reservations.
     pub exposure: PortfolioExposure,
 }
@@ -67,6 +69,8 @@ pub struct PaperReport {
     pub events_processed: usize,
     /// Total simulated fills produced.
     pub fills: usize,
+    /// Typed terminal metrics for this run.
+    pub metrics: RunMetricsSnapshot,
     /// Portfolio-wide exposure aggregation over positions and reservations.
     pub exposure: PortfolioExposure,
 }
@@ -82,6 +86,8 @@ pub struct LiveReport {
     pub fills: usize,
     /// Orders rejected by the risk gate before reaching the venue.
     pub rejected: usize,
+    /// Typed terminal metrics for this run.
+    pub metrics: RunMetricsSnapshot,
     /// Portfolio-wide exposure aggregation over positions and reservations.
     pub exposure: PortfolioExposure,
 }
@@ -97,9 +103,93 @@ pub enum RunReport {
     Live(LiveReport),
 }
 
+/// Typed counters for one run, available at completion and on driver failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunMetricsSnapshot {
+    /// The run these counters belong to.
+    pub run: RunId,
+    /// PM market events consumed by the run driver.
+    pub events_processed: usize,
+    /// Fills applied by the mode's authoritative fill owner.
+    pub fills: usize,
+    /// Orders rejected by the mode's execution boundary.
+    pub rejected: usize,
+    /// Observed PM source reconnects, derived from connection-epoch advances.
+    pub reconnects: usize,
+    /// Strategy decision evaluations completed by the run driver.
+    pub decisions: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RunMetrics {
+    run: RunId,
+    events_processed: Arc<AtomicUsize>,
+    fills: Arc<AtomicUsize>,
+    rejected: Arc<AtomicUsize>,
+    reconnects: Arc<AtomicUsize>,
+    decisions: Arc<AtomicUsize>,
+}
+
+impl RunMetrics {
+    fn new(run: &RunId) -> Self {
+        Self {
+            run: run.clone(),
+            events_processed: Arc::new(AtomicUsize::new(0)),
+            fills: Arc::new(AtomicUsize::new(0)),
+            rejected: Arc::new(AtomicUsize::new(0)),
+            reconnects: Arc::new(AtomicUsize::new(0)),
+            decisions: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub(crate) fn event(&self) {
+        self.events_processed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_fills(&self, fills: usize) {
+        self.fills.fetch_add(fills, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_fills(&self, fills: usize) {
+        self.fills.store(fills, Ordering::Relaxed);
+    }
+
+    pub(crate) fn reject(&self) {
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn reconnect(&self) {
+        self.reconnects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn decision(&self) {
+        self.decisions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> RunMetricsSnapshot {
+        RunMetricsSnapshot {
+            run: self.run.clone(),
+            events_processed: self.events_processed.load(Ordering::Relaxed),
+            fills: self.fills.load(Ordering::Relaxed),
+            rejected: self.rejected.load(Ordering::Relaxed),
+            reconnects: self.reconnects.load(Ordering::Relaxed),
+            decisions: self.decisions.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// A failure raised while starting runs.
 #[derive(Debug, Error)]
 pub enum StartError {
+    /// A run driver failed after exposing its partial typed metrics.
+    #[error("run failed: {source}")]
+    RunFailed {
+        /// Counters observed before the failure.
+        diagnostics: RunMetricsSnapshot,
+        /// The original typed failure.
+        #[source]
+        source: Box<Self>,
+    },
     /// A required market-data source could not complete a safe lifecycle.
     #[error("data source failed for run {run}: {source}")]
     Source {
@@ -152,6 +242,17 @@ pub enum StartError {
     /// A persisted portfolio kill switch blocked live execution.
     #[error("portfolio kill switch is active for live run {0}")]
     KillSwitchActive(RunId),
+}
+
+impl StartError {
+    /// Returns partial run metrics when a started driver fails.
+    #[must_use]
+    pub const fn diagnostics(&self) -> Option<&RunMetricsSnapshot> {
+        match self {
+            Self::RunFailed { diagnostics, .. } => Some(diagnostics),
+            _ => None,
+        }
+    }
 }
 
 /// A failure raised while interacting with a started runtime.
@@ -219,6 +320,7 @@ pub enum RunLifecycleEvent {
 pub(crate) struct RunControl {
     cancel: Option<Cancellation>,
     subscriber: Option<mpsc::UnboundedSender<RunLifecycleEvent>>,
+    metrics: Option<RunMetrics>,
 }
 
 impl RunControl {
@@ -230,6 +332,18 @@ impl RunControl {
         if let Some(subscriber) = &self.subscriber {
             let _ = subscriber.send(event);
         }
+    }
+
+    pub(crate) fn for_run(&self, run: &RunId) -> Self {
+        Self {
+            cancel: self.cancel.clone(),
+            subscriber: self.subscriber.clone(),
+            metrics: Some(RunMetrics::new(run)),
+        }
+    }
+
+    pub(crate) fn metrics_for(&self, run: &RunId) -> RunMetrics {
+        self.metrics.clone().unwrap_or_else(|| RunMetrics::new(run))
     }
 }
 
@@ -330,7 +444,11 @@ impl PmkitBuilder {
             cancel,
             subscriber,
         } = self;
-        let control = RunControl { cancel, subscriber };
+        let control = RunControl {
+            cancel,
+            subscriber,
+            metrics: None,
+        };
 
         let mut seen = HashSet::new();
         let mut report_order = Vec::with_capacity(runs.len());
@@ -354,17 +472,29 @@ impl PmkitBuilder {
                         collect_backtest_report(&mut backtests, &mut reports).await?;
                     }
                     let store = store.clone();
-                    let control = control.clone();
+                    let control = control.for_run(run.id());
+                    let metrics = control.metrics_for(run.id());
                     backtests.spawn(async move {
-                        backtest::drive_with_control(&run, store.as_deref(), &control).await
+                        backtest::drive_with_control(&run, store.as_deref(), &control)
+                            .await
+                            .map_err(|source| StartError::RunFailed {
+                                diagnostics: metrics.snapshot(),
+                                source: Box::new(source),
+                            })
                     });
                 }
                 RunSpec::Paper(run) => {
                     while !backtests.is_empty() {
                         collect_backtest_report(&mut backtests, &mut reports).await?;
                     }
-                    let report =
-                        paper::drive_with_control(&run, store.as_deref(), &control).await?;
+                    let control = control.for_run(run.id());
+                    let metrics = control.metrics_for(run.id());
+                    let report = paper::drive_with_control(&run, store.as_deref(), &control)
+                        .await
+                        .map_err(|source| StartError::RunFailed {
+                            diagnostics: metrics.snapshot(),
+                            source: Box::new(source),
+                        })?;
                     reports.insert(run.id().clone(), RunReport::Paper(report));
                 }
                 RunSpec::Live(run) => {
@@ -374,8 +504,15 @@ impl PmkitBuilder {
                     if consent.is_none() {
                         return Err(StartError::LiveConsentMissing(run.id().clone()));
                     }
+                    let control = control.for_run(run.id());
+                    let metrics = control.metrics_for(run.id());
                     let report =
-                        live::drive_with_control(&run, &config, store.as_deref(), &control).await?;
+                        live::drive_with_control(&run, &config, store.as_deref(), &control)
+                            .await
+                            .map_err(|source| StartError::RunFailed {
+                                diagnostics: metrics.snapshot(),
+                                source: Box::new(source),
+                            })?;
                     reports.insert(run.id().clone(), RunReport::Live(report));
                 }
             }
@@ -437,6 +574,16 @@ impl AppHandle {
         self.reports.get(run)
     }
 
+    /// Returns the terminal typed metrics snapshot for `run`, if it completed.
+    #[must_use]
+    pub fn metrics(&self, run: &RunId) -> Option<&RunMetricsSnapshot> {
+        self.reports.get(run).map(|report| match report {
+            RunReport::Backtest(report) => &report.metrics,
+            RunReport::Paper(report) => &report.metrics,
+            RunReport::Live(report) => &report.metrics,
+        })
+    }
+
     /// Returns all reports in run submission order.
     #[must_use]
     pub fn reports_ordered(&self) -> Vec<(&RunId, &RunReport)> {
@@ -465,6 +612,20 @@ fn run_id_of(spec: &RunSpec) -> &RunId {
         RunSpec::Paper(run) => run.id(),
         RunSpec::Live(run) => run.id(),
     }
+}
+
+pub(crate) fn observe_reconnect(
+    source: &SourceEnvelope,
+    connection_epochs: &mut HashMap<String, i64>,
+) -> bool {
+    let metadata = match source {
+        SourceEnvelope::PmMarket(envelope) => &envelope.metadata,
+        SourceEnvelope::PmAccount(envelope) => &envelope.metadata,
+        SourceEnvelope::CexReference(_) => return false,
+    };
+    connection_epochs
+        .insert(metadata.source_id.clone(), metadata.connection_epoch)
+        .is_some_and(|previous| metadata.connection_epoch > previous)
 }
 
 async fn store_signal(

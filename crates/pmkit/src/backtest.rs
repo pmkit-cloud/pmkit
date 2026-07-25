@@ -1,6 +1,6 @@
 use super::{
     BacktestReport, RunControl, RunLifecycleEvent, StartError, StrategyInstance,
-    instantiate_strategies, store_signal,
+    instantiate_strategies, observe_reconnect, store_signal,
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_accounting::{
@@ -28,6 +28,7 @@ pub async fn drive_with_control(
     control: &RunControl,
 ) -> Result<BacktestReport, StartError> {
     let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
+    let metrics = control.metrics_for(run.id());
 
     let markets = strategies
         .iter()
@@ -81,8 +82,7 @@ pub async fn drive_with_control(
     let mut sim = SimEngine::with_fee_config("bt", 0, simulation_config);
     let mut positions_by_market: HashMap<MarketId, Vec<pmkit_book::Position>> = HashMap::new();
     let mut marks: HashMap<(MarketId, Outcome), Decimal> = HashMap::new();
-    let mut events_processed = 0_usize;
-    let mut fills = 0_usize;
+    let mut connection_epochs = HashMap::new();
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
     control.emit(RunLifecycleEvent::Started {
@@ -92,10 +92,12 @@ pub async fn drive_with_control(
         control.emit(RunLifecycleEvent::Cancelled {
             run: run.id().clone(),
         });
+        let metrics = metrics.snapshot();
         return Ok(BacktestReport {
             run: run.id().clone(),
-            events_processed,
-            fills,
+            events_processed: metrics.events_processed,
+            fills: metrics.fills,
+            metrics,
             exposure: report_exposure(&positions_by_market, &marks, &sim.open_orders()),
         });
     }
@@ -105,12 +107,17 @@ pub async fn drive_with_control(
             control.emit(RunLifecycleEvent::Cancelled {
                 run: run.id().clone(),
             });
+            let metrics = metrics.snapshot();
             return Ok(BacktestReport {
                 run: run.id().clone(),
-                events_processed,
-                fills,
+                events_processed: metrics.events_processed,
+                fills: metrics.fills,
+                metrics,
                 exposure: report_exposure(&positions_by_market, &marks, &sim.open_orders()),
             });
+        }
+        if observe_reconnect(&merged.source, &mut connection_epochs) {
+            metrics.reconnect();
         }
         store_signal(
             store,
@@ -130,7 +137,7 @@ pub async fn drive_with_control(
             continue;
         };
         let event = envelope.fact;
-        events_processed += 1;
+        metrics.event();
         if let MarketEvent::BookUpdate {
             market,
             outcome,
@@ -152,7 +159,7 @@ pub async fn drive_with_control(
             }
             sim.update_book(market, *outcome, book.clone());
             let drained = sim.drain_fills();
-            fills += absorb_market_fills(&drained, &mut positions_by_market);
+            metrics.add_fills(absorb_market_fills(&drained, &mut positions_by_market));
             let (added, actions_placed) = run_strategies(&mut RunStrategiesInputs {
                 strategies: &mut strategies,
                 market,
@@ -162,7 +169,8 @@ pub async fn drive_with_control(
                 timestamp_ms: *timestamp_ms,
                 sim: &mut sim,
             });
-            fills += added;
+            metrics.add_fills(added);
+            metrics.decision();
             if let Some(store) = store {
                 let identity = CausalIdentity {
                     scope: scope.clone(),
@@ -203,10 +211,12 @@ pub async fn drive_with_control(
     control.emit(RunLifecycleEvent::Completed {
         run: run.id().clone(),
     });
+    let metrics = metrics.snapshot();
     Ok(BacktestReport {
         run: run.id().clone(),
-        events_processed,
-        fills,
+        events_processed: metrics.events_processed,
+        fills: metrics.fills,
+        metrics,
         exposure: report_exposure(&positions_by_market, &marks, &sim.open_orders()),
     })
 }

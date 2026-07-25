@@ -1,5 +1,6 @@
 use super::{
-    PaperReport, RunControl, RunLifecycleEvent, StartError, instantiate_strategies, store_signal,
+    PaperReport, RunControl, RunLifecycleEvent, StartError, instantiate_strategies,
+    observe_reconnect, store_signal,
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_accounting::{
@@ -117,6 +118,7 @@ pub async fn drive_with_control(
     control: &RunControl,
 ) -> Result<PaperReport, StartError> {
     let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
+    let metrics = control.metrics_for(run.id());
 
     let (fill_tx, mut fill_rx) = tokio::sync::mpsc::channel(1024);
     let simulation = run.simulation();
@@ -196,9 +198,10 @@ pub async fn drive_with_control(
     let feed = MergedFeed::from_tasks(FeedMode::Paper, sources, None);
     let merge = tokio::spawn(async move { feed.forward(event_tx).await });
 
-    let mut events_processed = 0_usize;
     let mut fills = paper.fill_count();
+    metrics.set_fills(fills);
     let mut marks = HashMap::new();
+    let mut connection_epochs = HashMap::new();
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     control.emit(RunLifecycleEvent::Started {
         run: run.id().clone(),
@@ -207,10 +210,12 @@ pub async fn drive_with_control(
         control.emit(RunLifecycleEvent::Cancelled {
             run: run.id().clone(),
         });
+        let metrics = metrics.snapshot();
         return Ok(PaperReport {
             run: run.id().clone(),
-            events_processed,
-            fills,
+            events_processed: metrics.events_processed,
+            fills: metrics.fills,
+            metrics,
             exposure: report_exposure(&paper.account_state(), &marks),
         });
     }
@@ -220,12 +225,17 @@ pub async fn drive_with_control(
             control.emit(RunLifecycleEvent::Cancelled {
                 run: run.id().clone(),
             });
+            let metrics = metrics.snapshot();
             return Ok(PaperReport {
                 run: run.id().clone(),
-                events_processed,
-                fills,
+                events_processed: metrics.events_processed,
+                fills: metrics.fills,
+                metrics,
                 exposure: report_exposure(&paper.account_state(), &marks),
             });
+        }
+        if observe_reconnect(&merged.source, &mut connection_epochs) {
+            metrics.reconnect();
         }
         store_signal(
             store,
@@ -279,7 +289,7 @@ pub async fn drive_with_control(
             continue;
         };
         let event = envelope.fact;
-        events_processed += 1;
+        metrics.event();
         if let MarketEvent::BookUpdate {
             market,
             outcome,
@@ -317,6 +327,7 @@ pub async fn drive_with_control(
             })?;
             drain_fills(&mut fill_rx);
             fills = paper.fill_count();
+            metrics.set_fills(fills);
             let mut actions_placed = 0_u32;
             for instance in &mut *strategies {
                 if instance.market != *market {
@@ -350,7 +361,7 @@ pub async fn drive_with_control(
                                 Ok(_) => {
                                     actions_placed = actions_placed.saturating_add(1);
                                 }
-                                Err(ExecError::Rejected { .. }) => {}
+                                Err(ExecError::Rejected { .. }) => metrics.reject(),
                                 Err(source) => {
                                     return Err(StartError::ExecutionState {
                                         run: run.id().clone(),
@@ -363,7 +374,9 @@ pub async fn drive_with_control(
                 }
                 drain_fills(&mut fill_rx);
                 fills = paper.fill_count();
+                metrics.set_fills(fills);
             }
+            metrics.decision();
             if let Some(store) = store {
                 let identity = CausalIdentity {
                     scope: scope.clone(),
@@ -402,14 +415,17 @@ pub async fn drive_with_control(
         })?;
     drain_fills(&mut fill_rx);
     fills = paper.fill_count();
+    metrics.set_fills(fills);
     control.emit(RunLifecycleEvent::Completed {
         run: run.id().clone(),
     });
 
+    let metrics = metrics.snapshot();
     Ok(PaperReport {
         run: run.id().clone(),
-        events_processed,
-        fills,
+        events_processed: metrics.events_processed,
+        fills: metrics.fills,
+        metrics,
         exposure: report_exposure(&paper.account_state(), &marks),
     })
 }

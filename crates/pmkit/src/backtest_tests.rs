@@ -1,12 +1,13 @@
 use crate::{
-    AppHandle, Cancellation, Pmkit, RunLifecycleEvent, RunReport, RuntimeError,
+    AppHandle, Cancellation, Pmkit, RunLifecycleEvent, RunMetricsSnapshot, RunReport, RuntimeError,
     test_support::{BuyFactory, config, risk},
 };
 use async_trait::async_trait;
 use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
 use pmkit_data::{DataSourceError, HistoricalDataSource, ReplayQuery, SourceSignal};
 use pmkit_event::{
-    CexReferenceEnvelope, CexReferenceEvent, MarketEvent, SourceEnvelope, StreamMetadata,
+    CexReferenceEnvelope, CexReferenceEvent, MarketEvent, PmMarketEnvelope, SourceEnvelope,
+    StreamMetadata,
 };
 use pmkit_market::{Asset, Exchange, Outcome};
 use pmkit_money::Money;
@@ -18,6 +19,7 @@ use pmkit_strategy::{
     Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
 };
 use rust_decimal::Decimal;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
@@ -31,6 +33,8 @@ struct ScriptedReference;
 struct TwoMarketHistory;
 
 struct StaleMarkHistory;
+
+struct FailingHistory;
 
 struct Taker;
 
@@ -187,6 +191,17 @@ impl HistoricalDataSource for StaleMarkHistory {
 }
 
 #[async_trait]
+impl HistoricalDataSource for FailingHistory {
+    async fn replay(
+        &self,
+        _query: ReplayQuery,
+        _sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        Err(DataSourceError::NotAvailable)
+    }
+}
+
+#[async_trait]
 impl HistoricalDataSource for ScriptedHistory {
     async fn replay(
         &self,
@@ -273,6 +288,99 @@ async fn backtest_drives_replay_through_strategy_to_fill() -> Result<(), Box<dyn
     assert_eq!(manifest["mode"], "backtest");
     assert_eq!(manifest["run"], "bt");
     Ok(())
+}
+
+#[tokio::test]
+async fn metrics_match_report() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: a completed backtest with two PM book events.
+    let app = backtest_app().await?;
+    let run = RunId::new("bt")?;
+    let RunReport::Backtest(report) = app.wait_for(run.clone()).await? else {
+        return Err("expected a backtest report".into());
+    };
+
+    // When: metrics are read from the public application handle.
+    let metrics = app.metrics(&run).ok_or("missing run metrics")?;
+
+    // Then: the snapshot agrees with the terminal report and owns no unrelated data.
+    assert_eq!(metrics.run, run);
+    assert_eq!(metrics.events_processed, report.events_processed);
+    assert_eq!(metrics.fills, report.fills);
+    assert_eq!(metrics.rejected, 0);
+    assert_eq!(metrics.reconnects, 0);
+    assert_eq!(metrics.decisions, 2);
+    assert_eq!(report.metrics, *metrics);
+    Ok(())
+}
+
+#[tokio::test]
+async fn metrics_observable_on_failure() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: a replay source that fails before producing an event.
+    let replay = ReplaySpec::new(
+        Arc::new(FailingHistory),
+        "2026-01-01T00:00:00Z".parse()?,
+        "2026-02-01T00:00:00Z".parse()?,
+        EvidenceRequirement::CorroboratedOnly,
+        RetrievalWait::ReturnPending,
+    );
+    let run = BacktestRun::new(
+        RunId::new("metrics-failure")?,
+        PortfolioId::new("research")?,
+        replay,
+        Money::usdc(1_000),
+        risk()?,
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+        },
+    );
+
+    // When: the application start fails through its public boundary.
+    let error = Pmkit::builder(config()?)
+        .run(run)
+        .start()
+        .await
+        .err()
+        .ok_or("failing replay unexpectedly completed")?;
+
+    // Then: the typed, run-scoped diagnostics remain available without storage internals.
+    let metrics: &RunMetricsSnapshot = error.diagnostics().ok_or("missing diagnostics")?;
+    assert_eq!(metrics.run, RunId::new("metrics-failure")?);
+    assert_eq!(metrics.events_processed, 0);
+    assert_eq!(metrics.fills, 0);
+    assert_eq!(metrics.rejected, 0);
+    assert_eq!(metrics.reconnects, 0);
+    assert_eq!(metrics.decisions, 0);
+    Ok(())
+}
+
+#[test]
+fn reconnects_follow_connection_epoch() {
+    let source = |connection_epoch| {
+        SourceEnvelope::PmMarket(PmMarketEnvelope {
+            metadata: StreamMetadata {
+                schema_version: 1,
+                source_id: "polymarket-live".into(),
+                source_time_ms: 1,
+                canonical_source_rank: 0,
+                receipt_time_ms: 1,
+                connection_id: format!("connection-{connection_epoch}"),
+                connection_epoch,
+                frame_sequence: 1,
+                ingest_sequence: 1,
+            },
+            raw_frame: Vec::new(),
+            fact: MarketEvent::Tick { timestamp_ms: 1 },
+        })
+    };
+    let mut epochs = HashMap::new();
+
+    assert!(!crate::observe_reconnect(&source(0), &mut epochs));
+    assert!(crate::observe_reconnect(&source(1), &mut epochs));
+    assert!(!crate::observe_reconnect(&source(1), &mut epochs));
 }
 
 #[tokio::test]
