@@ -22,22 +22,22 @@ pub fn decode_row(
             reason,
         })
     };
-    let Ok(schema_version) = row.get::<i64>(5) else {
+    let Ok(schema_version) = row.get::<i64>(6) else {
         return gap(ReplayGapReason::UnsupportedSchemaVersion);
     };
     if schema_version != i64::from(PM_ENVELOPE_VERSION) {
         return gap(ReplayGapReason::UnsupportedSchemaVersion);
     }
     let (Ok(receipt_timestamp_ms), Ok(venue_id), Ok(config_hash), Ok(source_id), Ok(connection_id)) =
-        (row.get(6), row.get(7), row.get(8), row.get(9), row.get(10))
+        (row.get(7), row.get(8), row.get(9), row.get(10), row.get(11))
     else {
         return gap(ReplayGapReason::NormalizedIntegrityMismatch);
     };
     let (Ok(raw_frame), Ok(raw_sha256), Ok(normalized_json), Ok(normalized_sha256)) = (
-        row.get::<Vec<u8>>(11),
-        row.get::<String>(12),
+        row.get::<Vec<u8>>(12),
         row.get::<String>(13),
         row.get::<String>(14),
+        row.get::<String>(15),
     ) else {
         return gap(ReplayGapReason::RawIntegrityMismatch);
     };

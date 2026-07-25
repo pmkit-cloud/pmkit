@@ -200,6 +200,8 @@ pub struct ReplayCursor {
     pub source_timestamp_ms: i64,
     /// The canonical source rank of the last replayed record.
     pub canonical_source_rank: i64,
+    /// The market identity of the last replayed record when available.
+    pub canonical_market_id: String,
     /// The connection epoch of the last replayed record.
     pub connection_epoch: i64,
     /// The frame sequence of the last replayed record.
@@ -214,6 +216,7 @@ impl ReplayCursor {
             scope: envelope.scope.clone(),
             source_timestamp_ms: envelope.source_timestamp_ms,
             canonical_source_rank: envelope.canonical_source_rank,
+            canonical_market_id: envelope.canonical_market_id().into(),
             connection_epoch: envelope.connection_epoch,
             frame_sequence: envelope.frame_sequence,
         }
@@ -251,6 +254,17 @@ pub struct PmEnvelope {
     pub raw_frame: Vec<u8>,
     /// The normalized PM projection derived from the frame.
     pub normalized: Value,
+}
+
+impl PmEnvelope {
+    /// Returns the market identity carried by the normalized PM payload.
+    #[must_use]
+    pub fn canonical_market_id(&self) -> &str {
+        self.normalized
+            .pointer("/payload/market")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    }
 }
 
 /// The identity shared by causal decisions and durable intents.

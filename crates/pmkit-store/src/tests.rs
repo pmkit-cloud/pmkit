@@ -84,6 +84,34 @@ async fn lossless_pm_envelope_round_trip() -> Result<(), Box<dyn std::error::Err
 }
 
 #[tokio::test]
+async fn cross_market_envelopes_with_matching_transport_identity_both_replay()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: two market facts with a colliding legacy transport identity.
+    let (_dir, path) = database_path("cross-market-identity")?;
+    let scope = owner_scope("paper")?;
+    let mut first = envelope(scope.clone(), 1);
+    first.normalized = json!({"payload": {"market": "btc-5m"}});
+    let mut second = envelope(scope.clone(), 2);
+    second.normalized = json!({"payload": {"market": "eth-5m"}});
+    let store = TursoTapeStore::open_local(&path).await?;
+
+    // When: both market envelopes are persisted and replayed.
+    store.store_envelope(&first).await?;
+    store.store_envelope(&second).await?;
+    let page = store
+        .read_envelopes(&scope, None, NonZeroUsize::new(2).ok_or("limit")?)
+        .await?;
+
+    // Then: market identity prevents collision and orders the replay deterministically.
+    assert_eq!(
+        page.items,
+        vec![ReplayItem::Envelope(first), ReplayItem::Envelope(second)]
+    );
+    store.delete_database()?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn duplicate_or_cross_owner_read_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
     // Given: one envelope and a cursor for its owner scope.
     let (_dir, path) = database_path("ownership")?;

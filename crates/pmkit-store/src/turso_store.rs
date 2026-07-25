@@ -89,6 +89,7 @@ impl TapeStore for TursoTapeStore {
                     envelope.connection_id.as_str(),
                     envelope.source_timestamp_ms,
                     envelope.canonical_source_rank,
+                    envelope.canonical_market_id(),
                     envelope.connection_epoch,
                     envelope.frame_sequence,
                     envelope.ingest_sequence,
@@ -125,6 +126,9 @@ impl TapeStore for TursoTapeStore {
         let cursor_source_rank = cursor
             .as_ref()
             .map_or(0, |value| value.canonical_source_rank);
+        let cursor_market_id = cursor
+            .as_ref()
+            .map_or("", |value| value.canonical_market_id.as_str());
         let cursor_connection_epoch = cursor.as_ref().map_or(0, |value| value.connection_epoch);
         let cursor_frame_sequence = cursor.as_ref().map_or(0, |value| value.frame_sequence);
         let mut rows = self
@@ -136,6 +140,7 @@ impl TapeStore for TursoTapeStore {
                     scope.run_id.to_string(),
                     cursor_timestamp,
                     cursor_source_rank,
+                    cursor_market_id,
                     cursor_connection_epoch,
                     cursor_frame_sequence,
                     limit,
@@ -147,9 +152,10 @@ impl TapeStore for TursoTapeStore {
         while let Some(row) = rows.next().await? {
             let source_timestamp_ms = row.get(0)?;
             let canonical_source_rank = row.get(1)?;
-            let connection_epoch = row.get(2)?;
-            let frame_sequence = row.get(3)?;
-            let ingest_sequence = row.get(4)?;
+            let canonical_market_id = row.get(2)?;
+            let connection_epoch = row.get(3)?;
+            let frame_sequence = row.get(4)?;
+            let ingest_sequence = row.get(5)?;
             let item = decode_row(
                 &row,
                 scope,
@@ -163,6 +169,7 @@ impl TapeStore for TursoTapeStore {
                 scope: scope.clone(),
                 source_timestamp_ms,
                 canonical_source_rank,
+                canonical_market_id,
                 connection_epoch,
                 frame_sequence,
             });

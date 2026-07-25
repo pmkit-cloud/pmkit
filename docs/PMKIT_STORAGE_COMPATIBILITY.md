@@ -3,7 +3,7 @@
 ## Durable version boundary
 
 `pm_envelopes.schema_version` is the version of the normalized envelope and its
-serialized metadata. The current version is `2`, defined by
+serialized metadata. The current version is `3`, defined by
 `pmkit-store::schema::PM_ENVELOPE_VERSION`.
 
 Readers must reject unsupported versions with a typed replay/integrity error;
@@ -54,6 +54,14 @@ record schema is exactly version `1` to version `2`. Existing decision payloads
 and causal identities remain byte-for-byte unchanged and readable; new version-2
 decision snapshots include the resolved simulation fee model. Unsupported
 record versions remain untouched and fail closed in the reader.
+
+Database migration version `6` rebuilds `pm_envelopes` with a persisted
+`canonical_market_id` extracted from each normalized payload. The market key is
+part of both durable uniqueness and replay cursor ordering, so two markets with
+identical source timestamp/rank/connection/frame metadata remain distinct and
+replay in a total deterministic order. Version-2 envelope rows advance to
+version 3; records without a market retain the empty key, and raw/normalized
+evidence remains byte-for-byte unchanged.
 
 Opening fails with a typed `StoreError` when the newest on-disk version exceeds
 the binary's maximum supported version. PMKit never auto-downgrades a database.

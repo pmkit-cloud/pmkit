@@ -62,7 +62,12 @@ impl StrategyFactory for TakerFactory {
 
 impl Strategy for PositionProbe {
     fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
-        self.0.lock().unwrap().push(context.positions.len());
+        self.0
+            .lock()
+            .map_err(|_| StrategyError {
+                message: "position probe lock poisoned".into(),
+            })?
+            .push(context.positions.len());
         Ok(Actions::none())
     }
 }
@@ -272,7 +277,11 @@ async fn two_market_positions_isolated() -> Result<(), Box<dyn std::error::Error
     Pmkit::builder(config()?).run(run).start().await?;
 
     // Then: the second market's strategy cannot observe the first market's fill.
-    assert_eq!(*observed_positions.lock().unwrap(), [0]);
+    let observed_positions = observed_positions
+        .lock()
+        .map_err(|_| "position probe lock poisoned")?;
+    assert_eq!(*observed_positions, [0]);
+    drop(observed_positions);
     Ok(())
 }
 

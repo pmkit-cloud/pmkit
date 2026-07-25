@@ -1,8 +1,8 @@
 /// Current durable PM envelope schema version.
-pub const PM_ENVELOPE_VERSION: u16 = 2;
+pub const PM_ENVELOPE_VERSION: u16 = 3;
 pub const CAUSAL_DECISION_SCHEMA_VERSION: i64 = 2;
 pub const DURABLE_INTENT_SCHEMA_VERSION: i64 = 1;
-pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 pub const CREATE_SCHEMA_MIGRATIONS: &str = "
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -27,6 +27,32 @@ UPDATE pm_envelopes SET schema_version = 2 WHERE schema_version = 1";
 pub const MIGRATE_CAUSAL_DECISIONS_V1_TO_V2: &str = "
 UPDATE causal_decisions SET schema_version = 2 WHERE schema_version = 1";
 
+pub const MIGRATE_PM_ENVELOPES_V2_TO_V3: &[&str] = &[
+    "ALTER TABLE pm_envelopes RENAME TO pm_envelopes_v2",
+    "
+CREATE TABLE pm_envelopes (
+    portfolio_id TEXT NOT NULL, run_id TEXT NOT NULL, source_id TEXT NOT NULL,
+    connection_id TEXT NOT NULL, source_timestamp_ms INTEGER NOT NULL,
+    canonical_source_rank INTEGER NOT NULL, canonical_market_id TEXT NOT NULL,
+    connection_epoch INTEGER NOT NULL, frame_sequence INTEGER NOT NULL,
+    ingest_sequence INTEGER NOT NULL, schema_version INTEGER NOT NULL,
+    receipt_timestamp_ms INTEGER NOT NULL, venue_id TEXT NOT NULL, config_hash TEXT NOT NULL,
+    raw_frame BLOB NOT NULL, raw_sha256 TEXT NOT NULL, normalized_json TEXT NOT NULL,
+    normalized_sha256 TEXT NOT NULL,
+    PRIMARY KEY (portfolio_id, run_id, source_id, connection_id, source_timestamp_ms, canonical_market_id, connection_epoch, frame_sequence),
+    UNIQUE (portfolio_id, run_id, source_timestamp_ms, canonical_source_rank, canonical_market_id, connection_epoch, frame_sequence)
+)",
+    "
+INSERT INTO pm_envelopes SELECT portfolio_id, run_id, source_id, connection_id,
+    source_timestamp_ms, canonical_source_rank,
+    COALESCE(json_extract(normalized_json, '$.payload.market'), ''), connection_epoch,
+    frame_sequence, ingest_sequence, CASE WHEN schema_version = 2 THEN 3 ELSE schema_version END,
+    receipt_timestamp_ms, venue_id, config_hash, raw_frame, raw_sha256, normalized_json,
+    normalized_sha256 FROM pm_envelopes_v2",
+    "DROP TABLE pm_envelopes_v2",
+    "CREATE INDEX pm_envelopes_owner_cursor ON pm_envelopes (portfolio_id, run_id, source_timestamp_ms, canonical_source_rank, canonical_market_id, connection_epoch, frame_sequence)",
+];
+
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS pm_envelopes (
     portfolio_id TEXT NOT NULL,
@@ -35,6 +61,7 @@ CREATE TABLE IF NOT EXISTS pm_envelopes (
     connection_id TEXT NOT NULL,
     source_timestamp_ms INTEGER NOT NULL,
     canonical_source_rank INTEGER NOT NULL,
+    canonical_market_id TEXT NOT NULL,
     connection_epoch INTEGER NOT NULL,
     frame_sequence INTEGER NOT NULL,
     ingest_sequence INTEGER NOT NULL,
@@ -46,12 +73,12 @@ CREATE TABLE IF NOT EXISTS pm_envelopes (
     raw_sha256 TEXT NOT NULL,
     normalized_json TEXT NOT NULL,
     normalized_sha256 TEXT NOT NULL,
-    PRIMARY KEY (portfolio_id, run_id, source_id, connection_id, source_timestamp_ms, connection_epoch, frame_sequence),
-    UNIQUE (portfolio_id, run_id, source_timestamp_ms, canonical_source_rank, connection_epoch, frame_sequence)
+    PRIMARY KEY (portfolio_id, run_id, source_id, connection_id, source_timestamp_ms, canonical_market_id, connection_epoch, frame_sequence),
+    UNIQUE (portfolio_id, run_id, source_timestamp_ms, canonical_source_rank, canonical_market_id, connection_epoch, frame_sequence)
 );
 CREATE INDEX IF NOT EXISTS pm_envelopes_owner_cursor
     ON pm_envelopes (
-        portfolio_id, run_id, source_timestamp_ms, canonical_source_rank, connection_epoch, frame_sequence
+        portfolio_id, run_id, source_timestamp_ms, canonical_source_rank, canonical_market_id, connection_epoch, frame_sequence
     );
 CREATE TABLE IF NOT EXISTS causal_decisions (
     portfolio_id TEXT NOT NULL,
@@ -101,20 +128,22 @@ CREATE TABLE IF NOT EXISTS canonical_chain_checkpoints (
 pub const INSERT_ENVELOPE: &str = "
 INSERT INTO pm_envelopes (
     portfolio_id, run_id, source_id, connection_id, source_timestamp_ms, canonical_source_rank,
-    connection_epoch, frame_sequence, ingest_sequence, schema_version, receipt_timestamp_ms,
-    venue_id, config_hash, raw_frame, raw_sha256, normalized_json, normalized_sha256
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+    canonical_market_id, connection_epoch, frame_sequence, ingest_sequence, schema_version,
+    receipt_timestamp_ms, venue_id, config_hash, raw_frame, raw_sha256, normalized_json,
+    normalized_sha256
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
 ON CONFLICT DO NOTHING";
 
 pub const READ_ENVELOPES: &str = "
-SELECT source_timestamp_ms, canonical_source_rank, connection_epoch, frame_sequence,
-       ingest_sequence, schema_version, receipt_timestamp_ms, venue_id, config_hash, source_id,
-       connection_id, raw_frame, raw_sha256, normalized_json, normalized_sha256
+SELECT source_timestamp_ms, canonical_source_rank, canonical_market_id, connection_epoch,
+       frame_sequence, ingest_sequence, schema_version, receipt_timestamp_ms, venue_id,
+       config_hash, source_id, connection_id, raw_frame, raw_sha256, normalized_json,
+       normalized_sha256
 FROM pm_envelopes
 WHERE portfolio_id = ?1 AND run_id = ?2
-  AND (?3 IS NULL OR (source_timestamp_ms, canonical_source_rank, connection_epoch, frame_sequence) > (?3, ?4, ?5, ?6))
-ORDER BY source_timestamp_ms, canonical_source_rank, connection_epoch, frame_sequence
-LIMIT ?7";
+  AND (?3 IS NULL OR (source_timestamp_ms, canonical_source_rank, canonical_market_id, connection_epoch, frame_sequence) > (?3, ?4, ?5, ?6, ?7))
+ORDER BY source_timestamp_ms, canonical_source_rank, canonical_market_id, connection_epoch, frame_sequence
+LIMIT ?8";
 
 pub const INSERT_DECISION: &str = "
 INSERT INTO causal_decisions (
