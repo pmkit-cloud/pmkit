@@ -27,6 +27,37 @@ pub enum Liquidity {
     Taker,
 }
 
+/// Stable identity of one fill, preserving whether it came from a venue or transport frame.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FillIdentity {
+    /// Identity assigned by the venue to the fill or trade.
+    Venue(String),
+    /// Identity derived from a transport frame at a boundary without a venue fill id.
+    Transport {
+        /// Stable source identity.
+        source_id: String,
+        /// Connection that delivered the frame.
+        connection_id: String,
+        /// Connection epoch for the source.
+        connection_epoch: i64,
+        /// Frame number within the connection epoch.
+        frame_sequence: i64,
+    },
+}
+
+impl FillIdentity {
+    /// Derives identity from transport coordinates when the boundary has no venue fill id.
+    #[must_use]
+    pub fn transport(metadata: &StreamMetadata) -> Self {
+        Self::Transport {
+            source_id: metadata.source_id.clone(),
+            connection_id: metadata.connection_id.clone(),
+            connection_epoch: metadata.connection_epoch,
+            frame_sequence: metadata.frame_sequence,
+        }
+    }
+}
+
 /// A single event flowing through a per-market loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarketEvent {
@@ -154,6 +185,8 @@ impl MarketResolutionEvent {
 pub enum PmAccountEvent {
     /// A fill on one of the portfolio's orders.
     Fill {
+        /// Stable venue or transport fill identity.
+        identity: FillIdentity,
         /// Owning strategy, if attributed.
         strategy: Option<StrategyId>,
         /// Venue order id.

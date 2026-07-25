@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs::{self, File};
 
-use pmkit_event::{MarketEvent, PmAccountEnvelope, PmAccountEvent, StreamMetadata};
+use pmkit_event::{FillIdentity, MarketEvent, PmAccountEnvelope, PmAccountEvent, StreamMetadata};
 use pmkit_exec::OrderId;
 use pmkit_run::TapePolicy;
 use pmkit_runtime::RuntimeConfig;
@@ -47,6 +47,22 @@ impl LiveTape {
     }
 
     pub(super) fn append(&mut self, run: &LiveRun, event: &MarketEvent) -> Result<(), StartError> {
+        let timestamp_ms = event.timestamp_ms();
+        let frame_sequence = i64::try_from(self.ingest_sequence).map_err(|_| StartError::Tape {
+            run: run.id().clone(),
+            source: std::io::Error::other("live tape frame sequence exceeds signed range"),
+        })?;
+        let metadata = StreamMetadata {
+            schema_version: 3,
+            source_id: "pmkit-live".into(),
+            source_time_ms: timestamp_ms,
+            canonical_source_rank: 0,
+            receipt_time_ms: timestamp_ms,
+            connection_id: run.id().to_string(),
+            connection_epoch: 0,
+            frame_sequence,
+            ingest_sequence: self.ingest_sequence,
+        };
         let fact = match event {
             MarketEvent::Fill {
                 strategy,
@@ -60,6 +76,7 @@ impl LiveTape {
                 liquidity,
                 timestamp_ms,
             } => PmAccountEvent::Fill {
+                identity: FillIdentity::transport(&metadata),
                 strategy: strategy.clone(),
                 order_id: order_id.clone(),
                 market: market.clone(),
@@ -88,20 +105,9 @@ impl LiveTape {
         let Some(tape) = &mut self.tape else {
             return Ok(());
         };
-        let timestamp_ms = event.timestamp_ms();
         let envelope = PmAccountEnvelope {
             portfolio: run.portfolio().clone(),
-            metadata: StreamMetadata {
-                schema_version: 1,
-                source_id: "pmkit-live".into(),
-                source_time_ms: timestamp_ms,
-                canonical_source_rank: 0,
-                receipt_time_ms: timestamp_ms,
-                connection_id: run.id().to_string(),
-                connection_epoch: 0,
-                frame_sequence: 0,
-                ingest_sequence: self.ingest_sequence,
-            },
+            metadata,
             raw_frame: Vec::new(),
             fact,
         };

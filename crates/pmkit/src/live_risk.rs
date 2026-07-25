@@ -1,10 +1,11 @@
 use pmkit_accounting::PositionExposure;
 use pmkit_book::Position;
 use pmkit_core::{MarketId, PortfolioId, StrategyId};
-use pmkit_event::{MarketEvent, PmAccountEvent};
+use pmkit_event::{FillIdentity, MarketEvent, PmAccountEvent};
 use pmkit_exec::PlaceOrder;
 use pmkit_market::Outcome;
 use pmkit_runtime::RiskLimits;
+use pmkit_store::PmEnvelope;
 use rust_decimal::Decimal;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -90,15 +91,6 @@ pub fn mark_positions(
     Some(portfolio_unrealized_pnl)
 }
 
-type FillIdentity = (
-    String,
-    MarketId,
-    Outcome,
-    pmkit_book::Side,
-    Decimal,
-    Decimal,
-    i64,
-);
 type SettlementIdentity = (MarketId, Outcome, Decimal, Decimal, i64);
 
 #[derive(Debug, thiserror::Error)]
@@ -132,6 +124,45 @@ fn outcome_field(payload: &Value) -> Result<Outcome, RiskStateError> {
         "down" => Ok(Outcome::Down),
         outcome => Err(RiskStateError::corrupt(format!(
             "unsupported outcome {outcome}"
+        ))),
+    }
+}
+
+fn durable_fill_identity(
+    record: &PmEnvelope,
+    payload: &Value,
+    account_schema_version: u64,
+) -> Result<FillIdentity, RiskStateError> {
+    let Some(identity) = payload.get("identity") else {
+        return match account_schema_version {
+            1 | 2 => Ok(FillIdentity::Transport {
+                source_id: record.source_id.clone(),
+                connection_id: record.connection_id.clone(),
+                connection_epoch: record.connection_epoch,
+                frame_sequence: record.frame_sequence,
+            }),
+            3 => Err(RiskStateError::corrupt("fill identity is missing")),
+            _ => Err(RiskStateError::corrupt(format!(
+                "unsupported account schema version {account_schema_version}"
+            ))),
+        };
+    };
+    match string_field(identity, "source")? {
+        "venue" => Ok(FillIdentity::Venue(
+            string_field(identity, "id")?.to_owned(),
+        )),
+        "transport" => Ok(FillIdentity::Transport {
+            source_id: string_field(identity, "source_id")?.to_owned(),
+            connection_id: string_field(identity, "connection_id")?.to_owned(),
+            connection_epoch: identity["connection_epoch"]
+                .as_i64()
+                .ok_or_else(|| RiskStateError::corrupt("connection_epoch is missing or invalid"))?,
+            frame_sequence: identity["frame_sequence"]
+                .as_i64()
+                .ok_or_else(|| RiskStateError::corrupt("frame_sequence is missing or invalid"))?,
+        }),
+        source => Err(RiskStateError::corrupt(format!(
+            "unsupported fill identity source {source}"
         ))),
     }
 }
@@ -306,30 +337,25 @@ impl LiveRiskState {
         self.refresh_marks(limits)
     }
 
-    pub(super) fn apply_fill(&mut self, event: &MarketEvent, limits: &RiskLimits) -> bool {
+    pub(super) fn apply_fill(
+        &mut self,
+        event: &MarketEvent,
+        identity: &FillIdentity,
+        limits: &RiskLimits,
+    ) -> bool {
         let MarketEvent::Fill {
-            order_id,
             market,
             outcome,
             side,
             price,
             size,
             fee,
-            timestamp_ms,
             ..
         } = event
         else {
             return false;
         };
-        if !self.applied_fills.insert((
-            order_id.clone(),
-            market.clone(),
-            *outcome,
-            *side,
-            *price,
-            *size,
-            *timestamp_ms,
-        )) {
+        if !self.applied_fills.insert(identity.clone()) {
             return false;
         }
         let positions = self.positions_by_market.entry(market.clone()).or_default();
@@ -359,11 +385,12 @@ impl LiveRiskState {
 
     pub(super) fn apply_durable_account_record(
         &mut self,
-        record: &Value,
+        record: &PmEnvelope,
         portfolio: &PortfolioId,
         limits: &RiskLimits,
     ) -> Result<(), RiskStateError> {
-        let Some(record_portfolio) = record.get("portfolio") else {
+        let normalized = &record.normalized;
+        let Some(record_portfolio) = normalized.get("portfolio") else {
             return Ok(());
         };
         let record_portfolio = record_portfolio
@@ -374,7 +401,15 @@ impl LiveRiskState {
                 "record owner {record_portfolio} does not match {portfolio}"
             )));
         }
-        let payload = record
+        let account_schema_version = normalized["schema_version"].as_u64().ok_or_else(|| {
+            RiskStateError::corrupt("account schema version is missing or invalid")
+        })?;
+        if !matches!(account_schema_version, 1..=3) {
+            return Err(RiskStateError::corrupt(format!(
+                "unsupported account schema version {account_schema_version}"
+            )));
+        }
+        let payload = normalized
             .get("payload")
             .ok_or_else(|| RiskStateError::corrupt("account payload is missing"))?;
         let timestamp_ms = payload["ts"]
@@ -403,6 +438,7 @@ impl LiveRiskState {
                     ));
                 }
                 PmAccountEvent::Fill {
+                    identity: durable_fill_identity(record, payload, account_schema_version)?,
                     strategy,
                     order_id: string_field(payload, "order_id")?.to_owned(),
                     market,
@@ -458,6 +494,7 @@ impl LiveRiskState {
     ) -> Result<bool, RiskStateError> {
         match event {
             PmAccountEvent::Fill {
+                identity,
                 strategy,
                 order_id,
                 market,
@@ -481,6 +518,7 @@ impl LiveRiskState {
                     liquidity: *liquidity,
                     timestamp_ms: *timestamp_ms,
                 },
+                identity,
                 limits,
             )),
             PmAccountEvent::Settlement {
@@ -630,12 +668,13 @@ mod ledger_tests {
     use crate::test_support::risk;
     use pmkit_book::{OrderBookL2, Side};
     use pmkit_core::MarketId;
-    use pmkit_event::{Liquidity, PmAccountEvent};
+    use pmkit_event::{FillIdentity, Liquidity, PmAccountEvent};
     use pmkit_market::Outcome;
     use rust_decimal::Decimal;
 
-    fn fill(market: MarketId) -> PmAccountEvent {
+    fn fill(fill_id: &str, market: MarketId) -> PmAccountEvent {
         PmAccountEvent::Fill {
+            identity: FillIdentity::Venue(fill_id.into()),
             strategy: None,
             order_id: "venue-1".into(),
             market,
@@ -666,7 +705,7 @@ mod ledger_tests {
             },
             &limits,
         );
-        let event = fill(market.clone());
+        let event = fill("fill-1", market.clone());
 
         // When: both deliveries pass through the authoritative account ledger.
         state.apply_account_event(&event, &limits)?;
@@ -686,11 +725,33 @@ mod ledger_tests {
     }
 
     #[test]
+    fn distinct_fill_identities_apply_same_value_and_time_twice()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Given: two venue fills with identical economics and timestamps but distinct identities.
+        let market = MarketId::new("btc-5m")?;
+        let limits = risk()?;
+        let mut state = LiveRiskState::default();
+
+        // When: both fills pass through the authoritative account ledger.
+        state.apply_account_event(&fill("fill-1", market.clone()), &limits)?;
+        state.apply_account_event(&fill("fill-2", market.clone()), &limits)?;
+
+        // Then: both identities affect the position and fill count.
+        let position = state
+            .positions(&market)
+            .first()
+            .ok_or("missing account-fill position")?;
+        assert_eq!(position.qty, Decimal::from(20));
+        assert_eq!(state.fill_count(), 2);
+        Ok(())
+    }
+
+    #[test]
     fn restart_does_not_double_count() -> Result<(), Box<dyn std::error::Error>> {
         // Given: duplicate durable fill and settlement records during restart replay.
         let market = MarketId::new("btc-5m")?;
         let limits = risk()?;
-        let fill = fill(market.clone());
+        let fill = fill("fill-1", market.clone());
         let settlement = PmAccountEvent::Settlement {
             market: market.clone(),
             outcome: Outcome::Up,

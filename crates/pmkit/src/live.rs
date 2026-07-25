@@ -5,7 +5,7 @@ use super::{
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_accounting::{ExposureReservation, aggregate_exposure};
 use pmkit_book::OrderBookL2;
-use pmkit_event::{MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
+use pmkit_event::{FillIdentity, MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
 use pmkit_exec::{ExecError, Executor, OrderId, OrderStatus, PlaceOrder};
 use pmkit_market::Outcome;
 use pmkit_runtime::{LiveOrderPolicy, RuntimeConfig, StrategyRegistration};
@@ -354,11 +354,7 @@ async fn reconstruct_risk_state(
             match item {
                 ReplayItem::Envelope(envelope) => {
                     state
-                        .apply_durable_account_record(
-                            &envelope.normalized,
-                            &scope.portfolio_id,
-                            limits,
-                        )
+                        .apply_durable_account_record(&envelope, &scope.portfolio_id, limits)
                         .map_err(|source| risk_storage_error(&source))?;
                 }
                 ReplayItem::Gap(gap) => {
@@ -926,7 +922,12 @@ async fn drive_with_control_and_rate_limits(
                 }
             }
             MarketEvent::Fill { order_id, size, .. }
-                if !account_ledger_authoritative && risk_state.apply_fill(&event, &limits) =>
+                if !account_ledger_authoritative
+                    && risk_state.apply_fill(
+                        &event,
+                        &FillIdentity::transport(&envelope.metadata),
+                        &limits,
+                    ) =>
             {
                 metrics.set_fills(risk_state.fill_count());
                 apply_reservation_fill(&mut reservations, &mut open_orders, order_id, *size)
@@ -1382,6 +1383,7 @@ mod risk_reconstruction_tests {
             ingest_sequence: sequence,
             raw_frame: Vec::new(),
             normalized: json!({
+                "schema_version": 1,
                 "portfolio": scope.portfolio_id.to_string(),
                 "payload": payload,
             }),
@@ -1459,6 +1461,58 @@ mod risk_reconstruction_tests {
         assert_eq!(state.realized_pnl(), Decimal::new(24, 1));
         assert_eq!(state.daily_pnl(), Some(Decimal::new(29, 1)));
         assert_eq!(state.fill_count(), 1);
+        store.delete_database()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the store must remain open through replay assertions and database deletion"
+    )]
+    async fn risk_state_replays_only_exact_fill_identities()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Given: two distinct same-value fills and one exact identity replay in durable order.
+        let dir = tempfile::tempdir()?;
+        let store = TursoTapeStore::open_local(dir.path().join("fill-identity-replay.db")).await?;
+        let scope = OwnerScope::new(
+            PortfolioId::new("risk-portfolio")?,
+            RunId::new("fill-identity-replay")?,
+        );
+        let market = MarketId::new("btc-5m")?;
+        for (sequence, fill_id) in [(1, "fill-1"), (2, "fill-2"), (3, "fill-1")] {
+            let mut envelope = account_envelope(
+                &scope,
+                sequence,
+                &json!({
+                    "kind": "fill",
+                    "ts": 1_000,
+                    "identity": { "source": "venue", "id": fill_id },
+                    "strategy": null,
+                    "order_id": "venue-1",
+                    "market": market.to_string(),
+                    "outcome": "up",
+                    "price": "0.4",
+                    "size": "10",
+                    "side": "buy",
+                    "fee": "0.1",
+                    "liquidity": "taker",
+                }),
+            );
+            envelope.normalized["schema_version"] = json!(3);
+            store.store_envelope(&envelope).await?;
+        }
+
+        // When: startup reconstructs the authoritative ledger.
+        let state = reconstruct_risk_state(&store, &scope, &risk()?).await?;
+
+        // Then: the repeated identity applies once and the distinct identity applies separately.
+        let position = state
+            .positions(&market)
+            .first()
+            .ok_or("missing reconstructed position")?;
+        assert_eq!(position.qty, Decimal::from(20));
+        assert_eq!(state.fill_count(), 2);
         store.delete_database()?;
         Ok(())
     }

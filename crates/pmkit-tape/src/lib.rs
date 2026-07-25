@@ -8,8 +8,8 @@ use std::io::{self, Write};
 
 use pmkit_book::Side;
 use pmkit_event::{
-    CexReferenceEnvelope, CexReferenceEvent, Liquidity, MarketEvent, PmAccountEnvelope,
-    PmAccountEvent, PmMarketEnvelope, StreamMetadata,
+    CexReferenceEnvelope, CexReferenceEvent, FillIdentity, Liquidity, MarketEvent,
+    PmAccountEnvelope, PmAccountEvent, PmMarketEnvelope, StreamMetadata,
 };
 use serde_json::json;
 
@@ -78,6 +78,27 @@ const fn liquidity_str(liquidity: Liquidity) -> &'static str {
     match liquidity {
         Liquidity::Maker => "maker",
         Liquidity::Taker => "taker",
+    }
+}
+
+fn fill_identity_json(identity: &FillIdentity) -> serde_json::Value {
+    match identity {
+        FillIdentity::Venue(id) => json!({
+            "source": "venue",
+            "id": id,
+        }),
+        FillIdentity::Transport {
+            source_id,
+            connection_id,
+            connection_epoch,
+            frame_sequence,
+        } => json!({
+            "source": "transport",
+            "source_id": source_id,
+            "connection_id": connection_id,
+            "connection_epoch": connection_epoch,
+            "frame_sequence": frame_sequence,
+        }),
     }
 }
 
@@ -190,6 +211,7 @@ pub fn market_envelope_json(envelope: &PmMarketEnvelope) -> serde_json::Value {
 pub fn account_envelope_json(envelope: &PmAccountEnvelope) -> serde_json::Value {
     let payload = match &envelope.fact {
         PmAccountEvent::Fill {
+            identity,
             strategy,
             order_id,
             market,
@@ -203,6 +225,7 @@ pub fn account_envelope_json(envelope: &PmAccountEnvelope) -> serde_json::Value 
         } => json!({
             "kind": "fill",
             "ts": timestamp_ms,
+            "identity": fill_identity_json(identity),
             "strategy": strategy.as_ref().map(ToString::to_string),
             "order_id": order_id,
             "market": market.to_string(),

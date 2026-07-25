@@ -1,0 +1,32 @@
+{
+  "schema_version": 5,
+  "normalized": {
+    "schema_version": 3,
+    "source_id": "polymarket:user-ws",
+    "source_time_ms": 1003,
+    "canonical_source_rank": 0,
+    "receipt_time_ms": 1004,
+    "connection_id": "account-1",
+    "connection_epoch": 1,
+    "frame_sequence": 3,
+    "ingest_sequence": 3,
+    "portfolio": "paper",
+    "payload": {
+      "kind": "fill",
+      "ts": 1003,
+      "identity": {
+        "source": "venue",
+        "id": "trade-3"
+      },
+      "strategy": null,
+      "order_id": "order-1",
+      "market": "btc-5m",
+      "outcome": "up",
+      "price": "0.4",
+      "size": "10",
+      "side": "buy",
+      "fee": "0.1",
+      "liquidity": "taker"
+    }
+  }
+}

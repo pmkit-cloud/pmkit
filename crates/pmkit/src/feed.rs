@@ -717,6 +717,7 @@ const fn account_event_kind_rank(event: &pmkit_event::PmAccountEvent) -> u8 {
 fn account_event_detail_key(event: &pmkit_event::PmAccountEvent) -> String {
     match event {
         pmkit_event::PmAccountEvent::Fill {
+            identity,
             order_id,
             market,
             outcome,
@@ -727,7 +728,9 @@ fn account_event_detail_key(event: &pmkit_event::PmAccountEvent) -> String {
             timestamp_ms,
             ..
         } => {
-            format!("{order_id}:{market}:{outcome:?}:{price}:{size}:{side:?}:{fee}:{timestamp_ms}")
+            format!(
+                "{identity:?}:{order_id}:{market}:{outcome:?}:{price}:{size}:{side:?}:{fee}:{timestamp_ms}"
+            )
         }
         pmkit_event::PmAccountEvent::OrderAck {
             order_id,

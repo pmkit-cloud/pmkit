@@ -1,6 +1,6 @@
 use pmkit_book::Side;
 use pmkit_core::MarketId;
-use pmkit_event::Liquidity;
+use pmkit_event::{FillIdentity, Liquidity};
 use pmkit_exec::PlaceOrder;
 use pmkit_market::{Asset, Exchange, Outcome};
 use pmkit_strategy::{Actions, Strategy, StrategyContext, StrategyError};
@@ -70,6 +70,7 @@ fn fact_timestamp_reads_every_fact_kind() -> Result<(), Box<dyn std::error::Erro
     );
     assert_eq!(
         fact_timestamp(&account_fill(
+            FillIdentity::Venue("fill-1".into()),
             "order-1",
             &market,
             Outcome::Up,

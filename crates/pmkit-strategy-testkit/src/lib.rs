@@ -15,7 +15,9 @@
 
 use pmkit_book::{OrderBookL2, Position, Side};
 use pmkit_core::MarketId;
-use pmkit_event::{CexReferenceEvent, Liquidity, MarketEvent, PmAccountEvent, StrategyFact};
+use pmkit_event::{
+    CexReferenceEvent, FillIdentity, Liquidity, MarketEvent, PmAccountEvent, StrategyFact,
+};
 use pmkit_exec::PlaceOrder;
 use pmkit_market::{Asset, Exchange, Outcome};
 use pmkit_strategy::{Action, Actions, LogicalTimestamp, Strategy, StrategyContext, StrategyError};
@@ -88,6 +90,7 @@ pub const fn reference_trade(
 #[must_use]
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
 pub fn account_fill(
+    identity: FillIdentity,
     order_id: impl Into<String>,
     market: &MarketId,
     outcome: Outcome,
@@ -99,6 +102,7 @@ pub fn account_fill(
     timestamp_ms: i64,
 ) -> StrategyFact {
     StrategyFact::Account(PmAccountEvent::Fill {
+        identity,
         strategy: None,
         order_id: order_id.into(),
         market: market.clone(),

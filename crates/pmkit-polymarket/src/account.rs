@@ -3,7 +3,9 @@ use std::fmt;
 use futures::StreamExt as _;
 use pmkit_core::PortfolioId;
 use pmkit_data::{DataSourceError, LiveAccountDataSource, SourceSignal};
-use pmkit_event::{Liquidity, PmAccountEnvelope, PmAccountEvent, SourceEnvelope, StreamMetadata};
+use pmkit_event::{
+    FillIdentity, Liquidity, PmAccountEnvelope, PmAccountEvent, SourceEnvelope, StreamMetadata,
+};
 use polymarket_client_sdk_v2::{
     auth::{Normal, state::Authenticated},
     clob::{
@@ -91,7 +93,7 @@ impl LiveAccountDataSource for PolymarketUserData {
                 PmAccountEnvelope {
                     portfolio: self.portfolio.clone(),
                     metadata: StreamMetadata {
-                        schema_version: 1,
+                        schema_version: 3,
                         source_id: SOURCE_ID.into(),
                         source_time_ms: timestamp_ms,
                         canonical_source_rank: 0,
@@ -233,6 +235,7 @@ fn trade_event(
                 }
             };
             Ok(PmAccountEvent::Fill {
+                identity: FillIdentity::Venue(trade.id.clone()),
                 strategy: None,
                 order_id,
                 market: tokens.market().clone(),
@@ -382,6 +385,25 @@ mod tests {
         assert!(
             matches!(event, PmAccountEvent::OrderRejected { order_id, .. } if order_id == "order-1")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn maps_typed_trade_venue_fill_identity() -> Result<(), Box<dyn std::error::Error>> {
+        let trade: WsMessage = serde_json::from_str(
+            r#"{"event_type":"trade","id":"trade-1","market":"0x0101010101010101010101010101010101010101010101010101010101010101","asset_id":"1","side":"BUY","size":"2","price":"0.5","status":"MATCHED","timestamp":"42","taker_order_id":"order-1","trader_side":"TAKER"}"#,
+        )?;
+        let tokens = tokens()?;
+
+        let event = account_event(&trade, &tokens, MARKET)?;
+
+        assert!(matches!(
+            event,
+            PmAccountEvent::Fill {
+                identity: pmkit_event::FillIdentity::Venue(id),
+                ..
+            } if id == "trade-1"
+        ));
         Ok(())
     }
 }

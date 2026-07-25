@@ -1,8 +1,8 @@
 /// Current durable PM envelope schema version.
-pub const PM_ENVELOPE_VERSION: u16 = 4;
+pub const PM_ENVELOPE_VERSION: u16 = 5;
 pub const CAUSAL_DECISION_SCHEMA_VERSION: i64 = 2;
 pub const DURABLE_INTENT_SCHEMA_VERSION: i64 = 1;
-pub const CURRENT_SCHEMA_VERSION: i64 = 7;
+pub const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 pub const CREATE_SCHEMA_MIGRATIONS: &str = "
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -23,6 +23,9 @@ CREATE TABLE finalized_chain_checkpoints (
 
 pub const MIGRATE_PM_ENVELOPES_V1_TO_V2: &str = "
 UPDATE pm_envelopes SET schema_version = 2 WHERE schema_version = 1";
+
+pub const MIGRATE_PM_ENVELOPES_V4_TO_V5: &str = "
+UPDATE pm_envelopes SET schema_version = 5 WHERE schema_version = 4";
 
 pub const MIGRATE_CAUSAL_DECISIONS_V1_TO_V2: &str = "
 UPDATE causal_decisions SET schema_version = 2 WHERE schema_version = 1";
