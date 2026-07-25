@@ -181,6 +181,10 @@ impl Executor for TransportExec {
 
 struct LiveWithFill;
 
+struct LiveWithBook;
+
+struct LiveWithDuplicatePartialFill;
+
 #[async_trait]
 impl LiveDataSource for LiveWithFill {
     async fn subscribe(
@@ -221,6 +225,78 @@ impl LiveDataSource for LiveWithFill {
             .await
             .map_err(|_| DataSourceError::SinkClosed)?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl LiveDataSource for LiveWithBook {
+    async fn subscribe(
+        &self,
+        market: MarketId,
+        outcome: Outcome,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        if outcome == Outcome::Up {
+            sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
+                market,
+                outcome,
+                bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+                asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
+                timestamp_ms: 1,
+            }))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        }
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+#[async_trait]
+impl LiveDataSource for LiveWithDuplicatePartialFill {
+    async fn subscribe(
+        &self,
+        market: MarketId,
+        outcome: Outcome,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        if outcome == Outcome::Up {
+            sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
+                market: market.clone(),
+                outcome,
+                bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+                asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
+                timestamp_ms: 1,
+            }))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+            for timestamp_ms in [2, 2] {
+                sink.send(SourceSignal::market_event(MarketEvent::Fill {
+                    strategy: None,
+                    order_id: "owned-order".to_owned(),
+                    market: market.clone(),
+                    outcome,
+                    price: Decimal::new(50, 2),
+                    size: Decimal::from(3),
+                    side: Side::Buy,
+                    fee: Decimal::ZERO,
+                    liquidity: Liquidity::Taker,
+                    timestamp_ms,
+                }))
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)?;
+            }
+        }
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
     }
 }
 
@@ -365,7 +441,7 @@ async fn live_run_cancels_owned_orders_on_shutdown() -> Result<(), Box<dyn std::
         RunId::new("live-cancel-owned")?,
         PortfolioId::new("alice")?,
         executor.clone(),
-        Arc::new(LiveWithFill),
+        Arc::new(LiveWithBook),
         risk()?,
     )
     .strategy(StrategyRegistration::new(
@@ -378,9 +454,67 @@ async fn live_run_cancels_owned_orders_on_shutdown() -> Result<(), Box<dyn std::
 
     let report = live::drive(&run, &runtime).await?;
 
-    assert_eq!(report.events_processed, 2);
+    assert_eq!(report.events_processed, 1);
+    assert_eq!(report.exposure.portfolio_notional, Decimal::ZERO);
     assert_eq!(executor.cancels.load(Ordering::Relaxed), 1);
     assert_eq!(executor.cancel_all_calls.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_report_keeps_exact_open_order_reservation_when_leaving_orders()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: one accepted ten-share order at a fifty-cent limit.
+    let executor = Arc::new(ShutdownExec::default());
+    let run = LiveRun::new(
+        RunId::new("live-leave")?,
+        PortfolioId::new("alice")?,
+        executor.clone(),
+        Arc::new(LiveWithBook),
+        risk()?,
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(BuyFactory),
+    ));
+    let mut runtime = config()?;
+    runtime.shutdown.live_orders = LiveOrderPolicy::Leave;
+
+    // When: shutdown deliberately leaves the owned order open.
+    let report = live::drive(&run, &runtime).await?;
+
+    // Then: the public report retains exactly the open order's 10 × 0.50 reservation.
+    assert_eq!(report.exposure.portfolio_notional, Decimal::from(5));
+    assert_eq!(executor.cancels.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn duplicate_partial_fill_does_not_decrement_live_reservation_twice()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: one ten-share reservation and two identical three-share venue fills.
+    let run = LiveRun::new(
+        RunId::new("live-duplicate-partial")?,
+        PortfolioId::new("alice")?,
+        Arc::new(ShutdownExec::default()),
+        Arc::new(LiveWithDuplicatePartialFill),
+        risk()?,
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(BuyFactory),
+    ));
+    let mut runtime = config()?;
+    runtime.shutdown.live_orders = LiveOrderPolicy::Leave;
+
+    // When: the live driver receives both deliveries.
+    let report = live::drive(&run, &runtime).await?;
+
+    // Then: one 3 × 0.45 position plus one 7 × 0.50 reservation remains.
+    assert_eq!(report.fills, 1);
+    assert_eq!(report.exposure.portfolio_notional, Decimal::new(485, 2));
     Ok(())
 }
 

@@ -30,6 +30,8 @@ struct ScriptedReference;
 
 struct TwoMarketHistory;
 
+struct StaleMarkHistory;
+
 struct Taker;
 
 struct TakerFactory;
@@ -150,6 +152,41 @@ impl HistoricalDataSource for TwoMarketHistory {
 }
 
 #[async_trait]
+impl HistoricalDataSource for StaleMarkHistory {
+    async fn replay(
+        &self,
+        _query: ReplayQuery,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        let market = MarketId::new("btc-5m").map_err(|_| DataSourceError::NotAvailable)?;
+        for (bids, asks, timestamp_ms) in [
+            (
+                vec![(Decimal::new(44, 2), Decimal::from(50))],
+                vec![(Decimal::new(46, 2), Decimal::from(50))],
+                1,
+            ),
+            (Vec::new(), Vec::new(), 2),
+        ] {
+            sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
+                market: market.clone(),
+                outcome: Outcome::Up,
+                bids,
+                asks,
+                timestamp_ms,
+            }))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        }
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+#[async_trait]
 impl HistoricalDataSource for ScriptedHistory {
     async fn replay(
         &self,
@@ -235,6 +272,48 @@ async fn backtest_drives_replay_through_strategy_to_fill() -> Result<(), Box<dyn
     let manifest = app.manifest(&RunId::new("bt")?).ok_or("missing manifest")?;
     assert_eq!(manifest["mode"], "backtest");
     assert_eq!(manifest["run"], "bt");
+    Ok(())
+}
+
+#[tokio::test]
+async fn backtest_clears_exposure_when_book_loses_its_mark()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: a filled position followed by an unmarkable book for the same outcome.
+    let replay = ReplaySpec::new(
+        Arc::new(StaleMarkHistory),
+        "2026-01-01T00:00:00Z".parse()?,
+        "2026-02-01T00:00:00Z".parse()?,
+        EvidenceRequirement::CorroboratedOnly,
+        RetrievalWait::ReturnPending,
+    );
+    let run = BacktestRun::new(
+        RunId::new("bt-stale-mark")?,
+        PortfolioId::new("research")?,
+        replay,
+        Money::usdc(1_000),
+        risk()?,
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(BuyFactory),
+    ));
+
+    // When: the replay completes.
+    let app = Pmkit::builder(config()?).run(run).start().await?;
+    let RunReport::Backtest(report) = app.wait_for(RunId::new("bt-stale-mark")?).await? else {
+        return Err("expected a backtest report".into());
+    };
+
+    // Then: the obsolete mid-price cannot survive in reported exposure.
+    assert_eq!(report.exposure.portfolio_notional, Decimal::ZERO);
     Ok(())
 }
 
