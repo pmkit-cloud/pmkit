@@ -305,6 +305,8 @@ pub(super) struct LiveRiskState {
     positions_by_market: HashMap<MarketId, Vec<Position>>,
     marks: HashMap<(MarketId, Outcome), Decimal>,
     applied_fills: HashSet<FillIdentity>,
+    filled_qty_by_order: HashMap<String, Decimal>,
+    fees_by_order: HashMap<String, Decimal>,
     applied_settlements: HashSet<SettlementIdentity>,
     realized_pnl: Decimal,
     fees: Decimal,
@@ -344,6 +346,7 @@ impl LiveRiskState {
         limits: &RiskLimits,
     ) -> bool {
         let MarketEvent::Fill {
+            order_id,
             market,
             outcome,
             side,
@@ -358,6 +361,11 @@ impl LiveRiskState {
         if !self.applied_fills.insert(identity.clone()) {
             return false;
         }
+        *self
+            .filled_qty_by_order
+            .entry(order_id.clone())
+            .or_default() += *size;
+        *self.fees_by_order.entry(order_id.clone()).or_default() += *fee;
         let positions = self.positions_by_market.entry(market.clone()).or_default();
         if let Some(position) = positions
             .iter()
@@ -592,6 +600,20 @@ impl LiveRiskState {
 
     pub(super) const fn fill_count(&self) -> usize {
         self.fill_count
+    }
+
+    pub(super) fn filled_qty(&self, order_id: &str) -> Decimal {
+        self.filled_qty_by_order
+            .get(order_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn fees_for_order(&self, order_id: &str) -> Decimal {
+        self.fees_by_order
+            .get(order_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     #[cfg(test)]

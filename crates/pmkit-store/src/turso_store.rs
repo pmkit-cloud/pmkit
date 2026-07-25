@@ -15,8 +15,9 @@ use crate::{
     migrations::{MIGRATIONS, apply},
     schema::{
         CAUSAL_DECISION_SCHEMA_VERSION, DURABLE_INTENT_SCHEMA_VERSION, INSERT_DECISION,
-        INSERT_ENVELOPE, INSERT_PENDING_INTENT, READ_DECISIONS, READ_ENVELOPES, READ_KILL_STATE,
-        READ_PENDING_INTENTS, READ_UNKNOWN_INTENTS, TRANSITION_PENDING_INTENT, UPSERT_KILL_STATE,
+        INSERT_ENVELOPE, INSERT_PENDING_INTENT, READ_ACCEPTED_INTENTS, READ_DECISIONS,
+        READ_ENVELOPES, READ_KILL_STATE, READ_PENDING_INTENTS, READ_UNKNOWN_INTENTS,
+        TRANSITION_PENDING_INTENT, UPSERT_KILL_STATE,
     },
 };
 
@@ -289,6 +290,13 @@ impl TapeStore for TursoTapeStore {
         scope: &OwnerScope,
     ) -> Result<Vec<DurableIntent>, StoreError> {
         read_intents_by_state(self, scope, READ_UNKNOWN_INTENTS).await
+    }
+
+    async fn read_accepted_intents(
+        &self,
+        scope: &OwnerScope,
+    ) -> Result<Vec<DurableIntent>, StoreError> {
+        read_intents_by_state(self, scope, READ_ACCEPTED_INTENTS).await
     }
 
     async fn read_decisions(&self, scope: &OwnerScope) -> Result<Vec<CausalDecision>, StoreError> {

@@ -33,6 +33,7 @@ pmkit-manifest = { path = "../pmkit-manifest" }
 pmkit-tape = { path = "../pmkit-tape" }
 pmkit-store = { path = "../pmkit-store" }
 serde_json = { workspace = true }
+serde = { workspace = true }
 rust_decimal = { workspace = true }
 
 [dev-dependencies]

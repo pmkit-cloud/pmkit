@@ -281,8 +281,9 @@ async fn causal_decision_and_pending_intent_are_idempotent()
 }
 
 #[tokio::test]
-async fn pending_and_unknown_intents_are_enumerated() -> Result<(), Box<dyn std::error::Error>> {
-    // Given: two pending intents and one intent that transitioned to unknown.
+async fn pending_unknown_and_accepted_intents_are_enumerated()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: two pending intents and one intent in each recoverable terminal state.
     let (_dir, path) = database_path("intents")?;
     let scope = owner_scope("paper")?;
     let store = TursoTapeStore::open_local(&path).await?;
@@ -303,6 +304,12 @@ async fn pending_and_unknown_intents_are_enumerated() -> Result<(), Box<dyn std:
         correlation_id: "unknown".into(),
         source_timestamp_ms: 1_002,
         ingest_sequence: 3,
+    };
+    let accepted = CausalIdentity {
+        scope: scope.clone(),
+        correlation_id: "accepted".into(),
+        source_timestamp_ms: 1_003,
+        ingest_sequence: 4,
     };
     store
         .store_decision(&CausalDecision {
@@ -334,10 +341,17 @@ async fn pending_and_unknown_intents_are_enumerated() -> Result<(), Box<dyn std:
     store
         .transition_intent_with_order(&unknown, IntentOutcome::Unknown, Some("venue-unknown"))
         .await?;
+    store
+        .store_intent_pending(&accepted, &json!({"a": 4}))
+        .await?;
+    store
+        .transition_intent_with_order(&accepted, IntentOutcome::Accepted, Some("venue-accepted"))
+        .await?;
 
-    // When: pending and unknown intents are enumerated.
+    // When: pending, unknown, and accepted intents are enumerated.
     let pending = store.read_pending_intents(&scope).await?;
     let unknowns = store.read_unknown_intents(&scope).await?;
+    let accepted = store.read_accepted_intents(&scope).await?;
 
     // Then: pending contains the two still-pending intents; unknown contains the terminal one.
     assert_eq!(pending.len(), 2);
@@ -359,6 +373,9 @@ async fn pending_and_unknown_intents_are_enumerated() -> Result<(), Box<dyn std:
     assert_eq!(unknowns.len(), 1);
     assert_eq!(unknowns[0].identity.correlation_id, "unknown");
     assert_eq!(unknowns[0].payload["venue_order_id"], "venue-unknown");
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].identity.correlation_id, "accepted");
+    assert_eq!(accepted[0].payload["venue_order_id"], "venue-accepted");
 
     store.delete_database()?;
     assert!(!path.exists());

@@ -15,10 +15,15 @@ use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 
+#[path = "live_recovery.rs"]
+mod live_recovery;
 #[path = "live_risk.rs"]
 mod live_risk;
 #[path = "live_tape.rs"]
 mod live_tape;
+#[cfg(test)]
+use live_recovery::{DurableOrder, apply_status_fill};
+use live_recovery::{accepted_submissions, corrupt_order, reconstruct_accepted_orders};
 #[cfg(test)]
 pub use live_risk::mark_positions;
 use live_risk::{
@@ -68,6 +73,28 @@ async fn reconcile_open_orders(
     Ok(snapshot.open_orders.into_iter().collect())
 }
 
+async fn query_order_status(
+    run: &LiveRun,
+    runtime: &RuntimeConfig,
+    order_id: &OrderId,
+) -> Result<OrderStatus, StartError> {
+    tokio::time::timeout(
+        runtime.shutdown.reconciliation_timeout,
+        run.executor().query_status(order_id),
+    )
+    .await
+    .map_err(|_| StartError::ExecutionState {
+        run: run.id().clone(),
+        source: ExecError::Transport {
+            message: format!("status query timed out for order {}", order_id.0),
+        },
+    })?
+    .map_err(|source| StartError::ExecutionState {
+        run: run.id().clone(),
+        source,
+    })
+}
+
 async fn recover_intents(
     run: &LiveRun,
     runtime: &RuntimeConfig,
@@ -111,21 +138,7 @@ async fn recover_intents(
                     ),
                 },
             })?;
-        let status = tokio::time::timeout(
-            runtime.shutdown.reconciliation_timeout,
-            run.executor().query_status(&order_id),
-        )
-        .await
-        .map_err(|_| StartError::ExecutionState {
-            run: run.id().clone(),
-            source: ExecError::Transport {
-                message: format!("status query timed out for order {}", order_id.0),
-            },
-        })?
-        .map_err(|source| StartError::ExecutionState {
-            run: run.id().clone(),
-            source,
-        })?;
+        let status = query_order_status(run, runtime, &order_id).await?;
         let outcome = match status {
             OrderStatus::Open(_) | OrderStatus::Accepted(_) => pmkit_store::IntentOutcome::Accepted,
             OrderStatus::Rejected(_) | OrderStatus::Cancelled(_) => {
@@ -256,81 +269,6 @@ fn correlation_strategy(
             .starts_with(&prefix)
             .then(|| registration.id().clone())
     })
-}
-
-fn corrupt_rate_history(message: impl Into<String>) -> StoreError {
-    StoreError::Storage {
-        message: format!("invalid durable order-rate history: {}", message.into()),
-    }
-}
-
-async fn accepted_submissions(
-    store: &dyn TapeStore,
-    scope: &OwnerScope,
-    registrations: &[StrategyRegistration],
-) -> Result<Vec<(Option<pmkit_core::StrategyId>, i64)>, StoreError> {
-    let mut submissions = Vec::new();
-    let mut accepted_intent_ids = HashSet::new();
-    for decision in store.read_decisions(scope).await? {
-        let decision_kind = decision.payload["decision"]["kind"]
-            .as_str()
-            .ok_or_else(|| corrupt_rate_history("decision kind is missing"))?;
-        let risk = match decision_kind {
-            "no_action" | "strategy_error" => continue,
-            "actions" => decision.payload["decision"]["risk"]
-                .as_array()
-                .ok_or_else(|| corrupt_rate_history("action risk list is missing"))?,
-            other => {
-                return Err(corrupt_rate_history(format!(
-                    "unsupported decision kind {other}"
-                )));
-            }
-        };
-        let timestamp_ms = decision.payload["snapshot"]["timing"]["decision_ms"]
-            .as_i64()
-            .ok_or_else(|| corrupt_rate_history("logical decision timestamp is missing"))?;
-        let strategy = correlation_strategy(&decision.identity.correlation_id, registrations);
-        for verdict in risk {
-            let action_index = verdict["action_index"]
-                .as_u64()
-                .and_then(|value| u32::try_from(value).ok())
-                .ok_or_else(|| corrupt_rate_history("action index is invalid"))?;
-            let verdict_kind = verdict["verdict"]["kind"]
-                .as_str()
-                .ok_or_else(|| corrupt_rate_history("risk verdict kind is missing"))?;
-            match verdict_kind {
-                "accepted" => {
-                    accepted_intent_ids.insert(format!(
-                        "{}:{action_index}",
-                        decision.identity.correlation_id
-                    ));
-                    submissions.push((strategy.clone(), timestamp_ms));
-                }
-                "rejected" => {}
-                other => {
-                    return Err(corrupt_rate_history(format!(
-                        "unsupported risk verdict {other}"
-                    )));
-                }
-            }
-        }
-    }
-
-    let mut unresolved = store.read_pending_intents(scope).await?;
-    unresolved.extend(store.read_unknown_intents(scope).await?);
-    for intent in unresolved {
-        if accepted_intent_ids.contains(&intent.identity.correlation_id) {
-            continue;
-        }
-        let timestamp_ms = intent.payload["submitted_ms"]
-            .as_i64()
-            .ok_or_else(|| corrupt_rate_history("intent logical timestamp is missing"))?;
-        submissions.push((
-            correlation_strategy(&intent.identity.correlation_id, registrations),
-            timestamp_ms,
-        ));
-    }
-    Ok(submissions)
 }
 
 fn risk_storage_error(source: &RiskStateError) -> StoreError {
@@ -624,6 +562,7 @@ async fn drive_with_control_and_rate_limits(
     let mut tape = LiveTape::open(run, runtime)?;
     let mut order_rate_state = OrderRateState::default();
     let mut risk_state = LiveRiskState::default();
+    let mut reservations: HashMap<String, Reservation> = HashMap::new();
     if let Some(store) = store {
         risk_state = reconstruct_risk_state(store, &scope, &limits)
             .await
@@ -631,7 +570,6 @@ async fn drive_with_control_and_rate_limits(
                 run: run.id().clone(),
                 source,
             })?;
-        metrics.set_fills(risk_state.fill_count());
         let submissions = accepted_submissions(store, &scope, run.strategies())
             .await
             .map_err(|source| StartError::Storage {
@@ -640,9 +578,19 @@ async fn drive_with_control_and_rate_limits(
             })?;
         order_rate_state.restore(rate_limits, submissions);
         recover_intents(run, runtime, store, &scope).await?;
+        let recovered = reconstruct_accepted_orders(run, runtime, store, &mut risk_state).await?;
+        if recovered.open_orders != open_orders {
+            return Err(StartError::Storage {
+                run: run.id().clone(),
+                source: corrupt_order(
+                    "executor open-order snapshot differs from durable accepted intents",
+                ),
+            });
+        }
+        reservations = recovered.reservations;
+        metrics.set_fills(risk_state.fill_count());
     }
 
-    let mut reservations: HashMap<String, Reservation> = HashMap::new();
     let mut connection_epochs = HashMap::new();
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     control.emit(RunLifecycleEvent::Started {
@@ -998,18 +946,23 @@ async fn finish(
 
 #[cfg(test)]
 mod recovery_tests {
-    use super::{StartError, recover_intents};
-    use crate::test_support::{config, risk};
+    use super::{
+        DurableOrder, LiveRiskState, StartError, apply_status_fill, drive_with_store,
+        recover_intents, strategy_correlation_id,
+    };
+    use crate::test_support::{BuyFactory, config, risk};
     use async_trait::async_trait;
-    use pmkit_core::{PortfolioId, RunId};
+    use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
     use pmkit_data::{DataSourceError, LiveDataSource, SourceSignal};
     use pmkit_exec::{
         ExecError, ExecutionSnapshot, Executor, OrderId, OrderStatus, OrderStatusDetails,
         PlaceOrder,
     };
     use pmkit_market::Outcome;
+    use pmkit_runtime::{LiveOrderPolicy, StrategyRegistration};
     use pmkit_spec::LiveRun;
     use pmkit_store::{CausalIdentity, IntentOutcome, OwnerScope, TapeStore, TursoTapeStore};
+    use rust_decimal::Decimal;
     use serde_json::json;
     use std::{sync::Arc, time::Duration};
     use tokio::sync::mpsc::Sender;
@@ -1023,6 +976,11 @@ mod recovery_tests {
     }
 
     struct RecoveryExecutor(RecoveryResponse);
+
+    struct RestartExecutor {
+        open_orders: Vec<OrderId>,
+        status: OrderStatus,
+    }
 
     #[async_trait]
     impl Executor for RecoveryExecutor {
@@ -1065,6 +1023,37 @@ mod recovery_tests {
         }
     }
 
+    #[async_trait]
+    impl Executor for RestartExecutor {
+        async fn preflight(&self) -> Result<ExecutionSnapshot, ExecError> {
+            Ok(ExecutionSnapshot {
+                open_orders: self.open_orders.clone(),
+            })
+        }
+
+        async fn reconcile(&self) -> Result<ExecutionSnapshot, ExecError> {
+            Ok(ExecutionSnapshot {
+                open_orders: self.open_orders.clone(),
+            })
+        }
+
+        async fn query_status(&self, _order_id: &OrderId) -> Result<OrderStatus, ExecError> {
+            Ok(self.status.clone())
+        }
+
+        async fn submit(&self, _order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
+            Ok(OrderId("unused".into()))
+        }
+
+        async fn cancel(&self, _order_id: &OrderId) -> Result<(), ExecError> {
+            Ok(())
+        }
+
+        async fn cancel_all(&self) -> Result<(), ExecError> {
+            Ok(())
+        }
+    }
+
     struct RecoverySource;
 
     #[async_trait]
@@ -1073,8 +1062,14 @@ mod recovery_tests {
             &self,
             _market: pmkit_core::MarketId,
             _outcome: Outcome,
-            _sink: Sender<SourceSignal>,
+            sink: Sender<SourceSignal>,
         ) -> Result<(), DataSourceError> {
+            sink.send(SourceSignal::Watermark(i64::MAX))
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)?;
+            sink.send(SourceSignal::Eof)
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)?;
             Ok(())
         }
     }
@@ -1099,6 +1094,39 @@ mod recovery_tests {
             source_timestamp_ms: 1_000,
             ingest_sequence: 1,
         }
+    }
+
+    fn restart_run(
+        run_id: &str,
+        executor: RestartExecutor,
+    ) -> Result<LiveRun, Box<dyn std::error::Error>> {
+        Ok(LiveRun::new(
+            RunId::new(run_id)?,
+            PortfolioId::new("recovery")?,
+            Arc::new(executor),
+            Arc::new(RecoverySource),
+            risk()?,
+        )
+        .strategy(StrategyRegistration::new(
+            StrategyId::new("maker")?,
+            MarketId::new("btc-5m")?,
+            Arc::new(BuyFactory),
+        )))
+    }
+
+    fn accepted_intent_payload() -> serde_json::Value {
+        json!({
+            "action_index": 0,
+            "submitted_ms": 1_000,
+            "order": {
+                "market": "btc-5m",
+                "outcome": "Up",
+                "side": "buy",
+                "price": "0.50",
+                "qty": "10",
+                "post_only": true
+            }
+        })
     }
 
     #[tokio::test]
@@ -1172,26 +1200,269 @@ mod recovery_tests {
         }
         Ok(())
     }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
+    async fn restart_restores_exact_open_reservation() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: a durable accepted ten-share maker order with three shares filled at the venue.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("recover-open-reservation.db");
+        let store = TursoTapeStore::open_local(&path).await?;
+        let run = restart_run(
+            "recover-open-reservation",
+            RestartExecutor {
+                open_orders: vec![OrderId("venue-open".into())],
+                status: OrderStatus::Open(OrderStatusDetails {
+                    filled_qty: Some(Decimal::from(3)),
+                    price: Some(Decimal::new(50, 2)),
+                    fee: Some(Decimal::ZERO),
+                    settlement_reference: None,
+                }),
+            },
+        )?;
+        let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
+        let correlation =
+            strategy_correlation_id(&StrategyId::new("maker")?, &MarketId::new("btc-5m")?, 1_000);
+        let identity = recovery_identity(&scope, &format!("{correlation}:0"));
+        store
+            .store_intent_pending(&identity, &accepted_intent_payload())
+            .await?;
+        store
+            .transition_intent_with_order(&identity, IntentOutcome::Accepted, Some("venue-open"))
+            .await?;
+        let mut runtime = config()?;
+        runtime.shutdown.live_orders = LiveOrderPolicy::Leave;
+
+        // When: the live driver restarts from durable intent and venue status authorities.
+        let report = drive_with_store(&run, &runtime, Some(&store)).await?;
+
+        // Then: exact remaining notional is attributed to its durable market and strategy.
+        assert_eq!(report.exposure.portfolio_notional, Decimal::new(350, 2));
+        assert_eq!(report.exposure.market_notionals.len(), 1);
+        assert_eq!(
+            report.exposure.market_notionals[0].market,
+            MarketId::new("btc-5m")?
+        );
+        assert_eq!(
+            report.exposure.market_notionals[0].notional,
+            Decimal::new(350, 2)
+        );
+        assert_eq!(report.exposure.strategy_notionals.len(), 1);
+        assert_eq!(
+            report.exposure.strategy_notionals[0].strategy,
+            StrategyId::new("maker")?
+        );
+        assert_eq!(
+            report.exposure.strategy_notionals[0].notional,
+            Decimal::new(350, 2)
+        );
+        store.delete_database()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
+    async fn restart_applies_matched_status_fill_once() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: an accepted order whose authoritative venue status is fully matched.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("recover-matched-fill.db");
+        let store = TursoTapeStore::open_local(&path).await?;
+        let scope = OwnerScope::new(
+            PortfolioId::new("recovery")?,
+            RunId::new("recover-matched-fill")?,
+        );
+        let correlation =
+            strategy_correlation_id(&StrategyId::new("maker")?, &MarketId::new("btc-5m")?, 1_000);
+        let identity = recovery_identity(&scope, &format!("{correlation}:0"));
+        store
+            .store_intent_pending(&identity, &accepted_intent_payload())
+            .await?;
+        store
+            .transition_intent_with_order(&identity, IntentOutcome::Accepted, Some("venue-matched"))
+            .await?;
+        let mut runtime = config()?;
+        runtime.shutdown.live_orders = LiveOrderPolicy::Leave;
+
+        // When: the same durable restart reconstruction is performed twice.
+        for _ in 0..2 {
+            let run = restart_run(
+                "recover-matched-fill",
+                RestartExecutor {
+                    open_orders: Vec::new(),
+                    status: OrderStatus::Accepted(OrderStatusDetails {
+                        filled_qty: Some(Decimal::from(10)),
+                        price: Some(Decimal::new(52, 2)),
+                        fee: Some(Decimal::new(10, 2)),
+                        settlement_reference: None,
+                    }),
+                },
+            )?;
+            let report = drive_with_store(&run, &runtime, Some(&store)).await?;
+
+            // Then: the recovered aggregate fill has one stable identity per reconstruction.
+            assert_eq!(report.fills, 1);
+        }
+        store.delete_database()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
+    async fn restart_rejects_missing_or_ambiguous_order_detail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for ambiguous in [false, true] {
+            // Given: an open venue order whose durable detail is missing or duplicated.
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join(format!("recover-invalid-{ambiguous}.db"));
+            let store = TursoTapeStore::open_local(&path).await?;
+            let run_id = format!("recover-invalid-{ambiguous}");
+            let run = restart_run(
+                &run_id,
+                RestartExecutor {
+                    open_orders: vec![OrderId("venue-invalid".into())],
+                    status: OrderStatus::Open(OrderStatusDetails {
+                        filled_qty: Some(Decimal::ZERO),
+                        price: Some(Decimal::new(50, 2)),
+                        fee: Some(Decimal::ZERO),
+                        settlement_reference: None,
+                    }),
+                },
+            )?;
+            let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
+            let correlation = strategy_correlation_id(
+                &StrategyId::new("maker")?,
+                &MarketId::new("btc-5m")?,
+                1_000,
+            );
+            let identity = recovery_identity(&scope, &format!("{correlation}:0"));
+            let mut payload = accepted_intent_payload();
+            if !ambiguous {
+                payload["order"]
+                    .as_object_mut()
+                    .ok_or("order object")?
+                    .remove("price");
+            }
+            store.store_intent_pending(&identity, &payload).await?;
+            store
+                .transition_intent_with_order(
+                    &identity,
+                    IntentOutcome::Accepted,
+                    Some("venue-invalid"),
+                )
+                .await?;
+            if ambiguous {
+                let duplicate = CausalIdentity {
+                    correlation_id: format!("{correlation}:1"),
+                    ingest_sequence: 2,
+                    ..identity.clone()
+                };
+                let mut duplicate_payload = accepted_intent_payload();
+                duplicate_payload["action_index"] = json!(1);
+                store
+                    .store_intent_pending(&duplicate, &duplicate_payload)
+                    .await?;
+                store
+                    .transition_intent_with_order(
+                        &duplicate,
+                        IntentOutcome::Accepted,
+                        Some("venue-invalid"),
+                    )
+                    .await?;
+            }
+            let mut runtime = config()?;
+            runtime.shutdown.live_orders = LiveOrderPolicy::Leave;
+
+            // When: startup cannot identify one complete durable authority for the open order.
+            let result = drive_with_store(&run, &runtime, Some(&store)).await;
+
+            // Then: recovery aborts instead of inferring price, size, or ownership.
+            assert!(matches!(result, Err(StartError::Storage { .. })));
+            store.delete_database()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn matched_status_applies_only_missing_durable_fill_delta()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Given: four durable shares and a matched venue aggregate of ten shares for one order.
+        let limits = risk()?;
+        let market = MarketId::new("btc-5m")?;
+        let strategy = StrategyId::new("maker")?;
+        let order = DurableOrder {
+            order_id: OrderId("venue-delta".into()),
+            strategy: strategy.clone(),
+            market: market.clone(),
+            outcome: Outcome::Up,
+            side: pmkit_book::Side::Buy,
+            price: Decimal::new(50, 2),
+            qty: Decimal::from(10),
+            post_only: true,
+            submitted_ms: 1_000,
+        };
+        let mut state = LiveRiskState::default();
+        state.apply_account_event(
+            &pmkit_event::PmAccountEvent::Fill {
+                identity: pmkit_event::FillIdentity::Venue("trade-1".into()),
+                strategy: Some(strategy),
+                order_id: order.order_id.0.clone(),
+                market: market.clone(),
+                outcome: Outcome::Up,
+                price: Decimal::new(51, 2),
+                size: Decimal::from(4),
+                side: pmkit_book::Side::Buy,
+                fee: Decimal::new(4, 2),
+                liquidity: pmkit_event::Liquidity::Maker,
+                timestamp_ms: 1_001,
+            },
+            &limits,
+        )?;
+        let details = OrderStatusDetails {
+            filled_qty: Some(Decimal::from(10)),
+            price: Some(Decimal::new(52, 2)),
+            fee: Some(Decimal::new(10, 2)),
+            settlement_reference: None,
+        };
+
+        // When: matched recovery observes the same aggregate status twice.
+        apply_status_fill(&order, &details, &mut state, &limits)?;
+        apply_status_fill(&order, &details, &mut state, &limits)?;
+
+        // Then: only the six-share delta is added under one recovered fill identity.
+        assert_eq!(state.filled_qty("venue-delta"), Decimal::from(10));
+        assert_eq!(state.fees_for_order("venue-delta"), Decimal::new(10, 2));
+        assert_eq!(state.fill_count(), 2);
+        assert_eq!(state.positions(&market)[0].qty, Decimal::from(10));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod rate_limit_tests {
-    use super::{OrderRateLimits, drive_with_rate_limits};
+    use super::{
+        OrderRateLimits, accepted_submissions, drive_with_rate_limits, strategy_correlation_id,
+    };
     use crate::test_support::{config, risk};
     use async_trait::async_trait;
     use pmkit_book::Side;
     use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
     use pmkit_data::{DataSourceError, LiveDataSource, SourceSignal};
     use pmkit_event::MarketEvent;
-    use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
+    use pmkit_exec::{
+        ExecError, ExecutionSnapshot, Executor, OrderId, OrderStatus, OrderStatusDetails,
+        PlaceOrder,
+    };
     use pmkit_market::Outcome;
     use pmkit_runtime::StrategyRegistration;
     use pmkit_spec::LiveRun;
-    use pmkit_store::TursoTapeStore;
+    use pmkit_store::{
+        CausalDecision, CausalIdentity, IntentOutcome, OwnerScope, TapeStore, TursoTapeStore,
+    };
     use pmkit_strategy::{
         Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
     };
     use rust_decimal::Decimal;
+    use serde_json::json;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc::Sender;
@@ -1209,6 +1480,10 @@ mod rate_limit_tests {
 
         async fn reconcile(&self) -> Result<ExecutionSnapshot, ExecError> {
             Ok(ExecutionSnapshot::default())
+        }
+
+        async fn query_status(&self, _order_id: &OrderId) -> Result<OrderStatus, ExecError> {
+            Ok(OrderStatus::Cancelled(OrderStatusDetails::default()))
         }
 
         async fn submit(&self, _order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
@@ -1349,6 +1624,79 @@ mod rate_limit_tests {
         assert_eq!(first_executor.submissions.load(Ordering::Relaxed), 2);
         assert_eq!(restarted_executor.submissions.load(Ordering::Relaxed), 1);
         assert_eq!(report.rejected, 1);
+        store.delete_database()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
+    async fn accepted_intents_fill_decision_crash_window_without_double_counting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Given: one accepted intent with its decision and one accepted before decision storage.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("live-rate-accepted-intents.db");
+        let store = TursoTapeStore::open_local(&path).await?;
+        let run = rate_run(
+            "rate-accepted-intents",
+            Vec::new(),
+            Arc::new(RateExecutor::default()),
+        )?;
+        let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
+        let strategy = StrategyId::new("rate-strategy")?;
+        let market = MarketId::new("btc-5m")?;
+        let first_correlation = strategy_correlation_id(&strategy, &market, 1_000);
+        let first_decision = CausalIdentity {
+            scope: scope.clone(),
+            correlation_id: first_correlation.clone(),
+            source_timestamp_ms: 1_000,
+            ingest_sequence: 1,
+        };
+        store
+            .store_decision(&CausalDecision {
+                identity: first_decision,
+                payload: json!({
+                    "snapshot": {"timing": {"decision_ms": 1_000}},
+                    "decision": {
+                        "kind": "actions",
+                        "risk": [{"action_index": 0, "verdict": {"kind": "accepted"}}]
+                    }
+                }),
+            })
+            .await?;
+        for (correlation_id, timestamp_ms, ingest_sequence) in [
+            (format!("{first_correlation}:0"), 1_000, 1),
+            (
+                format!("{}:0", strategy_correlation_id(&strategy, &market, 1_050)),
+                1_050,
+                2,
+            ),
+        ] {
+            let intent = CausalIdentity {
+                scope: scope.clone(),
+                correlation_id,
+                source_timestamp_ms: timestamp_ms,
+                ingest_sequence,
+            };
+            store
+                .store_intent_pending(&intent, &json!({"submitted_ms": timestamp_ms}))
+                .await?;
+            let venue_order_id = format!("venue-{ingest_sequence}");
+            store
+                .transition_intent_with_order(
+                    &intent,
+                    IntentOutcome::Accepted,
+                    Some(&venue_order_id),
+                )
+                .await?;
+        }
+
+        // When: accepted submission history is reconstructed after the crash window.
+        let submissions = accepted_submissions(&store, &scope, run.strategies()).await?;
+
+        // Then: both accepted submissions contribute, and the decision-backed one contributes once.
+        assert_eq!(submissions.len(), 2);
+        assert!(submissions.contains(&(Some(strategy.clone()), 1_000)));
+        assert!(submissions.contains(&(Some(strategy), 1_050)));
         store.delete_database()?;
         Ok(())
     }

@@ -431,6 +431,17 @@ pub trait TapeStore: Send + Sync {
         scope: &OwnerScope,
     ) -> Result<Vec<DurableIntent>, StoreError>;
 
+    /// Lists durable intents accepted by the venue for one owner scope.
+    async fn read_accepted_intents(
+        &self,
+        scope: &OwnerScope,
+    ) -> Result<Vec<DurableIntent>, StoreError> {
+        let _ = scope;
+        Err(StoreError::Storage {
+            message: "accepted-intent recovery is not configured".into(),
+        })
+    }
+
     /// Lists causal decisions recorded for one owner scope in canonical order.
     async fn read_decisions(&self, scope: &OwnerScope) -> Result<Vec<CausalDecision>, StoreError>;
 

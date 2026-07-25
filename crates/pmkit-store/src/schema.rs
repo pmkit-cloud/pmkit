@@ -276,6 +276,12 @@ FROM durable_intents
 WHERE portfolio_id = ?1 AND run_id = ?2 AND state = 'unknown'
 ORDER BY source_timestamp_ms, ingest_sequence";
 
+pub const READ_ACCEPTED_INTENTS: &str = "
+SELECT portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence, schema_version, payload_json
+FROM durable_intents
+WHERE portfolio_id = ?1 AND run_id = ?2 AND state = 'accepted'
+ORDER BY source_timestamp_ms, ingest_sequence";
+
 pub const READ_DECISIONS: &str = "
 SELECT portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence, schema_version, payload_json
 FROM causal_decisions
