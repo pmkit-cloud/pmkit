@@ -3589,6 +3589,7 @@ name = "pmkit"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "pmkit-accounting",
  "pmkit-book",
  "pmkit-core",
  "pmkit-data",

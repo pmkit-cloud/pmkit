@@ -55,8 +55,9 @@ repository, not the long-term target.
 
 ### Gaps
 
-- Portfolio-wide exposure aggregation.
-- Model calibration and model registry.
+- Model calibration and model registry are explicitly deferred. A concrete
+  consumer has not been selected yet, so OSS intentionally ships no trait,
+  registry, or plugin seam for them at this stage.
 
 ## 4. Events and data contracts
 

@@ -79,6 +79,7 @@ async fn paper_run_drives_live_feed_to_fill() -> Result<(), Box<dyn std::error::
         paper.fills >= 1,
         "the taker buy should fill against the ask"
     );
+    assert!(paper.exposure.portfolio_notional > Decimal::ZERO);
     Ok(())
 }
 

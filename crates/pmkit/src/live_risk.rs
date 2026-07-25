@@ -1,3 +1,4 @@
+use pmkit_accounting::PositionExposure;
 use pmkit_book::Position;
 use pmkit_core::{MarketId, PortfolioId, StrategyId};
 use pmkit_event::{MarketEvent, PmAccountEvent};
@@ -590,6 +591,16 @@ impl LiveRiskState {
             .map_or(Decimal::ZERO, |positions| {
                 self.marked_notional(market, positions)
             })
+    }
+
+    pub(super) fn position_exposures(&self) -> Vec<PositionExposure> {
+        self.positions_by_market
+            .iter()
+            .map(|(market, positions)| PositionExposure {
+                market: market.clone(),
+                notional: self.marked_notional(market, positions),
+            })
+            .collect()
     }
 
     fn marked_notional(&self, market: &MarketId, positions: &[Position]) -> Decimal {

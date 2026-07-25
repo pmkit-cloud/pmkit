@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::{sync::mpsc, task::JoinSet};
 
+use pmkit_accounting::PortfolioExposure;
 use pmkit_core::{MarketId, RunId, StrategyId};
 use pmkit_data::SourceSignal;
 use pmkit_event::SourceEnvelope;
@@ -53,6 +54,8 @@ pub struct BacktestReport {
     pub events_processed: usize,
     /// Total simulated fills produced.
     pub fills: usize,
+    /// Portfolio-wide exposure aggregation over positions and reservations.
+    pub exposure: PortfolioExposure,
 }
 
 /// The terminal report of a paper run.
@@ -64,6 +67,8 @@ pub struct PaperReport {
     pub events_processed: usize,
     /// Total simulated fills produced.
     pub fills: usize,
+    /// Portfolio-wide exposure aggregation over positions and reservations.
+    pub exposure: PortfolioExposure,
 }
 
 /// The terminal report of a live run.
@@ -77,6 +82,8 @@ pub struct LiveReport {
     pub fills: usize,
     /// Orders rejected by the risk gate before reaching the venue.
     pub rejected: usize,
+    /// Portfolio-wide exposure aggregation over positions and reservations.
+    pub exposure: PortfolioExposure,
 }
 
 /// The terminal report of a run.

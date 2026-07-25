@@ -2,6 +2,7 @@ use super::{
     PaperReport, RunControl, RunLifecycleEvent, StartError, instantiate_strategies, store_signal,
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
+use pmkit_accounting::{PortfolioExposure, PositionExposure, aggregate_exposure};
 use pmkit_book::OrderBookL2;
 use pmkit_event::{MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
 use pmkit_exec::{ExecError, Executor};
@@ -11,6 +12,7 @@ use pmkit_sim::SimulationConfig;
 use pmkit_spec::PaperRun;
 use pmkit_store::{CausalDecision, CausalIdentity, OwnerScope, StoreError, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
+use rust_decimal::Decimal;
 use std::collections::HashSet;
 
 // allow: SIZE_OK — the scoped driver and task-specific recovery tests must remain in this file.
@@ -206,6 +208,7 @@ pub async fn drive_with_control(
             run: run.id().clone(),
             events_processed,
             fills,
+            exposure: report_exposure(&paper.account_state()),
         });
     }
 
@@ -218,6 +221,7 @@ pub async fn drive_with_control(
                 run: run.id().clone(),
                 events_processed,
                 fills,
+                exposure: report_exposure(&paper.account_state()),
             });
         }
         store_signal(
@@ -396,7 +400,25 @@ pub async fn drive_with_control(
         run: run.id().clone(),
         events_processed,
         fills,
+        exposure: report_exposure(&paper.account_state()),
     })
+}
+
+fn report_exposure(account: &pmkit_paper::PaperAccountState) -> PortfolioExposure {
+    let mut notionals = std::collections::HashMap::new();
+    for position in &account.positions {
+        let entry = notionals
+            .entry(position.market.clone())
+            .or_insert(Decimal::ZERO);
+        *entry += position.quantity.abs() * position.average_entry;
+    }
+    aggregate_exposure(
+        &notionals
+            .into_iter()
+            .map(|(market, notional)| PositionExposure { market, notional })
+            .collect::<Vec<_>>(),
+        &[],
+    )
 }
 
 #[cfg(test)]

@@ -3,14 +3,17 @@ use super::{
     instantiate_strategies, store_signal,
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
+use pmkit_accounting::{PortfolioExposure, PositionExposure, aggregate_exposure};
 use pmkit_book::OrderBookL2;
 use pmkit_core::MarketId;
 use pmkit_data::ReplayQuery;
 use pmkit_event::{MarketEvent, SourceEnvelope, StrategyFact};
+use pmkit_market::Outcome;
 use pmkit_sim::{SimEngine, SimulationConfig};
 use pmkit_spec::BacktestRun;
 use pmkit_store::{CausalIdentity, OwnerScope, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
+use rust_decimal::Decimal;
 use std::collections::HashMap;
 
 #[expect(
@@ -75,6 +78,7 @@ pub async fn drive_with_control(
     };
     let mut sim = SimEngine::with_fee_config("bt", 0, simulation_config);
     let mut positions_by_market: HashMap<MarketId, Vec<pmkit_book::Position>> = HashMap::new();
+    let mut marks: HashMap<(MarketId, Outcome), Decimal> = HashMap::new();
     let mut events_processed = 0_usize;
     let mut fills = 0_usize;
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
@@ -90,6 +94,7 @@ pub async fn drive_with_control(
             run: run.id().clone(),
             events_processed,
             fills,
+            exposure: report_exposure(&positions_by_market, &marks),
         });
     }
 
@@ -102,6 +107,7 @@ pub async fn drive_with_control(
                 run: run.id().clone(),
                 events_processed,
                 fills,
+                exposure: report_exposure(&positions_by_market, &marks),
             });
         }
         store_signal(
@@ -137,6 +143,9 @@ pub async fn drive_with_control(
                 timestamp_ms: *timestamp_ms,
                 last_trade_price: None,
             };
+            if let Some(mark) = book.mid_price() {
+                marks.insert((market.clone(), *outcome), mark);
+            }
             sim.update_book(market, *outcome, book.clone());
             let drained = sim.drain_fills();
             fills += absorb_market_fills(&drained, &mut positions_by_market);
@@ -194,6 +203,7 @@ pub async fn drive_with_control(
         run: run.id().clone(),
         events_processed,
         fills,
+        exposure: report_exposure(&positions_by_market, &marks),
     })
 }
 
@@ -216,6 +226,28 @@ fn absorb_market_fills(
         }
     }
     fills.len()
+}
+
+fn report_exposure(
+    positions_by_market: &HashMap<MarketId, Vec<pmkit_book::Position>>,
+    marks: &HashMap<(MarketId, Outcome), Decimal>,
+) -> PortfolioExposure {
+    let mut position_notionals = Vec::new();
+    for (market, positions) in positions_by_market {
+        let notional = positions
+            .iter()
+            .map(|position| {
+                marks
+                    .get(&(market.clone(), position.outcome))
+                    .map_or(Decimal::ZERO, |mark| position.qty.abs() * *mark)
+            })
+            .sum();
+        position_notionals.push(PositionExposure {
+            market: market.clone(),
+            notional,
+        });
+    }
+    aggregate_exposure(&position_notionals, &[])
 }
 
 struct RunStrategiesInputs<'a> {

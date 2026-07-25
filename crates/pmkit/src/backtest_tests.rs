@@ -231,6 +231,7 @@ async fn backtest_drives_replay_through_strategy_to_fill() -> Result<(), Box<dyn
         backtest.fills >= 1,
         "the taker buy should fill against the ask"
     );
+    assert!(backtest.exposure.portfolio_notional > Decimal::ZERO);
     let manifest = app.manifest(&RunId::new("bt")?).ok_or("missing manifest")?;
     assert_eq!(manifest["mode"], "backtest");
     assert_eq!(manifest["run"], "bt");

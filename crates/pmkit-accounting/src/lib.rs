@@ -1,11 +1,109 @@
 //! Chain- and venue-independent portfolio accounting.
 
 use pmkit_book::Side;
-use pmkit_core::MarketId;
+use pmkit_core::{MarketId, StrategyId};
 use pmkit_market::Outcome;
 use pmkit_money::Money;
 use rust_decimal::Decimal;
+use std::collections::HashMap;
 use thiserror::Error;
+
+/// One read-only marked position notional.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionExposure {
+    /// The market containing the position.
+    pub market: MarketId,
+    /// Position notional in USDC.
+    pub notional: Decimal,
+}
+
+/// One read-only open-order reservation notional.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExposureReservation {
+    /// The market containing the reservation.
+    pub market: MarketId,
+    /// The strategy that owns the reservation.
+    pub strategy: StrategyId,
+    /// Reserved notional in USDC.
+    pub notional: Decimal,
+}
+
+/// Aggregated notional for one market.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketExposure {
+    /// The market identity.
+    pub market: MarketId,
+    /// Total marked plus reserved notional for this market.
+    pub notional: Decimal,
+}
+
+/// Aggregated reserved notional for one strategy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrategyExposure {
+    /// The strategy identity.
+    pub strategy: StrategyId,
+    /// Total reserved notional for this strategy.
+    pub notional: Decimal,
+}
+
+/// Read-only portfolio-wide exposure view over positions and reservations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortfolioExposure {
+    /// Total portfolio notional (positions + reservations).
+    pub portfolio_notional: Decimal,
+    /// Portfolio notional grouped by market.
+    pub market_notionals: Vec<MarketExposure>,
+    /// Reservation notional grouped by strategy.
+    pub strategy_notionals: Vec<StrategyExposure>,
+}
+
+/// Sums positions and reservations into a single portfolio exposure view.
+#[must_use]
+pub fn aggregate_exposure(
+    positions: &[PositionExposure],
+    reservations: &[ExposureReservation],
+) -> PortfolioExposure {
+    let mut market_notionals: HashMap<MarketId, Decimal> = HashMap::new();
+    let mut strategy_notionals: HashMap<StrategyId, Decimal> = HashMap::new();
+    let mut portfolio_notional = Decimal::ZERO;
+
+    for position in positions {
+        portfolio_notional += position.notional;
+        let entry = market_notionals
+            .entry(position.market.clone())
+            .or_insert(Decimal::ZERO);
+        *entry += position.notional;
+    }
+
+    for reservation in reservations {
+        portfolio_notional += reservation.notional;
+        let market_entry = market_notionals
+            .entry(reservation.market.clone())
+            .or_insert(Decimal::ZERO);
+        *market_entry += reservation.notional;
+        let strategy_entry = strategy_notionals
+            .entry(reservation.strategy.clone())
+            .or_insert(Decimal::ZERO);
+        *strategy_entry += reservation.notional;
+    }
+
+    let mut market_notionals = market_notionals
+        .into_iter()
+        .map(|(market, notional)| MarketExposure { market, notional })
+        .collect::<Vec<_>>();
+    market_notionals.sort_by_key(|entry| entry.market.to_string());
+    let mut strategy_notionals = strategy_notionals
+        .into_iter()
+        .map(|(strategy, notional)| StrategyExposure { strategy, notional })
+        .collect::<Vec<_>>();
+    strategy_notionals.sort_by_key(|entry| entry.strategy.to_string());
+
+    PortfolioExposure {
+        portfolio_notional,
+        market_notionals,
+        strategy_notionals,
+    }
+}
 
 /// One normalized fill accepted by the accounting ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,9 +381,11 @@ const fn validate_non_negative(value: Decimal, field: &'static str) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::{LedgerFill, Mark, PortfolioLedger, Settlement};
+    use super::{
+        ExposureReservation, LedgerFill, Mark, PortfolioLedger, PositionExposure, Settlement,
+    };
     use pmkit_book::Side;
-    use pmkit_core::MarketId;
+    use pmkit_core::{MarketId, StrategyId};
     use pmkit_market::Outcome;
     use pmkit_money::Money;
     use rust_decimal::Decimal;
@@ -378,6 +478,117 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(ledger.positions()[0].quantity, Decimal::ONE);
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_exposure() -> Result<(), Box<dyn std::error::Error>> {
+        let btc = MarketId::new("btc-5m")?;
+        let eth = MarketId::new("eth-5m")?;
+        let maker = StrategyId::new("maker")?;
+        let taker = StrategyId::new("taker")?;
+        let exposure = super::aggregate_exposure(
+            &[
+                PositionExposure {
+                    market: btc.clone(),
+                    notional: Decimal::from(10),
+                },
+                PositionExposure {
+                    market: eth.clone(),
+                    notional: Decimal::from(20),
+                },
+            ],
+            &[
+                ExposureReservation {
+                    market: btc.clone(),
+                    strategy: maker.clone(),
+                    notional: Decimal::from(3),
+                },
+                ExposureReservation {
+                    market: eth.clone(),
+                    strategy: maker.clone(),
+                    notional: Decimal::from(2),
+                },
+                ExposureReservation {
+                    market: btc.clone(),
+                    strategy: taker.clone(),
+                    notional: Decimal::from(1),
+                },
+            ],
+        );
+
+        assert_eq!(exposure.portfolio_notional, Decimal::from(36));
+        assert_eq!(
+            exposure
+                .market_notionals
+                .iter()
+                .find(|entry| entry.market == btc)
+                .map(|entry| entry.notional),
+            Some(Decimal::from(14))
+        );
+        assert_eq!(
+            exposure
+                .market_notionals
+                .iter()
+                .find(|entry| entry.market == eth)
+                .map(|entry| entry.notional),
+            Some(Decimal::from(22))
+        );
+        assert_eq!(
+            exposure
+                .strategy_notionals
+                .iter()
+                .find(|entry| entry.strategy == maker)
+                .map(|entry| entry.notional),
+            Some(Decimal::from(5))
+        );
+        assert_eq!(
+            exposure
+                .strategy_notionals
+                .iter()
+                .find(|entry| entry.strategy == taker)
+                .map(|entry| entry.notional),
+            Some(Decimal::from(1))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_empty_is_zero() {
+        let exposure = super::aggregate_exposure(&[], &[]);
+        assert_eq!(exposure.portfolio_notional, Decimal::ZERO);
+        assert!(exposure.market_notionals.is_empty());
+        assert!(exposure.strategy_notionals.is_empty());
+    }
+
+    #[test]
+    fn aggregate_exposure_is_deterministic() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: one position in each of four distinct markets.
+        let positions = [
+            PositionExposure {
+                market: MarketId::new("btc-5m")?,
+                notional: Decimal::ONE,
+            },
+            PositionExposure {
+                market: MarketId::new("eth-5m")?,
+                notional: Decimal::ONE,
+            },
+            PositionExposure {
+                market: MarketId::new("sol-5m")?,
+                notional: Decimal::ONE,
+            },
+            PositionExposure {
+                market: MarketId::new("xrp-5m")?,
+                notional: Decimal::ONE,
+            },
+        ];
+
+        // When: the same inputs are aggregated twice.
+        let first = super::aggregate_exposure(&positions, &[]);
+        let second = super::aggregate_exposure(&positions, &[]);
+
+        // Then: the public grouped view is stable for report consumers.
+        assert_eq!(first, second);
         Ok(())
     }
 }

@@ -3,6 +3,7 @@ use super::{
     instantiate_strategies, store_signal as persist_signal,
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
+use pmkit_accounting::{ExposureReservation, aggregate_exposure};
 use pmkit_book::OrderBookL2;
 use pmkit_event::{MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
 use pmkit_exec::{ExecError, Executor, OrderId, OrderStatus, PlaceOrder};
@@ -215,12 +216,17 @@ fn sources(run: &LiveRun, strategies: &[StrategyInstance]) -> Vec<SourceTaskDefi
     sources
 }
 
-fn report(run: &LiveRun, counts: [usize; 3]) -> LiveReport {
+fn report(
+    run: &LiveRun,
+    counts: [usize; 3],
+    exposure: pmkit_accounting::PortfolioExposure,
+) -> LiveReport {
     LiveReport {
         run: run.id().clone(),
         events_processed: counts[0],
         fills: counts[1],
         rejected: counts[2],
+        exposure,
     }
 }
 
@@ -546,6 +552,8 @@ async fn drive_with_control_and_rate_limits(
             &open_orders,
             &mut tape,
             [events_processed, risk_state.fill_count(), rejected],
+            &risk_state,
+            &reservations,
         )
         .await;
     }
@@ -560,6 +568,8 @@ async fn drive_with_control_and_rate_limits(
                 &open_orders,
                 &mut tape,
                 [events_processed, risk_state.fill_count(), rejected],
+                &risk_state,
+                &reservations,
             )
             .await;
         }
@@ -814,6 +824,8 @@ async fn drive_with_control_and_rate_limits(
         &open_orders,
         &mut tape,
         [events_processed, risk_state.fill_count(), rejected],
+        &risk_state,
+        &reservations,
     )
     .await?;
     control.emit(RunLifecycleEvent::Completed {
@@ -828,9 +840,22 @@ async fn finish(
     open_orders: &HashSet<OrderId>,
     tape: &mut LiveTape,
     counts: [usize; 3],
+    risk_state: &LiveRiskState,
+    reservations: &HashMap<String, Reservation>,
 ) -> Result<LiveReport, StartError> {
     tape.finish(run, runtime, open_orders).await?;
-    Ok(report(run, counts))
+    let exposure = aggregate_exposure(
+        &risk_state.position_exposures(),
+        &reservations
+            .values()
+            .map(|reservation| ExposureReservation {
+                market: reservation.market.clone(),
+                strategy: reservation.strategy.clone(),
+                notional: reservation.notional,
+            })
+            .collect::<Vec<_>>(),
+    );
+    Ok(report(run, counts, exposure))
 }
 
 #[cfg(test)]

@@ -245,6 +245,7 @@ async fn live_run_routes_orders_and_counts_fills() -> Result<(), Box<dyn std::er
     assert_eq!(report.events_processed, 2);
     assert_eq!(report.fills, 1);
     assert_eq!(report.rejected, 0);
+    assert!(report.exposure.portfolio_notional > Decimal::ZERO);
     Ok(())
 }
 
