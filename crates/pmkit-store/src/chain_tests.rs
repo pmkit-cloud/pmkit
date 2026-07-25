@@ -7,8 +7,9 @@ use crate::wallet::rebuild_wallet;
 use crate::{
     Address, BlockHead, CanonicalChainLog, CanonicalLogSegment, CanonicalLogStore, ChainCheckpoint,
     ChainEvent, ChainId, ContractRegistry, FinalizedBlockCoverage, FinalizedBlockRange,
-    FinalizedRawLogBatch, ProviderIdentity, RawLogIdentity, RawRpcLog, TradeSide, TursoTapeStore,
-    WalletQuery, ingest_finalized_batch,
+    FinalizedRawLogBatch, ProviderIdentity, QuorumVerifiedFinalizedLogBatch, RawLogIdentity,
+    RawRpcLog, TradeSide, TursoTapeStore, WalletQuery, agree_on_finalized_log_batches,
+    ingest_finalized_batch,
 };
 
 fn database_path(name: &str) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
@@ -405,14 +406,14 @@ async fn finalized_raw_batch_is_decoded_and_ingested_transactionally()
         range.clone(),
         vec![BlockHead::new(ChainId::POLYGON, 1, "0xblock1", "0xgenesis")],
     )?;
-    let batch = FinalizedRawLogBatch::new(
+    let batch = quorum_verified_batch(FinalizedRawLogBatch::new(
         provider,
         range,
         BlockHead::new(ChainId::POLYGON, 2, "0xhead", "0xblock1"),
         BlockHead::new(ChainId::POLYGON, 1, "0xblock1", "0xgenesis"),
         coverage,
         vec![raw],
-    )?;
+    )?)?;
     let store = TursoTapeStore::open_local(&path).await?;
 
     // When: the validated batch is decoded and committed through the canonical store.
@@ -456,11 +457,22 @@ fn raw_transfer(block_number: u64, block_hash: &str, amount: u64) -> RawRpcLog {
     }
 }
 
+fn quorum_verified_batch(
+    batch: FinalizedRawLogBatch,
+) -> Result<QuorumVerifiedFinalizedLogBatch, crate::ChainSourceError> {
+    let mut corroborating = batch.clone();
+    corroborating.provider = ProviderIdentity::new("corroborating-rpc");
+    for log in &mut corroborating.logs {
+        log.identity.provider = corroborating.provider.clone();
+    }
+    agree_on_finalized_log_batches(2, &[batch, corroborating])
+}
+
 fn finalized_batch(
     blocks: Vec<BlockHead>,
     finalized: BlockHead,
     logs: Vec<RawRpcLog>,
-) -> Result<FinalizedRawLogBatch, Box<dyn std::error::Error>> {
+) -> Result<QuorumVerifiedFinalizedLogBatch, Box<dyn std::error::Error>> {
     let from_block = blocks
         .first()
         .ok_or("finalized batch fixture needs a first block")?
@@ -471,14 +483,14 @@ fn finalized_batch(
         .block_number;
     let range = FinalizedBlockRange::new(ChainId::POLYGON, from_block, to_block)?;
     let coverage = FinalizedBlockCoverage::new(range.clone(), blocks)?;
-    Ok(FinalizedRawLogBatch::new(
+    Ok(quorum_verified_batch(FinalizedRawLogBatch::new(
         ProviderIdentity::new("fixture-rpc"),
         range,
         finalized.clone(),
         finalized,
         coverage,
         logs,
-    )?)
+    )?)?)
 }
 
 #[tokio::test]

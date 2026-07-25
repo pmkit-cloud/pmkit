@@ -260,7 +260,8 @@ mod rpc_batch_tests {
     use crate::{
         Address, BlockHead, CanonicalLogStore, ChainCheckpoint, ChainId, ContractRegistry,
         FinalizedBlockCoverage, FinalizedBlockRange, FinalizedRawLogBatch, ProviderIdentity,
-        RawLogIdentity, RawRpcLog, StoreError, TursoTapeStore, WalletQuery, ingest_finalized_batch,
+        QuorumVerifiedFinalizedLogBatch, RawLogIdentity, RawRpcLog, StoreError, TursoTapeStore,
+        WalletQuery, agree_on_finalized_log_batches, ingest_finalized_batch,
     };
 
     const TRANSFER_TOPIC: &str =
@@ -295,17 +296,23 @@ mod rpc_batch_tests {
     fn batch(
         provider: ProviderIdentity,
         logs: Vec<RawRpcLog>,
-    ) -> Result<FinalizedRawLogBatch, crate::ChainSourceError> {
+    ) -> Result<QuorumVerifiedFinalizedLogBatch, crate::ChainSourceError> {
         let range = FinalizedBlockRange::new(ChainId::POLYGON, 1, 1)?;
         let finalized = BlockHead::new(ChainId::POLYGON, 1, "0xblock1", "0xgenesis");
-        FinalizedRawLogBatch::new(
+        let batch = FinalizedRawLogBatch::new(
             provider,
             range.clone(),
             BlockHead::new(ChainId::POLYGON, 2, "0xhead", "0xblock1"),
             finalized.clone(),
             FinalizedBlockCoverage::new(range, vec![finalized])?,
             logs,
-        )
+        )?;
+        let mut corroborating = batch.clone();
+        corroborating.provider = ProviderIdentity::new("corroborating-provider");
+        for log in &mut corroborating.logs {
+            log.identity.provider = corroborating.provider.clone();
+        }
+        agree_on_finalized_log_batches(2, &[batch, corroborating])
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use crate::{
-    CanonicalLogSegment, ChainCheckpoint, ChainId, ContractRegistry, FinalizedRawLogBatch,
-    StoreError, TursoTapeStore,
+    CanonicalLogSegment, ChainCheckpoint, ChainId, ContractRegistry,
+    QuorumVerifiedFinalizedLogBatch, StoreError, TursoTapeStore,
     chain_store::{validate_segment, validate_stored_chain, write_canonical_segment},
     decode_raw_log,
     schema::{READ_FINALIZED_CHAIN_CHECKPOINT, UPSERT_FINALIZED_CHAIN_CHECKPOINT},
@@ -13,6 +13,24 @@ use crate::{
 /// coordination. The batch is held without canonical writes until its coverage
 /// proves a finalized head linked to the durable checkpoint.
 ///
+/// A single-provider batch cannot cross this durable boundary:
+///
+/// ```compile_fail
+/// use pmkit_store::{
+///     ChainCheckpoint, ContractRegistry, FinalizedRawLogBatch, TursoTapeStore,
+///     ingest_finalized_batch,
+/// };
+///
+/// fn bypass_quorum(
+///     store: &TursoTapeStore,
+///     registry: &ContractRegistry,
+///     batch: &FinalizedRawLogBatch,
+///     common_ancestor: ChainCheckpoint,
+/// ) {
+///     let _ = ingest_finalized_batch(store, registry, batch, common_ancestor);
+/// }
+/// ```
+///
 /// # Errors
 ///
 /// Returns [`StoreError`] when finality regresses, header evidence is invalid,
@@ -20,9 +38,10 @@ use crate::{
 pub async fn ingest_finalized_batch(
     store: &TursoTapeStore,
     registry: &ContractRegistry,
-    batch: &FinalizedRawLogBatch,
+    batch: &QuorumVerifiedFinalizedLogBatch,
     common_ancestor: ChainCheckpoint,
 ) -> Result<(), StoreError> {
+    let batch = batch.as_raw_batch();
     let persisted = store.finalized_checkpoint(registry.chain_id).await?;
     let Some(finalized) =
         verify_finalized_progression(persisted.as_ref(), &common_ancestor, batch)?

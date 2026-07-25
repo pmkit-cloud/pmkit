@@ -64,8 +64,9 @@ pub use schema::PM_ENVELOPE_VERSION;
 pub use source::{
     BlockHead, CanonicalLogSource, ChainSourceError, FinalizedBlockCoverage, FinalizedBlockRange,
     FinalizedProviderHead, FinalizedRawLogBatch, FinalizedRawLogProvider,
-    FixtureCanonicalLogSource, ProviderIdentity, RawLogIdentity, RawRpcLog,
-    agree_on_finalized_heads, agree_on_finalized_log_batches, verify_block_header_linkage,
+    FixtureCanonicalLogSource, ProviderIdentity, QuorumVerifiedFinalizedLogBatch, RawLogIdentity,
+    RawRpcLog, agree_on_finalized_heads, agree_on_finalized_log_batches,
+    verify_block_header_linkage,
 };
 pub use turso_store::TursoTapeStore;
 pub use wallet::{

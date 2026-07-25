@@ -271,6 +271,7 @@ fn log_batch_quorum_compares_agreed_height() {
         result,
         Ok(batch)
             if batch
+                .as_raw_batch()
                 .logs
                 .first()
                 .is_some_and(|log| log.data == "0xagreed")

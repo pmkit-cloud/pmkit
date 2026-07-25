@@ -19,7 +19,19 @@ pub trait CanonicalLogSource: Send + Sync {
     ) -> Result<CanonicalLogSegment, ChainSourceError>;
 }
 
-/// Selects a provider batch whose finalized-height logs are corroborated by quorum.
+/// A finalized raw-log batch corroborated by the configured provider quorum.
+#[derive(Debug)]
+pub struct QuorumVerifiedFinalizedLogBatch(FinalizedRawLogBatch);
+
+impl QuorumVerifiedFinalizedLogBatch {
+    /// Returns the corroborated provider batch selected by quorum agreement.
+    #[must_use]
+    pub const fn as_raw_batch(&self) -> &FinalizedRawLogBatch {
+        &self.0
+    }
+}
+
+/// Selects a provider batch whose finalized-range logs are corroborated by quorum.
 ///
 /// Provider labels are excluded from log equality; chain position, hashes,
 /// contract, topics, data, range, and header coverage must otherwise match.
@@ -31,7 +43,7 @@ pub trait CanonicalLogSource: Send + Sync {
 pub fn agree_on_finalized_log_batches(
     configured_provider_count: usize,
     batches: &[FinalizedRawLogBatch],
-) -> Result<FinalizedRawLogBatch, ChainSourceError> {
+) -> Result<QuorumVerifiedFinalizedLogBatch, ChainSourceError> {
     let provider_heads = batches
         .iter()
         .map(|batch| FinalizedProviderHead {
@@ -43,11 +55,8 @@ pub fn agree_on_finalized_log_batches(
     let agreed_head = agree_on_finalized_heads(configured_provider_count, &provider_heads)?;
     let required_provider_count = required_finality_quorum(configured_provider_count);
 
-    let valid_at_agreed_height = |batch: &FinalizedRawLogBatch| {
-        batch.verify().is_ok()
-            && batch.finalized == agreed_head
-            && batch.range.to_block == agreed_head.block_number
-    };
+    let valid_for_agreed_head =
+        |batch: &FinalizedRawLogBatch| batch.verify().is_ok() && batch.finalized == agreed_head;
     let batches_agree = |left: &FinalizedRawLogBatch, right: &FinalizedRawLogBatch| {
         left.range == right.range
             && left.coverage == right.coverage
@@ -65,12 +74,12 @@ pub fn agree_on_finalized_log_batches(
             })
     };
     let agreement_count = |candidate: &FinalizedRawLogBatch| {
-        if !valid_at_agreed_height(candidate) {
+        if !valid_for_agreed_head(candidate) {
             return 0;
         }
         batches
             .iter()
-            .filter(|batch| valid_at_agreed_height(batch) && batches_agree(candidate, batch))
+            .filter(|batch| valid_for_agreed_head(batch) && batches_agree(candidate, batch))
             .count()
     };
     let largest_agreement_count = batches
@@ -82,7 +91,7 @@ pub fn agree_on_finalized_log_batches(
         .iter()
         .find(|candidate| agreement_count(candidate) >= required_provider_count)
     {
-        return Ok(agreed.clone());
+        return Ok(QuorumVerifiedFinalizedLogBatch(agreed.clone()));
     }
 
     Err(ChainSourceError::ProviderQuorumNotReached {
@@ -90,7 +99,7 @@ pub fn agree_on_finalized_log_batches(
         required_provider_count,
         observed_provider_count: batches
             .iter()
-            .filter(|batch| valid_at_agreed_height(batch))
+            .filter(|batch| valid_for_agreed_head(batch))
             .count(),
         largest_agreement_count,
     })
