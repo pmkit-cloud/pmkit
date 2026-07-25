@@ -1,5 +1,6 @@
 use crate::feed::{FeedMode, MergedFeed, SourceDefinition};
-use pmkit_core::MarketId;
+use crate::{FeedHealthSnapshot, RunMetrics};
+use pmkit_core::{MarketId, RunId};
 use pmkit_data::{DataSourceError, SourceSignal};
 use pmkit_event::{
     CexReferenceEnvelope, CexReferenceEvent, MarketEvent, PmMarketEnvelope, SourceEnvelope,
@@ -84,6 +85,55 @@ async fn deterministic_source_merge_matches_all_modes() -> Result<(), Box<dyn st
         expected.as_deref(),
         Some([StrategyFact::Market(_), StrategyFact::Reference(_)])
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn feed_reports_logical_lag() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: two sources whose safe merge frontier is 20 but whose latest events differ.
+    let metrics = RunMetrics::new(&RunId::new("feed-logical-lag")?);
+    let facts = MergedFeed::from_fixture(
+        FeedMode::Backtest,
+        vec![
+            SourceDefinition::finite(
+                "pm",
+                vec![pm(10, 1)?, SourceSignal::Watermark(20), SourceSignal::Eof],
+            ),
+            SourceDefinition::finite(
+                "binance",
+                vec![cex(20, 7), SourceSignal::Watermark(20), SourceSignal::Eof],
+            ),
+        ],
+        Some(20),
+    )
+    .with_metrics(metrics.clone())
+    .collect()
+    .await?;
+
+    // When: the merge finishes after releasing both safe facts.
+    let health = metrics.snapshot().feed_health;
+
+    // Then: source lag is measured only from the logical watermark frontier.
+    assert_eq!(facts.len(), 2);
+    assert_eq!(
+        health,
+        vec![
+            FeedHealthSnapshot {
+                source: "binance".to_owned(),
+                last_event_timestamp_ms: Some(20),
+                watermark_ms: Some(20),
+                logical_lag_ms: Some(0),
+                gap_count: 0,
+            },
+            FeedHealthSnapshot {
+                source: "pm".to_owned(),
+                last_event_timestamp_ms: Some(10),
+                watermark_ms: Some(20),
+                logical_lag_ms: Some(10),
+                gap_count: 0,
+            },
+        ]
+    );
     Ok(())
 }
 

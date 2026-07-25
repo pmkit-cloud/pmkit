@@ -66,7 +66,8 @@ pub async fn drive_with_control(
         FeedMode::Backtest,
         sources,
         Some(run.replay().to().timestamp_millis()),
-    );
+    )
+    .with_metrics(metrics.clone());
     let replay = tokio::spawn(async move { feed.forward(tx).await });
 
     // ponytail: fee category fixed to Crypto; positions tracked from fills.

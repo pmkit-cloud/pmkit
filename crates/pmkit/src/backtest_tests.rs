@@ -1,5 +1,6 @@
 use crate::{
-    AppHandle, Cancellation, Pmkit, RunLifecycleEvent, RunMetricsSnapshot, RunReport, RuntimeError,
+    AppHandle, Cancellation, FeedHealthSnapshot, Pmkit, RunLifecycleEvent, RunMetricsSnapshot,
+    RunReport, RuntimeError, StartError,
     test_support::{BuyFactory, config, risk},
 };
 use async_trait::async_trait;
@@ -314,7 +315,7 @@ async fn metrics_match_report() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn metrics_observable_on_failure() -> Result<(), Box<dyn std::error::Error>> {
+async fn feed_gap_counted_and_still_aborts() -> Result<(), Box<dyn std::error::Error>> {
     // Given: a replay source that fails before producing an event.
     let replay = ReplaySpec::new(
         Arc::new(FailingHistory),
@@ -347,13 +348,35 @@ async fn metrics_observable_on_failure() -> Result<(), Box<dyn std::error::Error
         .ok_or("failing replay unexpectedly completed")?;
 
     // Then: the typed, run-scoped diagnostics remain available without storage internals.
-    let metrics: &RunMetricsSnapshot = error.diagnostics().ok_or("missing diagnostics")?;
+    let metrics: RunMetricsSnapshot = error.diagnostics().ok_or("missing diagnostics")?.clone();
+    println!("feed gap diagnostics: {metrics:?}");
     assert_eq!(metrics.run, RunId::new("metrics-failure")?);
     assert_eq!(metrics.events_processed, 0);
     assert_eq!(metrics.fills, 0);
     assert_eq!(metrics.rejected, 0);
     assert_eq!(metrics.reconnects, 0);
     assert_eq!(metrics.decisions, 0);
+    assert_eq!(
+        metrics.feed_health,
+        vec![FeedHealthSnapshot {
+            source: "pm".to_owned(),
+            last_event_timestamp_ms: None,
+            watermark_ms: None,
+            logical_lag_ms: None,
+            gap_count: 1,
+        }]
+    );
+    assert!(matches!(
+        error,
+        StartError::RunFailed { source, .. }
+            if matches!(
+                source.as_ref(),
+                StartError::Source {
+                    source: DataSourceError::ReplayGap { .. },
+                    ..
+                }
+            )
+    ));
     Ok(())
 }
 

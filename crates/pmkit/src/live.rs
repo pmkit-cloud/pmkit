@@ -622,7 +622,8 @@ async fn drive_with_control_and_rate_limits(
     let account_ledger_authoritative = run.account_data_ref().is_some();
     let max_open_orders = usize::try_from(limits.max_open_orders.get()).unwrap_or(usize::MAX);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1024);
-    let feed = MergedFeed::from_tasks(FeedMode::Live, sources(run, &strategies), None);
+    let feed = MergedFeed::from_tasks(FeedMode::Live, sources(run, &strategies), None)
+        .with_metrics(metrics.clone());
     let merge = tokio::spawn(async move { feed.forward(event_tx).await });
     let mut tape = LiveTape::open(run, runtime)?;
     let mut order_rate_state = OrderRateState::default();

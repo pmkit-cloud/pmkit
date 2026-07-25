@@ -196,7 +196,7 @@ pub async fn drive_with_control(
             move |sink| async move { account.subscribe_account(portfolio, sink).await },
         ));
     }
-    let feed = MergedFeed::from_tasks(FeedMode::Paper, sources, None);
+    let feed = MergedFeed::from_tasks(FeedMode::Paper, sources, None).with_metrics(metrics.clone());
     let merge = tokio::spawn(async move { feed.forward(event_tx).await });
 
     let mut fills = paper.fill_count();

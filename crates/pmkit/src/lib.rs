@@ -18,8 +18,8 @@ pub(crate) mod live;
 mod paper;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::{sync::mpsc, task::JoinSet};
 
@@ -103,6 +103,21 @@ pub enum RunReport {
     Live(LiveReport),
 }
 
+/// Deterministic logical-time health for one merged source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedHealthSnapshot {
+    /// The merge-owned source identifier that emitted the lifecycle signals.
+    pub source: String,
+    /// Timestamp from the latest event's canonical source key.
+    pub last_event_timestamp_ms: Option<i64>,
+    /// Most recent source watermark supplied to the merge.
+    pub watermark_ms: Option<i64>,
+    /// Distance from the merge's safe watermark frontier in logical milliseconds.
+    pub logical_lag_ms: Option<i64>,
+    /// Fail-closed replay gaps observed for this source.
+    pub gap_count: usize,
+}
+
 /// Typed counters for one run, available at completion and on driver failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunMetricsSnapshot {
@@ -118,6 +133,8 @@ pub struct RunMetricsSnapshot {
     pub reconnects: usize,
     /// Strategy decision evaluations completed by the run driver.
     pub decisions: usize,
+    /// Per-source feed health derived by the deterministic merge.
+    pub feed_health: Vec<FeedHealthSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +145,7 @@ pub(crate) struct RunMetrics {
     rejected: Arc<AtomicUsize>,
     reconnects: Arc<AtomicUsize>,
     decisions: Arc<AtomicUsize>,
+    feed_health: Arc<Mutex<Vec<FeedHealthSnapshot>>>,
 }
 
 impl RunMetrics {
@@ -139,6 +157,7 @@ impl RunMetrics {
             rejected: Arc::new(AtomicUsize::new(0)),
             reconnects: Arc::new(AtomicUsize::new(0)),
             decisions: Arc::new(AtomicUsize::new(0)),
+            feed_health: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -170,6 +189,13 @@ impl RunMetrics {
         self.decisions.fetch_add(decisions, Ordering::Relaxed);
     }
 
+    pub(crate) fn set_feed_health(&self, feed_health: Vec<FeedHealthSnapshot>) {
+        match self.feed_health.lock() {
+            Ok(mut health) => *health = feed_health,
+            Err(poisoned) => *poisoned.into_inner() = feed_health,
+        }
+    }
+
     pub(crate) fn snapshot(&self) -> RunMetricsSnapshot {
         RunMetricsSnapshot {
             run: self.run.clone(),
@@ -178,6 +204,10 @@ impl RunMetrics {
             rejected: self.rejected.load(Ordering::Relaxed),
             reconnects: self.reconnects.load(Ordering::Relaxed),
             decisions: self.decisions.load(Ordering::Relaxed),
+            feed_health: match self.feed_health.lock() {
+                Ok(health) => health.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            },
         }
     }
 }

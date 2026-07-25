@@ -1,5 +1,5 @@
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -7,6 +7,8 @@ use pmkit_data::{DataSourceError, SourceSignal};
 use pmkit_event::{CanonicalSourceKey, SourceEnvelope, StrategyFact, StreamMetadata};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+
+use crate::{FeedHealthSnapshot, RunMetrics};
 
 /// The lifecycle policy applied to one deterministic source merge.
 #[derive(Debug, Clone, Copy)]
@@ -110,8 +112,10 @@ impl Ord for QueuedFact {
 
 #[derive(Debug, Default)]
 struct SourceState {
+    last_event_timestamp_ms: Option<i64>,
     watermark: Option<i64>,
     eof_seen: bool,
+    gap_count: usize,
 }
 
 enum Sources {
@@ -124,6 +128,7 @@ pub struct MergedFeed {
     mode: FeedMode,
     sources: Sources,
     replay_end_ms: Option<i64>,
+    metrics: Option<RunMetrics>,
 }
 
 impl std::fmt::Debug for MergedFeed {
@@ -148,6 +153,7 @@ impl MergedFeed {
             mode,
             sources: Sources::Fixtures(definitions),
             replay_end_ms,
+            metrics: None,
         }
     }
 
@@ -162,7 +168,15 @@ impl MergedFeed {
             mode,
             sources: Sources::Tasks(definitions),
             replay_end_ms,
+            metrics: None,
         }
+    }
+
+    /// Attaches the run-owned metrics sink used by production drivers.
+    #[must_use]
+    pub(crate) fn with_metrics(mut self, metrics: RunMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Streams causally safe facts. Source errors, early completion, and stale coverage fail closed.
@@ -171,23 +185,39 @@ impl MergedFeed {
     ///
     /// Returns [`DataSourceError::ReplayGap`] for an incomplete lifecycle and
     /// propagates source and output-channel failures.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the merge owns task lifecycle, safe release ordering, and fail-closed health"
+    )]
     pub async fn forward(self, output: mpsc::Sender<MergedFact>) -> Result<(), DataSourceError> {
+        let Self {
+            mode,
+            sources,
+            replay_end_ms,
+            metrics,
+        } = self;
         let (tx, mut rx) = mpsc::channel(128);
-        let mut tasks = JoinSet::new();
+        let mut tasks: JoinSet<(String, Result<(), DataSourceError>)> = JoinSet::new();
         let mut states = HashMap::new();
-        match self.sources {
+        match sources {
             Sources::Fixtures(definitions) => {
                 for definition in definitions {
                     states.insert(definition.name.clone(), SourceState::default());
                     let sender = tx.clone();
+                    let name = definition.name;
+                    let signals = definition.signals;
                     tasks.spawn(async move {
-                        for signal in definition.signals {
-                            sender
-                                .send((definition.name.clone(), signal))
-                                .await
-                                .map_err(|_| DataSourceError::SinkClosed)?;
+                        let result = async {
+                            for signal in signals {
+                                sender
+                                    .send((name.clone(), signal))
+                                    .await
+                                    .map_err(|_| DataSourceError::SinkClosed)?;
+                            }
+                            Ok(())
                         }
-                        Ok::<_, DataSourceError>(definition.name)
+                        .await;
+                        (name, result)
                     });
                 }
             }
@@ -195,29 +225,44 @@ impl MergedFeed {
                 for definition in definitions {
                     states.insert(definition.name.clone(), SourceState::default());
                     let sender = tx.clone();
+                    let name = definition.name;
+                    let task = definition.task;
                     tasks.spawn(async move {
-                    let (source_tx, mut source_rx) = mpsc::channel(128);
-                    let source = (definition.task)(source_tx);
-                    tokio::pin!(source);
-                    loop {
-                        tokio::select! {
-                            signal = source_rx.recv() => match signal {
-                                Some(signal) => sender.send((definition.name.clone(), signal)).await.map_err(|_| DataSourceError::SinkClosed)?,
-                                None => return source.await.map(|()| definition.name),
-                            },
-                            result = &mut source => {
-                                while let Ok(signal) = source_rx.try_recv() {
-                                    sender.send((definition.name.clone(), signal)).await.map_err(|_| DataSourceError::SinkClosed)?;
+                        let (source_tx, mut source_rx) = mpsc::channel(128);
+                        let source = task(source_tx);
+                        tokio::pin!(source);
+                        let result = loop {
+                            tokio::select! {
+                                signal = source_rx.recv() => match signal {
+                                    Some(signal) => {
+                                        if sender.send((name.clone(), signal)).await.is_err() {
+                                            break Err(DataSourceError::SinkClosed);
+                                        }
+                                    }
+                                    None => break source.await,
+                                },
+                                result = &mut source => {
+                                    let pending = async {
+                                        while let Ok(signal) = source_rx.try_recv() {
+                                            sender
+                                                .send((name.clone(), signal))
+                                                .await
+                                                .map_err(|_| DataSourceError::SinkClosed)?;
+                                        }
+                                        Ok(())
+                                    }
+                                    .await;
+                                    break pending.and(result);
                                 }
-                                return result.map(|()| definition.name);
-                            },
-                        }
-                    }
-                });
+                            }
+                        };
+                        (name, result)
+                    });
                 }
             }
         }
         drop(tx);
+        report_health(metrics.as_ref(), &states);
         let source_count = states.len();
         let mut completed = 0_usize;
         let mut queued = BinaryHeap::new();
@@ -225,34 +270,86 @@ impl MergedFeed {
             tokio::select! {
                 biased;
                 Some((source, signal)) = rx.recv(), if completed < source_count => {
-                    let state = states.get_mut(&source).ok_or_else(|| replay_gap("unknown source"))?;
-                    match signal {
+                    let Some(state) = states.get_mut(&source) else {
+                        states.insert(source, SourceState { gap_count: 1, ..SourceState::default() });
+                        report_health(metrics.as_ref(), &states);
+                        return abort(&mut tasks, replay_gap("unknown source")).await;
+                    };
+                    let gap = match signal {
                         SourceSignal::Data(envelope) => {
                             let envelope = *envelope;
                             let key = envelope.canonical_key();
-                            if state.watermark.is_some_and(|watermark| key.timestamp_ms() <= watermark) { return abort(&mut tasks, replay_gap("late record")).await; }
-                            queued.push(Reverse(QueuedFact { key, fact: merged_fact(envelope) }));
+                            if state.watermark.is_some_and(|watermark| key.timestamp_ms() <= watermark) {
+                                state.gap_count += 1;
+                                Some("late record")
+                            } else {
+                                state.last_event_timestamp_ms = Some(key.timestamp_ms());
+                                queued.push(Reverse(QueuedFact { key, fact: merged_fact(envelope) }));
+                                None
+                            }
                         }
                         SourceSignal::Watermark(watermark) => {
-                            if state.watermark.is_some_and(|previous| watermark < previous) { return abort(&mut tasks, replay_gap("watermark regressed")).await; }
-                            state.watermark = Some(watermark);
+                            if state.watermark.is_some_and(|previous| watermark < previous) {
+                                state.gap_count += 1;
+                                Some("watermark regressed")
+                            } else {
+                                state.watermark = Some(watermark);
+                                None
+                            }
                         }
-                        SourceSignal::Eof => state.eof_seen = true,
+                        SourceSignal::Eof => {
+                            state.eof_seen = true;
+                            None
+                        }
+                    };
+                    report_health(metrics.as_ref(), &states);
+                    if let Some(message) = gap {
+                        return abort(&mut tasks, replay_gap(message)).await;
                     }
                     release_safe(&mut queued, &states, &output).await?;
                 }
                 joined = tasks.join_next(), if completed < source_count => {
-                    let source = joined.ok_or_else(|| replay_gap("source task set ended early"))?.map_err(|error| replay_gap(&format!("source task failed: {error}")))??;
+                    let (source, result) = joined
+                        .ok_or_else(|| replay_gap("source task set ended early"))?
+                        .map_err(|error| replay_gap(&format!("source task failed: {error}")))?;
+                    if let Err(error) = result {
+                        record_gap(&source, &mut states, metrics.as_ref());
+                        return abort(&mut tasks, replay_gap(&format!("source task failed: {error}"))).await;
+                    }
                     let state = states.get(&source).ok_or_else(|| replay_gap("completed unknown source"))?;
-                    if !state.eof_seen { return abort(&mut tasks, replay_gap("premature EOF")).await; }
-                    if matches!(self.mode, FeedMode::Backtest) && self.replay_end_ms.is_some_and(|end| state.watermark.unwrap_or(i64::MIN) < end) { return abort(&mut tasks, replay_gap("historical coverage ends before replay end")).await; }
+                    let gap = if !state.eof_seen {
+                        Some("premature EOF")
+                    } else if matches!(mode, FeedMode::Backtest)
+                        && replay_end_ms.is_some_and(|end| state.watermark.unwrap_or(i64::MIN) < end)
+                    {
+                        Some("historical coverage ends before replay end")
+                    } else {
+                        None
+                    };
+                    if let Some(message) = gap {
+                        record_gap(&source, &mut states, metrics.as_ref());
+                        return abort(&mut tasks, replay_gap(message)).await;
+                    }
                     completed += 1;
                     release_safe(&mut queued, &states, &output).await?;
                 }
-                else => return Err(replay_gap("source channel closed before source completion")),
+                else => {
+                    for state in states.values_mut().filter(|state| !state.eof_seen) {
+                        state.gap_count += 1;
+                    }
+                    report_health(metrics.as_ref(), &states);
+                    return abort(&mut tasks, replay_gap("source channel closed before source completion")).await;
+                }
             }
         }
         if states.values().any(|state| state.watermark.is_none()) {
+            for state in states
+                .values_mut()
+                .filter(|state| state.watermark.is_none())
+            {
+                state.gap_count += 1;
+            }
+            report_health(metrics.as_ref(), &states);
             return Err(replay_gap("source did not warm up"));
         }
         Ok(())
@@ -297,11 +394,7 @@ async fn release_safe(
     states: &HashMap<String, SourceState>,
     output: &mpsc::Sender<MergedFact>,
 ) -> Result<(), DataSourceError> {
-    let watermark = states
-        .values()
-        .map(|state| state.watermark)
-        .collect::<Option<Vec<_>>>()
-        .and_then(|watermarks| watermarks.into_iter().min());
+    let watermark = merge_frontier(states);
     while watermark.is_some_and(|watermark| {
         queued
             .peek()
@@ -318,12 +411,54 @@ async fn release_safe(
 }
 
 async fn abort(
-    tasks: &mut JoinSet<Result<String, DataSourceError>>,
+    tasks: &mut JoinSet<(String, Result<(), DataSourceError>)>,
     error: DataSourceError,
 ) -> Result<(), DataSourceError> {
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     Err(error)
+}
+
+fn merge_frontier(states: &HashMap<String, SourceState>) -> Option<i64> {
+    states
+        .values()
+        .map(|state| state.watermark)
+        .collect::<Option<Vec<_>>>()
+        .and_then(|watermarks| watermarks.into_iter().min())
+}
+
+fn record_gap(
+    source: &str,
+    states: &mut HashMap<String, SourceState>,
+    metrics: Option<&RunMetrics>,
+) {
+    if let Some(state) = states.get_mut(source) {
+        state.gap_count += 1;
+    }
+    report_health(metrics, states);
+}
+
+fn report_health(metrics: Option<&RunMetrics>, states: &HashMap<String, SourceState>) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    let frontier = merge_frontier(states);
+    let mut health = BTreeMap::new();
+    for (source, state) in states {
+        health.insert(
+            source.clone(),
+            FeedHealthSnapshot {
+                source: source.clone(),
+                last_event_timestamp_ms: state.last_event_timestamp_ms,
+                watermark_ms: state.watermark,
+                logical_lag_ms: frontier.zip(state.last_event_timestamp_ms).map(
+                    |(frontier, event_timestamp_ms)| frontier.saturating_sub(event_timestamp_ms),
+                ),
+                gap_count: state.gap_count,
+            },
+        );
+    }
+    metrics.set_feed_health(health.into_values().collect());
 }
 
 fn replay_gap(message: &str) -> DataSourceError {
