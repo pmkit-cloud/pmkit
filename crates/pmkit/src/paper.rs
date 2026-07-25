@@ -33,7 +33,7 @@ async fn persist_paper_ledger(
     scope: &OwnerScope,
     paper: &PaperExecutor,
 ) -> Result<(), StoreError> {
-    for entry in paper.drain_ledger() {
+    while let Some(entry) = paper.pending_ledger_entry() {
         let ingest_sequence =
             i64::try_from(entry.sequence()).map_err(|_| StoreError::CorruptPaperLedger {
                 message: "paper ledger sequence exceeds storage range".into(),
@@ -51,6 +51,11 @@ async fn persist_paper_ledger(
                     .map_err(|error| corrupt_paper_ledger(&error))?,
             })
             .await?;
+        if !paper.acknowledge_ledger_entry(entry.event_id()) {
+            return Err(StoreError::Storage {
+                message: "paper ledger pending entry changed before acknowledgement".into(),
+            });
+        }
     }
     Ok(())
 }
@@ -474,6 +479,7 @@ mod ledger_tests {
     use super::{
         persist_paper_ledger, restore_paper_executor, restore_paper_executor_from_decisions,
     };
+    use async_trait::async_trait;
     use pmkit_book::{OrderBookL2, Side};
     use pmkit_core::{MarketId, PortfolioId, RunId};
     use pmkit_exec::{Executor, PlaceOrder};
@@ -486,8 +492,90 @@ mod ledger_tests {
     };
     use rust_decimal::Decimal;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
     use tokio::sync::mpsc;
+
+    struct FailNthDecisionStore {
+        inner: TursoTapeStore,
+        fail_at: usize,
+        attempts: AtomicUsize,
+    }
+
+    impl FailNthDecisionStore {
+        const fn new(inner: TursoTapeStore, fail_at: usize) -> Self {
+            Self {
+                inner,
+                fail_at,
+                attempts: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TapeStore for FailNthDecisionStore {
+        async fn store_envelope(
+            &self,
+            envelope: &pmkit_store::PmEnvelope,
+        ) -> Result<(), StoreError> {
+            self.inner.store_envelope(envelope).await
+        }
+
+        async fn read_envelopes(
+            &self,
+            scope: &OwnerScope,
+            after: Option<pmkit_store::ReplayCursor>,
+            limit: std::num::NonZeroUsize,
+        ) -> Result<pmkit_store::ReplayPage, StoreError> {
+            self.inner.read_envelopes(scope, after, limit).await
+        }
+
+        async fn store_decision(&self, decision: &CausalDecision) -> Result<(), StoreError> {
+            if self.attempts.fetch_add(1, Ordering::Relaxed) + 1 == self.fail_at {
+                return Err(StoreError::Storage {
+                    message: "injected decision write failure".into(),
+                });
+            }
+            self.inner.store_decision(decision).await
+        }
+
+        async fn store_intent_pending(
+            &self,
+            identity: &CausalIdentity,
+            payload: &serde_json::Value,
+        ) -> Result<(), StoreError> {
+            self.inner.store_intent_pending(identity, payload).await
+        }
+
+        async fn transition_intent(
+            &self,
+            identity: &CausalIdentity,
+            outcome: pmkit_store::IntentOutcome,
+        ) -> Result<(), StoreError> {
+            self.inner.transition_intent(identity, outcome).await
+        }
+
+        async fn read_pending_intents(
+            &self,
+            scope: &OwnerScope,
+        ) -> Result<Vec<pmkit_store::DurableIntent>, StoreError> {
+            self.inner.read_pending_intents(scope).await
+        }
+
+        async fn read_unknown_intents(
+            &self,
+            scope: &OwnerScope,
+        ) -> Result<Vec<pmkit_store::DurableIntent>, StoreError> {
+            self.inner.read_unknown_intents(scope).await
+        }
+
+        async fn read_decisions(
+            &self,
+            scope: &OwnerScope,
+        ) -> Result<Vec<CausalDecision>, StoreError> {
+            self.inner.read_decisions(scope).await
+        }
+    }
 
     fn book(timestamp_ms: i64) -> OrderBookL2 {
         OrderBookL2 {
@@ -715,6 +803,63 @@ mod ledger_tests {
         .ok_or("durable paper ledger was not found")?;
 
         // Then fills and cash effects are applied exactly once.
+        assert_eq!(restored.account_state(), expected);
+        drop(store);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paper_ledger_retry_preserves_unwritten_tail_after_storage_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Given a store that fails after durably accepting the first entry of an order batch.
+        let directory = tempdir()?;
+        let store = FailNthDecisionStore::new(
+            TursoTapeStore::open_local(directory.path().join("paper.db")).await?,
+            3,
+        );
+        let scope = OwnerScope::new(
+            PortfolioId::new("alice")?,
+            RunId::new("paper-retry-after-failure")?,
+        );
+        let (fill_tx, _fill_rx) = mpsc::channel(8);
+        let paper = PaperExecutor::with_account_fee_config(
+            fill_tx,
+            "paper",
+            SimulationConfig::default(),
+            Money::usdc(10),
+        );
+        flush(&store, &scope, &paper).await?;
+        let market = MarketId::new("btc-5m")?;
+        paper.update_book(&market, Outcome::Up, book(0)).await?;
+        paper
+            .submit(&order(market, Decimal::new(45, 2), Decimal::ONE, true), 1)
+            .await?;
+        let expected = paper.account_state();
+
+        // When the acknowledgement write fails and persistence is retried.
+        let failure = flush(&store, &scope, &paper).await;
+        assert!(matches!(failure, Err(StoreError::Storage { .. })));
+        flush(&store, &scope, &paper).await?;
+
+        // Then the durable ledger has the exact ordered tail once and restart rebuilds all state.
+        let decisions = store.read_decisions(&scope).await?;
+        assert_eq!(
+            decisions
+                .iter()
+                .map(|decision| decision.identity.correlation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["paper-ledger-0", "paper-ledger-1", "paper-ledger-2"]
+        );
+        let (restored_tx, _restored_rx) = mpsc::channel(8);
+        let restored = restore_paper_executor(
+            &store,
+            &scope,
+            restored_tx,
+            "paper",
+            SimulationConfig::default(),
+        )
+        .await?
+        .ok_or("durable paper ledger was not found")?;
         assert_eq!(restored.account_state(), expected);
         drop(store);
         Ok(())

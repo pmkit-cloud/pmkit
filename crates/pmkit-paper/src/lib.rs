@@ -276,6 +276,25 @@ impl PaperExecutor {
             .drain_pending()
     }
 
+    /// Returns the oldest ledger entry that durable storage has not acknowledged.
+    #[must_use]
+    pub fn pending_ledger_entry(&self) -> Option<PaperLedgerEntry> {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .ledger
+            .pending_entry()
+    }
+
+    /// Acknowledges the current oldest pending ledger entry after its durable commit.
+    pub fn acknowledge_ledger_entry(&self, event_id: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .ledger
+            .acknowledge_pending(event_id)
+    }
+
     /// Submits an order while retaining its strategy ownership in the ledger.
     ///
     /// # Errors

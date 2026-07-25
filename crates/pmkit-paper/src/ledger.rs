@@ -450,6 +450,22 @@ impl PaperLedger {
         std::mem::take(&mut self.pending)
     }
 
+    pub(crate) fn pending_entry(&self) -> Option<PaperLedgerEntry> {
+        self.pending.first().cloned()
+    }
+
+    pub(crate) fn acknowledge_pending(&mut self, event_id: &str) -> bool {
+        if self
+            .pending
+            .first()
+            .is_some_and(|entry| entry.event_id == event_id)
+        {
+            self.pending.remove(0);
+            return true;
+        }
+        false
+    }
+
     pub(crate) const fn fill_count(&self) -> usize {
         self.fill_count
     }
