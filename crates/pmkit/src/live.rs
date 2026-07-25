@@ -480,6 +480,36 @@ mod reservation_tests {
         assert!(open_orders.is_empty());
         Ok(())
     }
+
+    #[test]
+    fn known_order_overfill_fails_without_mutating_reservation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Given: one five-share reservation.
+        let mut reservations = HashMap::from([(
+            "order-1".to_owned(),
+            Reservation {
+                strategy: StrategyId::new("maker")?,
+                market: MarketId::new("btc-5m")?,
+                price: Decimal::new(5, 1),
+                remaining_qty: Decimal::from(5),
+            },
+        )]);
+        let mut open_orders = HashSet::from([OrderId("order-1".to_owned())]);
+
+        // When: a fill exceeds the known remaining quantity.
+        let result = apply_reservation_fill(
+            &mut reservations,
+            &mut open_orders,
+            "order-1",
+            Decimal::from(6),
+        );
+
+        // Then: the reservation is unchanged and the driver can fail closed.
+        assert!(result.is_err());
+        assert_eq!(reservations["order-1"].remaining_qty, Decimal::from(5));
+        assert!(open_orders.contains(&OrderId("order-1".to_owned())));
+        Ok(())
+    }
 }
 
 /// Places one order, routing through durable causal recording when storage is configured.
