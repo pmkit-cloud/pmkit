@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use pmkit_accounting::{AccountingError, LedgerFill, LedgerPosition, PortfolioLedger, Settlement};
 use pmkit_book::{OrderBookL2, Side};
-use pmkit_core::MarketId;
+use pmkit_core::{MarketId, StrategyId};
 use pmkit_event::MarketEvent;
 use pmkit_exec::{OrderId, PlaceOrder};
 use pmkit_market::Outcome;
@@ -62,6 +62,8 @@ pub struct PaperOpenOrder {
     pub order_id: OrderId,
     /// Exact owning market.
     pub market: MarketId,
+    /// Strategy that submitted the order when known.
+    pub strategy: Option<StrategyId>,
     /// Traded outcome token.
     pub outcome: Outcome,
     /// Buy or sell direction.
@@ -105,6 +107,7 @@ pub enum OrderState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedOrder {
     pub(crate) market: MarketId,
+    pub(crate) strategy: Option<StrategyId>,
     pub(crate) outcome: Outcome,
     pub(crate) side: Side,
     pub(crate) price: Decimal,
@@ -113,9 +116,10 @@ pub struct RecordedOrder {
 }
 
 impl RecordedOrder {
-    fn from_order(order: &PlaceOrder) -> Self {
+    fn from_order(order: &PlaceOrder, strategy: Option<StrategyId>) -> Self {
         Self {
             market: order.market.clone(),
+            strategy,
             outcome: order.outcome,
             side: order.side,
             price: order.price,
@@ -306,6 +310,7 @@ impl PaperLedger {
     pub(crate) fn begin_order(
         &mut self,
         order: &PlaceOrder,
+        strategy: Option<StrategyId>,
         timestamp_ms: i64,
     ) -> Result<(String, String), PaperLedgerError> {
         let placement_id = self.next_event_id();
@@ -313,7 +318,7 @@ impl PaperLedger {
         self.append(
             timestamp_ms,
             PaperLedgerEvent::OrderPlaced {
-                order: RecordedOrder::from_order(order),
+                order: RecordedOrder::from_order(order, strategy),
             },
         )?;
         Ok((placement_id, expected_order_id))
@@ -466,6 +471,7 @@ impl PaperLedger {
             let open = PaperOpenOrder {
                 order_id: OrderId(order_id.clone()),
                 market: tracked.order.market.clone(),
+                strategy: tracked.order.strategy.clone(),
                 outcome: tracked.order.outcome,
                 side: tracked.order.side,
                 price: tracked.order.price,

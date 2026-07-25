@@ -1,5 +1,5 @@
 use pmkit_book::Side;
-use pmkit_core::MarketId;
+use pmkit_core::{MarketId, StrategyId};
 use pmkit_market::Outcome;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,8 @@ enum WireEvent {
 #[derive(Debug, Serialize, Deserialize)]
 struct WireOrder {
     market: String,
+    #[serde(default)]
+    strategy: Option<String>,
     outcome: WireOutcome,
     side: WireSide,
     price: Decimal,
@@ -286,6 +288,7 @@ impl From<&RecordedOrder> for WireOrder {
     fn from(order: &RecordedOrder) -> Self {
         Self {
             market: order.market.to_string(),
+            strategy: order.strategy.as_ref().map(ToString::to_string),
             outcome: WireOutcome::from(order.outcome),
             side: WireSide::from(order.side),
             price: order.price,
@@ -301,6 +304,7 @@ impl TryFrom<WireOrder> for RecordedOrder {
     fn try_from(order: WireOrder) -> Result<Self, Self::Error> {
         Ok(Self {
             market: parse_market(order.market)?,
+            strategy: order.strategy.map(parse_strategy).transpose()?,
             outcome: order.outcome.into(),
             side: order.side.into(),
             price: order.price,
@@ -368,6 +372,12 @@ impl From<WireSide> for Side {
 
 fn parse_market(value: String) -> Result<MarketId, PaperLedgerError> {
     MarketId::new(value).map_err(|error| PaperLedgerError::InvalidRecord {
+        message: error.to_string(),
+    })
+}
+
+fn parse_strategy(value: String) -> Result<StrategyId, PaperLedgerError> {
+    StrategyId::new(value).map_err(|error| PaperLedgerError::InvalidRecord {
         message: error.to_string(),
     })
 }

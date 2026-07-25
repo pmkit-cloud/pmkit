@@ -402,7 +402,74 @@ enum PlaceFailure {
 struct Reservation {
     strategy: pmkit_core::StrategyId,
     market: pmkit_core::MarketId,
-    notional: rust_decimal::Decimal,
+    price: rust_decimal::Decimal,
+    remaining_qty: rust_decimal::Decimal,
+}
+
+impl Reservation {
+    fn notional(&self) -> rust_decimal::Decimal {
+        self.remaining_qty * self.price
+    }
+}
+
+fn apply_reservation_fill(
+    reservations: &mut HashMap<String, Reservation>,
+    open_orders: &mut HashSet<OrderId>,
+    order_id: &str,
+    size: rust_decimal::Decimal,
+) {
+    if let Some(reservation) = reservations.get_mut(order_id) {
+        reservation.remaining_qty -= size;
+        if reservation.remaining_qty.is_zero() {
+            reservations.remove(order_id);
+            open_orders.remove(&OrderId(order_id.to_owned()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::{Reservation, apply_reservation_fill};
+    use pmkit_core::{MarketId, StrategyId};
+    use pmkit_exec::OrderId;
+    use rust_decimal::Decimal;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn partial_fill_keeps_only_remaining_reservation() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: one ten-share live reservation at a fifty-cent limit.
+        let mut reservations = HashMap::from([(
+            "order-1".to_owned(),
+            Reservation {
+                strategy: StrategyId::new("maker")?,
+                market: MarketId::new("btc-5m")?,
+                price: Decimal::new(5, 1),
+                remaining_qty: Decimal::from(10),
+            },
+        )]);
+        let mut open_orders = HashSet::from([OrderId("order-1".to_owned())]);
+
+        // When: a partial three-share fill arrives before the terminal fill.
+        apply_reservation_fill(
+            &mut reservations,
+            &mut open_orders,
+            "order-1",
+            Decimal::from(3),
+        );
+
+        // Then: the seven unfilled shares remain reserved at their limit price.
+        assert_eq!(reservations["order-1"].notional(), Decimal::new(35, 1));
+        assert!(open_orders.contains(&OrderId("order-1".to_owned())));
+        apply_reservation_fill(
+            &mut reservations,
+            &mut open_orders,
+            "order-1",
+            Decimal::from(7),
+        );
+        assert!(reservations.is_empty());
+        assert!(open_orders.is_empty());
+        Ok(())
+    }
 }
 
 /// Places one order, routing through durable causal recording when storage is configured.
@@ -553,7 +620,7 @@ async fn drive_with_control_and_rate_limits(
             &mut tape,
             [events_processed, risk_state.fill_count(), rejected],
             &risk_state,
-            &reservations,
+            &mut reservations,
         )
         .await;
     }
@@ -569,7 +636,7 @@ async fn drive_with_control_and_rate_limits(
                 &mut tape,
                 [events_processed, risk_state.fill_count(), rejected],
                 &risk_state,
-                &reservations,
+                &mut reservations,
             )
             .await;
         }
@@ -593,8 +660,10 @@ async fn drive_with_control_and_rate_limits(
                     source: risk_storage_error(&source),
                 })?;
             match &envelope.fact {
-                PmAccountEvent::Fill { order_id, .. }
-                | PmAccountEvent::OrderCancelled { order_id, .. }
+                PmAccountEvent::Fill { order_id, size, .. } => {
+                    apply_reservation_fill(&mut reservations, &mut open_orders, order_id, *size);
+                }
+                PmAccountEvent::OrderCancelled { order_id, .. }
                 | PmAccountEvent::OrderRejected { order_id, .. } => {
                     reservations.remove(order_id);
                     open_orders.remove(&OrderId(order_id.clone()));
@@ -681,19 +750,17 @@ async fn drive_with_control_and_rate_limits(
                                     rejected += 1;
                                     continue;
                                 }
-                                let reserved_portfolio: rust_decimal::Decimal = reservations
-                                    .values()
-                                    .map(|reservation| reservation.notional)
-                                    .sum();
+                                let reserved_portfolio: rust_decimal::Decimal =
+                                    reservations.values().map(Reservation::notional).sum();
                                 let reserved_market: rust_decimal::Decimal = reservations
                                     .values()
                                     .filter(|reservation| reservation.market == *market)
-                                    .map(|reservation| reservation.notional)
+                                    .map(Reservation::notional)
                                     .sum();
                                 let reserved_strategy: rust_decimal::Decimal = reservations
                                     .values()
                                     .filter(|reservation| reservation.strategy == instance.id)
-                                    .map(|reservation| reservation.notional)
+                                    .map(Reservation::notional)
                                     .sum();
                                 let exposure =
                                     portfolio_daily_pnl.map(|daily_pnl| PortfolioRiskExposure {
@@ -752,7 +819,8 @@ async fn drive_with_control_and_rate_limits(
                                             Reservation {
                                                 strategy: instance.id.clone(),
                                                 market: market.clone(),
-                                                notional: order.qty * order.price,
+                                                price: order.price,
+                                                remaining_qty: order.qty,
                                             },
                                         );
                                         open_orders.insert(order_id);
@@ -798,8 +866,9 @@ async fn drive_with_control_and_rate_limits(
                     }
                 }
             }
-            MarketEvent::Fill { .. } if !account_ledger_authoritative => {
+            MarketEvent::Fill { order_id, size, .. } if !account_ledger_authoritative => {
                 risk_state.apply_fill(&event, &limits);
+                apply_reservation_fill(&mut reservations, &mut open_orders, order_id, *size);
             }
             _ => {}
         }
@@ -825,7 +894,7 @@ async fn drive_with_control_and_rate_limits(
         &mut tape,
         [events_processed, risk_state.fill_count(), rejected],
         &risk_state,
-        &reservations,
+        &mut reservations,
     )
     .await?;
     control.emit(RunLifecycleEvent::Completed {
@@ -841,9 +910,12 @@ async fn finish(
     tape: &mut LiveTape,
     counts: [usize; 3],
     risk_state: &LiveRiskState,
-    reservations: &HashMap<String, Reservation>,
+    reservations: &mut HashMap<String, Reservation>,
 ) -> Result<LiveReport, StartError> {
     tape.finish(run, runtime, open_orders).await?;
+    if runtime.shutdown.live_orders != LiveOrderPolicy::Leave {
+        reservations.clear();
+    }
     let exposure = aggregate_exposure(
         &risk_state.position_exposures(),
         &reservations
@@ -851,7 +923,7 @@ async fn finish(
             .map(|reservation| ExposureReservation {
                 market: reservation.market.clone(),
                 strategy: reservation.strategy.clone(),
-                notional: reservation.notional,
+                notional: reservation.notional(),
             })
             .collect::<Vec<_>>(),
     );

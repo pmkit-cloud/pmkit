@@ -9,7 +9,7 @@ use std::sync::{Mutex, PoisonError};
 
 use async_trait::async_trait;
 use pmkit_book::{OrderBookL2, Position};
-use pmkit_core::MarketId;
+use pmkit_core::{MarketId, StrategyId};
 use pmkit_event::MarketEvent;
 use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
 use pmkit_market::Outcome;
@@ -276,6 +276,67 @@ impl PaperExecutor {
             .drain_pending()
     }
 
+    /// Submits an order while retaining its strategy ownership in the ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError`] when the simulated order or ledger transition fails.
+    pub async fn submit_for_strategy(
+        &self,
+        order: &PlaceOrder,
+        strategy: StrategyId,
+        now_ms: i64,
+    ) -> Result<OrderId, ExecError> {
+        let (id, drained) = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let ExecutorState {
+                engine,
+                ledger,
+                config,
+                last_timestamp_ms,
+            } = &mut *state;
+            let (placement_id, expected_order_id) = ledger
+                .begin_order(order, Some(strategy.clone()), now_ms)
+                .map_err(|error| execution_error(&error))?;
+            let id = engine.submit_for_strategy(order, strategy, now_ms);
+            if let Some(actual) = &id {
+                let order_state = if order.post_only {
+                    OrderState::Resting
+                } else if config.activation_latency_ms > 0 {
+                    OrderState::Delayed
+                } else {
+                    OrderState::Immediate
+                };
+                ledger
+                    .acknowledge(
+                        placement_id,
+                        actual.0.clone(),
+                        order_state,
+                        now_ms.saturating_add(config.activation_latency_ms),
+                        now_ms,
+                    )
+                    .map_err(|error| execution_error(&error))?;
+            } else {
+                ledger
+                    .reject(placement_id, expected_order_id, now_ms)
+                    .map_err(|error| execution_error(&error))?;
+            }
+            let drained = engine.drain_fills();
+            for fill in &drained {
+                ledger
+                    .record_fill(fill)
+                    .map_err(|error| execution_error(&error))?;
+            }
+            *last_timestamp_ms = now_ms;
+            drop(state);
+            (id, drained)
+        };
+        self.deliver(drained).await?;
+        id.ok_or_else(|| ExecError::Rejected {
+            reason: "no fill available".to_owned(),
+        })
+    }
+
     async fn deliver(&self, fills: Vec<MarketEvent>) -> Result<(), ExecError> {
         for fill in fills {
             self.fills
@@ -309,7 +370,7 @@ impl Executor for PaperExecutor {
                 last_timestamp_ms,
             } = &mut *state;
             let (placement_id, expected_order_id) = ledger
-                .begin_order(order, now_ms)
+                .begin_order(order, None, now_ms)
                 .map_err(|error| execution_error(&error))?;
             let id = engine.submit(order, now_ms);
             if let Some(actual) = &id {
@@ -371,7 +432,12 @@ impl Executor for PaperExecutor {
     async fn cancel_all(&self) -> Result<(), ExecError> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let timestamp_ms = state.last_timestamp_ms;
-        let open = state.engine.resting_order_ids();
+        let open = state
+            .engine
+            .open_orders()
+            .into_iter()
+            .map(|order| order.order_id)
+            .collect::<Vec<_>>();
         state.engine.cancel_all();
         for order_id in open {
             state

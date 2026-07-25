@@ -2,10 +2,12 @@ use super::{
     PaperReport, RunControl, RunLifecycleEvent, StartError, instantiate_strategies, store_signal,
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
-use pmkit_accounting::{PortfolioExposure, PositionExposure, aggregate_exposure};
+use pmkit_accounting::{
+    ExposureReservation, PortfolioExposure, PositionExposure, aggregate_exposure,
+};
 use pmkit_book::OrderBookL2;
 use pmkit_event::{MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
-use pmkit_exec::{ExecError, Executor};
+use pmkit_exec::ExecError;
 use pmkit_market::Outcome;
 use pmkit_paper::{PaperExecutor, PaperLedgerEntry, PaperLedgerError};
 use pmkit_sim::SimulationConfig;
@@ -13,7 +15,7 @@ use pmkit_spec::PaperRun;
 use pmkit_store::{CausalDecision, CausalIdentity, OwnerScope, StoreError, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
 use rust_decimal::Decimal;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // allow: SIZE_OK — the scoped driver and task-specific recovery tests must remain in this file.
 
@@ -196,6 +198,7 @@ pub async fn drive_with_control(
 
     let mut events_processed = 0_usize;
     let mut fills = paper.fill_count();
+    let mut marks = HashMap::new();
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     control.emit(RunLifecycleEvent::Started {
         run: run.id().clone(),
@@ -208,7 +211,7 @@ pub async fn drive_with_control(
             run: run.id().clone(),
             events_processed,
             fills,
-            exposure: report_exposure(&paper.account_state()),
+            exposure: report_exposure(&paper.account_state(), &marks),
         });
     }
 
@@ -221,7 +224,7 @@ pub async fn drive_with_control(
                 run: run.id().clone(),
                 events_processed,
                 fills,
-                exposure: report_exposure(&paper.account_state()),
+                exposure: report_exposure(&paper.account_state(), &marks),
             });
         }
         store_signal(
@@ -291,6 +294,9 @@ pub async fn drive_with_control(
                 timestamp_ms: *timestamp_ms,
                 last_trade_price: None,
             };
+            if let Some(mark) = book.mid_price() {
+                marks.insert((market.clone(), *outcome), mark);
+            }
             let fact = StrategyFact::Market(event.clone());
             let update_result = paper.update_book(market, *outcome, book.clone()).await;
             if let Some(store) = store {
@@ -325,7 +331,9 @@ pub async fn drive_with_control(
                 if let Ok(actions) = instance.strategy.on_event(context) {
                     for action in actions.as_slice() {
                         if let Action::Place(order) = action {
-                            let submit_result = paper.submit(order, *timestamp_ms).await;
+                            let submit_result = paper
+                                .submit_for_strategy(order, instance.id.clone(), *timestamp_ms)
+                                .await;
                             if let Some(store) = store {
                                 persist_paper_ledger(store, &scope, &paper).await.map_err(
                                     |source| StartError::Storage {
@@ -400,24 +408,40 @@ pub async fn drive_with_control(
         run: run.id().clone(),
         events_processed,
         fills,
-        exposure: report_exposure(&paper.account_state()),
+        exposure: report_exposure(&paper.account_state(), &marks),
     })
 }
 
-fn report_exposure(account: &pmkit_paper::PaperAccountState) -> PortfolioExposure {
+fn report_exposure(
+    account: &pmkit_paper::PaperAccountState,
+    marks: &HashMap<(pmkit_core::MarketId, Outcome), Decimal>,
+) -> PortfolioExposure {
     let mut notionals = std::collections::HashMap::new();
     for position in &account.positions {
         let entry = notionals
             .entry(position.market.clone())
             .or_insert(Decimal::ZERO);
-        *entry += position.quantity.abs() * position.average_entry;
+        *entry += marks
+            .get(&(position.market.clone(), position.outcome))
+            .map_or(Decimal::ZERO, |mark| position.quantity.abs() * *mark);
     }
     aggregate_exposure(
         &notionals
             .into_iter()
             .map(|(market, notional)| PositionExposure { market, notional })
             .collect::<Vec<_>>(),
-        &[],
+        &account
+            .resting_orders
+            .iter()
+            .chain(&account.delayed_orders)
+            .filter_map(|order| {
+                order.strategy.clone().map(|strategy| ExposureReservation {
+                    market: order.market.clone(),
+                    strategy,
+                    notional: order.remaining_qty * order.price,
+                })
+            })
+            .collect::<Vec<_>>(),
     )
 }
 

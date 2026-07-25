@@ -3,7 +3,9 @@ use super::{
     instantiate_strategies, store_signal,
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
-use pmkit_accounting::{PortfolioExposure, PositionExposure, aggregate_exposure};
+use pmkit_accounting::{
+    ExposureReservation, PortfolioExposure, PositionExposure, aggregate_exposure,
+};
 use pmkit_book::OrderBookL2;
 use pmkit_core::MarketId;
 use pmkit_data::ReplayQuery;
@@ -94,7 +96,7 @@ pub async fn drive_with_control(
             run: run.id().clone(),
             events_processed,
             fills,
-            exposure: report_exposure(&positions_by_market, &marks),
+            exposure: report_exposure(&positions_by_market, &marks, &sim.open_orders()),
         });
     }
 
@@ -107,7 +109,7 @@ pub async fn drive_with_control(
                 run: run.id().clone(),
                 events_processed,
                 fills,
-                exposure: report_exposure(&positions_by_market, &marks),
+                exposure: report_exposure(&positions_by_market, &marks, &sim.open_orders()),
             });
         }
         store_signal(
@@ -203,7 +205,7 @@ pub async fn drive_with_control(
         run: run.id().clone(),
         events_processed,
         fills,
-        exposure: report_exposure(&positions_by_market, &marks),
+        exposure: report_exposure(&positions_by_market, &marks, &sim.open_orders()),
     })
 }
 
@@ -231,6 +233,7 @@ fn absorb_market_fills(
 fn report_exposure(
     positions_by_market: &HashMap<MarketId, Vec<pmkit_book::Position>>,
     marks: &HashMap<(MarketId, Outcome), Decimal>,
+    open_orders: &[pmkit_sim::SimOpenOrder],
 ) -> PortfolioExposure {
     let mut position_notionals = Vec::new();
     for (market, positions) in positions_by_market {
@@ -247,7 +250,17 @@ fn report_exposure(
             notional,
         });
     }
-    aggregate_exposure(&position_notionals, &[])
+    let reservations = open_orders
+        .iter()
+        .filter_map(|order| {
+            order.strategy.clone().map(|strategy| ExposureReservation {
+                market: order.market.clone(),
+                strategy,
+                notional: order.remaining_qty * order.price,
+            })
+        })
+        .collect::<Vec<_>>();
+    aggregate_exposure(&position_notionals, &reservations)
 }
 
 struct RunStrategiesInputs<'a> {
@@ -287,7 +300,9 @@ fn run_strategies(inputs: &mut RunStrategiesInputs<'_>) -> (usize, u32) {
         if let Ok(actions) = instance.strategy.on_event(context) {
             for action in actions.as_slice() {
                 if let Action::Place(order) = action {
-                    inputs.sim.submit(order, inputs.timestamp_ms);
+                    inputs
+                        .sim
+                        .submit_for_strategy(order, instance.id.clone(), inputs.timestamp_ms);
                     actions_placed = actions_placed.saturating_add(1);
                 }
             }

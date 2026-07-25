@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pmkit_book::{OrderBookL2, Side};
-use pmkit_core::MarketId;
+use pmkit_core::{MarketId, StrategyId};
 use pmkit_event::{Liquidity, MarketEvent};
 use pmkit_exec::{OrderId, PlaceOrder};
 use pmkit_market::Outcome;
@@ -31,6 +31,7 @@ struct RestingOrder {
     order: PlaceOrder,
     submitted_ms: i64,
     active_at_ms: i64,
+    strategy: Option<StrategyId>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +40,22 @@ struct DelayedOrder {
     order: PlaceOrder,
     submitted_ms: i64,
     active_at_ms: i64,
+    strategy: Option<StrategyId>,
+}
+
+/// Current simulator-owned order state used by read-only report projections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimOpenOrder {
+    /// Stable simulated order identity.
+    pub order_id: OrderId,
+    /// Exact owning market.
+    pub market: MarketId,
+    /// Strategy that submitted the order when known.
+    pub strategy: Option<StrategyId>,
+    /// Limit price.
+    pub price: Decimal,
+    /// Quantity not yet filled.
+    pub remaining_qty: Decimal,
 }
 
 /// Explicit inputs for conservative simulation behavior.
@@ -128,15 +145,35 @@ impl SimEngine {
     /// Submits an order. Post-only orders rest; others take liquidity. Returns
     /// the minted order id, or `None` when there is no book or no fill.
     pub fn submit(&mut self, order: &PlaceOrder, now_ms: i64) -> Option<OrderId> {
+        self.submit_with_strategy(order, None, now_ms)
+    }
+
+    /// Submits an order while retaining its strategy ownership for reporting.
+    pub fn submit_for_strategy(
+        &mut self,
+        order: &PlaceOrder,
+        strategy: StrategyId,
+        now_ms: i64,
+    ) -> Option<OrderId> {
+        self.submit_with_strategy(order, Some(strategy), now_ms)
+    }
+
+    fn submit_with_strategy(
+        &mut self,
+        order: &PlaceOrder,
+        strategy: Option<StrategyId>,
+        now_ms: i64,
+    ) -> Option<OrderId> {
         let order_id = self.next_order_id();
         if order.post_only {
-            self.submit_maker(order_id, order, now_ms)
+            self.submit_maker(order_id, order, strategy, now_ms)
         } else if self.config.activation_latency_ms > 0 {
             self.delayed.push(DelayedOrder {
                 order_id: order_id.clone(),
                 order: order.clone(),
                 submitted_ms: now_ms,
                 active_at_ms: now_ms.saturating_add(self.config.activation_latency_ms),
+                strategy,
             });
             Some(OrderId(order_id))
         } else {
@@ -149,13 +186,52 @@ impl SimEngine {
         self.resting
             .remove(&order_id.0)
             .map(|r| r.order.qty * r.order.price)
+            .or_else(|| {
+                self.delayed
+                    .iter()
+                    .position(|order| order.order_id == order_id.0)
+                    .map(|index| {
+                        let order = self.delayed.remove(index);
+                        order.order.qty * order.order.price
+                    })
+            })
     }
 
     /// Cancels every resting order, returning the total notional freed.
     pub fn cancel_all(&mut self) -> Decimal {
-        let freed = self.resting_committed();
+        let freed = self
+            .open_orders()
+            .iter()
+            .map(|order| order.remaining_qty * order.price)
+            .sum();
         self.resting.clear();
+        self.delayed.clear();
         freed
+    }
+
+    /// Returns all delayed and resting orders in deterministic id order.
+    #[must_use]
+    pub fn open_orders(&self) -> Vec<SimOpenOrder> {
+        let mut orders = self
+            .resting
+            .values()
+            .map(|order| SimOpenOrder {
+                order_id: OrderId(order.order_id.clone()),
+                market: order.order.market.clone(),
+                strategy: order.strategy.clone(),
+                price: order.order.price,
+                remaining_qty: order.order.qty,
+            })
+            .chain(self.delayed.iter().map(|order| SimOpenOrder {
+                order_id: OrderId(order.order_id.clone()),
+                market: order.order.market.clone(),
+                strategy: order.strategy.clone(),
+                price: order.order.price,
+                remaining_qty: order.order.qty,
+            }))
+            .collect::<Vec<_>>();
+        orders.sort_by(|left, right| left.order_id.0.cmp(&right.order_id.0));
+        orders
     }
 
     /// Returns the total resting maker notional.
@@ -190,6 +266,7 @@ impl SimEngine {
         &mut self,
         order_id: String,
         order: &PlaceOrder,
+        strategy: Option<StrategyId>,
         now_ms: i64,
     ) -> Option<OrderId> {
         let would_cross = {
@@ -209,6 +286,7 @@ impl SimEngine {
                 order: order.clone(),
                 submitted_ms: now_ms,
                 active_at_ms: now_ms.saturating_add(self.config.activation_latency_ms),
+                strategy,
             },
         );
         Some(OrderId(order_id))
