@@ -634,6 +634,7 @@ async fn drive_with_control_and_rate_limits(
                 run: run.id().clone(),
                 source,
             })?;
+        metrics.set_fills(risk_state.fill_count());
         let submissions = accepted_submissions(store, &scope, run.strategies())
             .await
             .map_err(|source| StartError::Storage {
@@ -791,6 +792,7 @@ async fn drive_with_control_and_rate_limits(
                         positions: market_positions,
                         now: LogicalTimestamp::from_millis(*timestamp_ms),
                     };
+                    metrics.decision();
                     if let Ok(actions) = instance.strategy.on_event(context) {
                         for (action_index, action) in actions.as_slice().iter().enumerate() {
                             if let Action::Place(order) = action {
@@ -881,7 +883,7 @@ async fn drive_with_control_and_rate_limits(
                                         );
                                         open_orders.insert(order_id);
                                     }
-                                    Ok(None) => {}
+                                    Ok(None) => metrics.reject(),
                                     Err(failure) => {
                                         reconcile_open_orders(run, runtime).await?;
                                         tape.flush(run)?;
@@ -920,7 +922,6 @@ async fn drive_with_control_and_rate_limits(
                                 source,
                             })?;
                     }
-                    metrics.decision();
                 }
             }
             MarketEvent::Fill { order_id, size, .. }

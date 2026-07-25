@@ -154,6 +154,7 @@ pub async fn drive_with_control(
             run.initial_cash(),
         )
     };
+    metrics.set_fills(paper.fill_count());
     if let Some(store) = store {
         persist_paper_ledger(store, &scope, &paper)
             .await
@@ -311,6 +312,7 @@ pub async fn drive_with_control(
             }
             let fact = StrategyFact::Market(event.clone());
             let update_result = paper.update_book(market, *outcome, book.clone()).await;
+            metrics.set_fills(paper.fill_count());
             if let Some(store) = store {
                 persist_paper_ledger(store, &scope, &paper)
                     .await
@@ -341,12 +343,17 @@ pub async fn drive_with_control(
                     positions: &positions,
                     now: LogicalTimestamp::from_millis(*timestamp_ms),
                 };
+                metrics.decision();
                 if let Ok(actions) = instance.strategy.on_event(context) {
                     for action in actions.as_slice() {
                         if let Action::Place(order) = action {
                             let submit_result = paper
                                 .submit_for_strategy(order, instance.id.clone(), *timestamp_ms)
                                 .await;
+                            metrics.set_fills(paper.fill_count());
+                            if matches!(&submit_result, Err(ExecError::Rejected { .. })) {
+                                metrics.reject();
+                            }
                             if let Some(store) = store {
                                 persist_paper_ledger(store, &scope, &paper).await.map_err(
                                     |source| StartError::Storage {
@@ -361,7 +368,7 @@ pub async fn drive_with_control(
                                 Ok(_) => {
                                     actions_placed = actions_placed.saturating_add(1);
                                 }
-                                Err(ExecError::Rejected { .. }) => metrics.reject(),
+                                Err(ExecError::Rejected { .. }) => {}
                                 Err(source) => {
                                     return Err(StartError::ExecutionState {
                                         run: run.id().clone(),
@@ -376,7 +383,6 @@ pub async fn drive_with_control(
                 fills = paper.fill_count();
                 metrics.set_fills(fills);
             }
-            metrics.decision();
             if let Some(store) = store {
                 let identity = CausalIdentity {
                     scope: scope.clone(),

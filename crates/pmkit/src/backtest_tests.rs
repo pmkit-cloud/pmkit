@@ -359,7 +359,7 @@ async fn metrics_observable_on_failure() -> Result<(), Box<dyn std::error::Error
 
 #[test]
 fn reconnects_follow_connection_epoch() {
-    let source = |connection_epoch| {
+    let source = |outcome, connection_epoch| {
         SourceEnvelope::PmMarket(PmMarketEnvelope {
             metadata: StreamMetadata {
                 schema_version: 1,
@@ -373,14 +373,48 @@ fn reconnects_follow_connection_epoch() {
                 ingest_sequence: 1,
             },
             raw_frame: Vec::new(),
-            fact: MarketEvent::Tick { timestamp_ms: 1 },
+            fact: MarketEvent::BookUpdate {
+                market: MarketId::new("btc-5m").unwrap_or_else(|_| unreachable!()),
+                outcome,
+                bids: Vec::new(),
+                asks: Vec::new(),
+                timestamp_ms: 1,
+            },
         })
     };
     let mut epochs = HashMap::new();
 
-    assert!(!crate::observe_reconnect(&source(0), &mut epochs));
-    assert!(crate::observe_reconnect(&source(1), &mut epochs));
-    assert!(!crate::observe_reconnect(&source(1), &mut epochs));
+    assert!(!crate::observe_reconnect(
+        &source(Outcome::Up, 0),
+        &mut epochs
+    ));
+    assert!(!crate::observe_reconnect(
+        &source(Outcome::Down, 1),
+        &mut epochs
+    ));
+    assert!(crate::observe_reconnect(
+        &source(Outcome::Up, 1),
+        &mut epochs
+    ));
+    assert!(!crate::observe_reconnect(
+        &source(Outcome::Up, 1),
+        &mut epochs
+    ));
+}
+
+#[tokio::test]
+async fn metrics_count_each_strategy_evaluation() -> Result<(), Box<dyn std::error::Error>> {
+    let mut run = backtest_run()?;
+    run = run.strategy(StrategyRegistration::new(
+        StrategyId::new("second-buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(BuyFactory),
+    ));
+    let app = Pmkit::builder(config()?).run(run).start().await?;
+    let metrics = app.metrics(&RunId::new("bt")?).ok_or("missing metrics")?;
+
+    assert_eq!(metrics.decisions, 4);
+    Ok(())
 }
 
 #[tokio::test]

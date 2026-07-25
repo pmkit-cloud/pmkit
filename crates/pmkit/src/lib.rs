@@ -26,7 +26,7 @@ use tokio::{sync::mpsc, task::JoinSet};
 use pmkit_accounting::PortfolioExposure;
 use pmkit_core::{MarketId, RunId, StrategyId};
 use pmkit_data::SourceSignal;
-use pmkit_event::SourceEnvelope;
+use pmkit_event::{CanonicalSourceKey, SourceEnvelope};
 use pmkit_exec::ExecError;
 use pmkit_manifest::build_manifest;
 use pmkit_run::LiveConsent;
@@ -164,6 +164,10 @@ impl RunMetrics {
 
     pub(crate) fn decision(&self) {
         self.decisions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_decisions(&self, decisions: usize) {
+        self.decisions.fetch_add(decisions, Ordering::Relaxed);
     }
 
     pub(crate) fn snapshot(&self) -> RunMetricsSnapshot {
@@ -618,14 +622,17 @@ pub(crate) fn observe_reconnect(
     source: &SourceEnvelope,
     connection_epochs: &mut HashMap<String, i64>,
 ) -> bool {
-    let metadata = match source {
-        SourceEnvelope::PmMarket(envelope) => &envelope.metadata,
-        SourceEnvelope::PmAccount(envelope) => &envelope.metadata,
-        SourceEnvelope::CexReference(_) => return false,
+    let CanonicalSourceKey::Pm {
+        stream_id,
+        connection_epoch,
+        ..
+    } = source.canonical_key()
+    else {
+        return false;
     };
     connection_epochs
-        .insert(metadata.source_id.clone(), metadata.connection_epoch)
-        .is_some_and(|previous| metadata.connection_epoch > previous)
+        .insert(stream_id, connection_epoch)
+        .is_some_and(|previous| connection_epoch > previous)
 }
 
 async fn store_signal(

@@ -160,7 +160,7 @@ pub async fn drive_with_control(
             sim.update_book(market, *outcome, book.clone());
             let drained = sim.drain_fills();
             metrics.add_fills(absorb_market_fills(&drained, &mut positions_by_market));
-            let (added, actions_placed) = run_strategies(&mut RunStrategiesInputs {
+            let (added, actions_placed, decisions) = run_strategies(&mut RunStrategiesInputs {
                 strategies: &mut strategies,
                 market,
                 outcome: *outcome,
@@ -170,7 +170,7 @@ pub async fn drive_with_control(
                 sim: &mut sim,
             });
             metrics.add_fills(added);
-            metrics.decision();
+            metrics.add_decisions(decisions);
             if let Some(store) = store {
                 let identity = CausalIdentity {
                     scope: scope.clone(),
@@ -285,9 +285,10 @@ struct RunStrategiesInputs<'a> {
     sim: &'a mut SimEngine,
 }
 
-fn run_strategies(inputs: &mut RunStrategiesInputs<'_>) -> (usize, u32) {
+fn run_strategies(inputs: &mut RunStrategiesInputs<'_>) -> (usize, u32, usize) {
     let mut fills = 0;
     let mut actions_placed = 0_u32;
+    let mut decisions = 0;
     for instance in inputs.strategies.iter_mut() {
         if instance.market != *inputs.market {
             continue;
@@ -309,6 +310,7 @@ fn run_strategies(inputs: &mut RunStrategiesInputs<'_>) -> (usize, u32) {
             positions,
             now: LogicalTimestamp::from_millis(inputs.timestamp_ms),
         };
+        decisions += 1;
         if let Ok(actions) = instance.strategy.on_event(context) {
             for action in actions.as_slice() {
                 if let Action::Place(order) = action {
@@ -322,7 +324,7 @@ fn run_strategies(inputs: &mut RunStrategiesInputs<'_>) -> (usize, u32) {
         let drained = inputs.sim.drain_fills();
         fills += absorb_market_fills(&drained, inputs.positions_by_market);
     }
-    (fills, actions_placed)
+    (fills, actions_placed, decisions)
 }
 
 #[cfg(test)]
