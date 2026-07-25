@@ -25,7 +25,7 @@ use tokio::{sync::mpsc, task::JoinSet};
 
 use pmkit_core::{MarketId, RunId, StrategyId};
 use pmkit_data::SourceSignal;
-use pmkit_event::{MarketEvent, SourceEnvelope};
+use pmkit_event::SourceEnvelope;
 use pmkit_exec::ExecError;
 use pmkit_manifest::build_manifest;
 use pmkit_run::LiveConsent;
@@ -515,22 +515,6 @@ async fn store_signal(
         SourceSignal::Watermark(_) | SourceSignal::Eof => return Ok(()),
     };
     store.store_envelope(&envelope).await
-}
-
-fn absorb_fills(fills: &[MarketEvent], positions: &mut Vec<pmkit_book::Position>) -> usize {
-    for event in fills {
-        if let MarketEvent::Fill {
-            outcome,
-            side,
-            price,
-            size,
-            ..
-        } = event
-        {
-            pmkit_book::book::apply_fill(positions, *outcome, *side, *price, *size);
-        }
-    }
-    fills.len()
 }
 
 fn instantiate_strategies(

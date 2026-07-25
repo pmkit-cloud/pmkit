@@ -1,15 +1,17 @@
 use super::{
-    BacktestReport, RunControl, RunLifecycleEvent, StartError, StrategyInstance, absorb_fills,
+    BacktestReport, RunControl, RunLifecycleEvent, StartError, StrategyInstance,
     instantiate_strategies, store_signal,
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_book::OrderBookL2;
+use pmkit_core::MarketId;
 use pmkit_data::ReplayQuery;
 use pmkit_event::{MarketEvent, SourceEnvelope, StrategyFact};
 use pmkit_sim::{SimEngine, SimulationConfig};
 use pmkit_spec::BacktestRun;
 use pmkit_store::{CausalIdentity, OwnerScope, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
+use std::collections::HashMap;
 
 #[expect(
     clippy::too_many_lines,
@@ -72,7 +74,7 @@ pub async fn drive_with_control(
         fee_model: Some(simulation.resolved_fee_model()),
     };
     let mut sim = SimEngine::with_fee_config("bt", 0, simulation_config);
-    let mut positions = Vec::new();
+    let mut positions_by_market: HashMap<MarketId, Vec<pmkit_book::Position>> = HashMap::new();
     let mut events_processed = 0_usize;
     let mut fills = 0_usize;
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
@@ -136,16 +138,17 @@ pub async fn drive_with_control(
                 last_trade_price: None,
             };
             sim.update_book(market, *outcome, book.clone());
-            fills += absorb_fills(&sim.drain_fills(), &mut positions);
-            let (added, actions_placed) = run_strategies(
-                &mut strategies,
+            let drained = sim.drain_fills();
+            fills += absorb_market_fills(&drained, &mut positions_by_market);
+            let (added, actions_placed) = run_strategies(&mut RunStrategiesInputs {
+                strategies: &mut strategies,
                 market,
-                *outcome,
-                &book,
-                &mut positions,
-                *timestamp_ms,
-                &mut sim,
-            );
+                outcome: *outcome,
+                book: &book,
+                positions_by_market: &mut positions_by_market,
+                timestamp_ms: *timestamp_ms,
+                sim: &mut sim,
+            });
             fills += added;
             if let Some(store) = store {
                 let identity = CausalIdentity {
@@ -194,43 +197,71 @@ pub async fn drive_with_control(
     })
 }
 
-fn run_strategies(
-    strategies: &mut [StrategyInstance],
-    market: &pmkit_core::MarketId,
+fn absorb_market_fills(
+    fills: &[MarketEvent],
+    positions_by_market: &mut HashMap<MarketId, Vec<pmkit_book::Position>>,
+) -> usize {
+    for event in fills {
+        if let MarketEvent::Fill {
+            market,
+            outcome,
+            side,
+            price,
+            size,
+            ..
+        } = event
+        {
+            let positions = positions_by_market.entry(market.clone()).or_default();
+            pmkit_book::book::apply_fill(positions, *outcome, *side, *price, *size);
+        }
+    }
+    fills.len()
+}
+
+struct RunStrategiesInputs<'a> {
+    strategies: &'a mut [StrategyInstance],
+    market: &'a pmkit_core::MarketId,
     outcome: pmkit_market::Outcome,
-    book: &OrderBookL2,
-    positions: &mut Vec<pmkit_book::Position>,
+    book: &'a OrderBookL2,
+    positions_by_market: &'a mut HashMap<MarketId, Vec<pmkit_book::Position>>,
     timestamp_ms: i64,
-    sim: &mut SimEngine,
-) -> (usize, u32) {
+    sim: &'a mut SimEngine,
+}
+
+fn run_strategies(inputs: &mut RunStrategiesInputs<'_>) -> (usize, u32) {
     let mut fills = 0;
     let mut actions_placed = 0_u32;
-    for instance in &mut *strategies {
-        if instance.market != *market {
+    for instance in inputs.strategies.iter_mut() {
+        if instance.market != *inputs.market {
             continue;
         }
+        let positions = inputs
+            .positions_by_market
+            .get(inputs.market)
+            .map_or(&[] as &[pmkit_book::Position], Vec::as_slice);
         let context = StrategyContext {
             fact: &StrategyFact::Market(MarketEvent::BookUpdate {
-                market: market.clone(),
-                outcome,
-                bids: book.bids.clone(),
-                asks: book.asks.clone(),
-                timestamp_ms,
+                market: inputs.market.clone(),
+                outcome: inputs.outcome,
+                bids: inputs.book.bids.clone(),
+                asks: inputs.book.asks.clone(),
+                timestamp_ms: inputs.timestamp_ms,
             }),
-            market,
-            book,
-            positions: positions.as_slice(),
-            now: LogicalTimestamp::from_millis(timestamp_ms),
+            market: inputs.market,
+            book: inputs.book,
+            positions,
+            now: LogicalTimestamp::from_millis(inputs.timestamp_ms),
         };
         if let Ok(actions) = instance.strategy.on_event(context) {
             for action in actions.as_slice() {
                 if let Action::Place(order) = action {
-                    sim.submit(order, timestamp_ms);
+                    inputs.sim.submit(order, inputs.timestamp_ms);
                     actions_placed = actions_placed.saturating_add(1);
                 }
             }
         }
-        fills += absorb_fills(&sim.drain_fills(), positions);
+        let drained = inputs.sim.drain_fills();
+        fills += absorb_market_fills(&drained, inputs.positions_by_market);
     }
     (fills, actions_placed)
 }

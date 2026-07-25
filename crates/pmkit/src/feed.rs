@@ -91,7 +91,7 @@ struct QueuedFact {
 
 impl PartialEq for QueuedFact {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
+        self.cmp(other) == Ordering::Equal
     }
 }
 impl Eq for QueuedFact {}
@@ -102,7 +102,9 @@ impl PartialOrd for QueuedFact {
 }
 impl Ord for QueuedFact {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.key.cmp(&other.key)
+        self.key
+            .cmp(&other.key)
+            .then_with(|| compare_pm_envelopes(&self.fact.source, &other.fact.source))
     }
 }
 
@@ -327,5 +329,225 @@ async fn abort(
 fn replay_gap(message: &str) -> DataSourceError {
     DataSourceError::ReplayGap {
         message: message.to_owned(),
+    }
+}
+
+fn compare_pm_envelopes(left: &SourceEnvelope, right: &SourceEnvelope) -> Ordering {
+    match (left, right) {
+        (SourceEnvelope::PmMarket(left), SourceEnvelope::PmMarket(right)) => left
+            .fact
+            .timestamp_ms()
+            .cmp(&right.fact.timestamp_ms())
+            .then_with(|| {
+                market_event_market_key(&left.fact).cmp(&market_event_market_key(&right.fact))
+            })
+            .then_with(|| {
+                outcome_rank(market_event_outcome(&left.fact))
+                    .cmp(&outcome_rank(market_event_outcome(&right.fact)))
+            })
+            .then_with(|| {
+                market_event_kind_rank(&left.fact).cmp(&market_event_kind_rank(&right.fact))
+            })
+            .then_with(|| {
+                market_event_detail_key(&left.fact).cmp(&market_event_detail_key(&right.fact))
+            }),
+        (SourceEnvelope::PmAccount(left), SourceEnvelope::PmAccount(right)) => left
+            .portfolio
+            .to_string()
+            .cmp(&right.portfolio.to_string())
+            .then_with(|| {
+                account_event_kind_rank(&left.fact).cmp(&account_event_kind_rank(&right.fact))
+            })
+            .then_with(|| {
+                account_event_detail_key(&left.fact).cmp(&account_event_detail_key(&right.fact))
+            }),
+        (SourceEnvelope::CexReference(_), SourceEnvelope::CexReference(_)) => Ordering::Equal,
+        (
+            SourceEnvelope::PmMarket(_),
+            SourceEnvelope::PmAccount(_) | SourceEnvelope::CexReference(_),
+        )
+        | (SourceEnvelope::PmAccount(_), SourceEnvelope::CexReference(_)) => Ordering::Less,
+        (
+            SourceEnvelope::PmAccount(_) | SourceEnvelope::CexReference(_),
+            SourceEnvelope::PmMarket(_),
+        )
+        | (SourceEnvelope::CexReference(_), SourceEnvelope::PmAccount(_)) => Ordering::Greater,
+    }
+}
+
+fn market_event_market_key(event: &pmkit_event::MarketEvent) -> String {
+    match event {
+        pmkit_event::MarketEvent::BookUpdate { market, .. }
+        | pmkit_event::MarketEvent::BestBidAsk { market, .. }
+        | pmkit_event::MarketEvent::LastTrade { market, .. }
+        | pmkit_event::MarketEvent::Fill { market, .. } => market.to_string(),
+        pmkit_event::MarketEvent::OrderAck { .. } | pmkit_event::MarketEvent::Tick { .. } => {
+            String::new()
+        }
+    }
+}
+
+const fn market_event_outcome(event: &pmkit_event::MarketEvent) -> pmkit_market::Outcome {
+    match event {
+        pmkit_event::MarketEvent::BookUpdate { outcome, .. }
+        | pmkit_event::MarketEvent::BestBidAsk { outcome, .. }
+        | pmkit_event::MarketEvent::LastTrade { outcome, .. }
+        | pmkit_event::MarketEvent::Fill { outcome, .. } => *outcome,
+        pmkit_event::MarketEvent::OrderAck { .. } | pmkit_event::MarketEvent::Tick { .. } => {
+            pmkit_market::Outcome::Up
+        }
+    }
+}
+
+const fn outcome_rank(outcome: pmkit_market::Outcome) -> u8 {
+    match outcome {
+        pmkit_market::Outcome::Up => 0,
+        pmkit_market::Outcome::Down => 1,
+    }
+}
+
+const fn market_event_kind_rank(event: &pmkit_event::MarketEvent) -> u8 {
+    match event {
+        pmkit_event::MarketEvent::BookUpdate { .. } => 0,
+        pmkit_event::MarketEvent::BestBidAsk { .. } => 1,
+        pmkit_event::MarketEvent::LastTrade { .. } => 2,
+        pmkit_event::MarketEvent::Fill { .. } => 3,
+        pmkit_event::MarketEvent::OrderAck { .. } => 4,
+        pmkit_event::MarketEvent::Tick { .. } => 5,
+    }
+}
+
+fn market_event_detail_key(event: &pmkit_event::MarketEvent) -> String {
+    match event {
+        pmkit_event::MarketEvent::BookUpdate { .. } => "book".to_owned(),
+        pmkit_event::MarketEvent::BestBidAsk { bid, ask, .. } => format!("{bid}:{ask}"),
+        pmkit_event::MarketEvent::LastTrade {
+            price, side, size, ..
+        } => format!("{price}:{side:?}:{size}"),
+        pmkit_event::MarketEvent::Fill {
+            order_id,
+            price,
+            size,
+            side,
+            fee,
+            ..
+        } => format!("{order_id}:{price}:{size}:{side:?}:{fee}"),
+        pmkit_event::MarketEvent::OrderAck { order_id, .. } => order_id.clone(),
+        pmkit_event::MarketEvent::Tick { .. } => "tick".to_owned(),
+    }
+}
+
+const fn account_event_kind_rank(event: &pmkit_event::PmAccountEvent) -> u8 {
+    match event {
+        pmkit_event::PmAccountEvent::Fill { .. } => 0,
+        pmkit_event::PmAccountEvent::OrderAck { .. } => 1,
+        pmkit_event::PmAccountEvent::OrderCancelled { .. } => 2,
+        pmkit_event::PmAccountEvent::OrderRejected { .. } => 3,
+        pmkit_event::PmAccountEvent::OrderStatus { .. } => 4,
+        pmkit_event::PmAccountEvent::Settlement { .. } => 5,
+    }
+}
+
+fn account_event_detail_key(event: &pmkit_event::PmAccountEvent) -> String {
+    match event {
+        pmkit_event::PmAccountEvent::Fill {
+            order_id,
+            market,
+            outcome,
+            price,
+            size,
+            side,
+            fee,
+            timestamp_ms,
+            ..
+        } => {
+            format!("{order_id}:{market}:{outcome:?}:{price}:{size}:{side:?}:{fee}:{timestamp_ms}")
+        }
+        pmkit_event::PmAccountEvent::OrderAck {
+            order_id,
+            timestamp_ms,
+            ..
+        }
+        | pmkit_event::PmAccountEvent::OrderCancelled {
+            order_id,
+            timestamp_ms,
+            ..
+        } => format!("{order_id}:{timestamp_ms}"),
+        pmkit_event::PmAccountEvent::OrderRejected {
+            order_id,
+            reason,
+            timestamp_ms,
+            ..
+        } => format!("{order_id}:{reason}:{timestamp_ms}"),
+        pmkit_event::PmAccountEvent::OrderStatus {
+            order_id,
+            status,
+            timestamp_ms,
+            ..
+        } => format!("{order_id}:{status}:{timestamp_ms}"),
+        pmkit_event::PmAccountEvent::Settlement {
+            market,
+            outcome,
+            settled_size,
+            proceeds,
+            timestamp_ms,
+        } => format!("{market}:{outcome:?}:{settled_size}:{proceeds}:{timestamp_ms}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{QueuedFact, merged_fact};
+    use pmkit_core::MarketId;
+    use pmkit_event::{MarketEvent, PmMarketEnvelope, SourceEnvelope, StreamMetadata};
+    use pmkit_market::Outcome;
+    use rust_decimal::Decimal;
+    use std::cmp::Ordering;
+
+    fn metadata() -> StreamMetadata {
+        StreamMetadata {
+            schema_version: 1,
+            source_id: "pm".into(),
+            source_time_ms: 10,
+            canonical_source_rank: 1,
+            receipt_time_ms: 10,
+            connection_id: "shared".into(),
+            connection_epoch: 7,
+            frame_sequence: 11,
+            ingest_sequence: 99,
+        }
+    }
+
+    fn queued(market: &str) -> Result<QueuedFact, Box<dyn std::error::Error>> {
+        let envelope = SourceEnvelope::PmMarket(PmMarketEnvelope {
+            metadata: metadata(),
+            raw_frame: Vec::new(),
+            fact: MarketEvent::BookUpdate {
+                market: MarketId::new(market)?,
+                outcome: Outcome::Up,
+                bids: vec![(Decimal::new(49, 2), Decimal::ONE)],
+                asks: vec![(Decimal::new(51, 2), Decimal::ONE)],
+                timestamp_ms: 10,
+            },
+        });
+        Ok(QueuedFact {
+            key: envelope.canonical_key(),
+            fact: merged_fact(envelope),
+        })
+    }
+
+    #[test]
+    fn cross_market_key_collision_regression() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: two PM envelopes with identical durable replay metadata but different markets.
+        let left = queued("btc-5m")?;
+        let right = queued("eth-5m")?;
+
+        // When: the merge queue compares them for release ordering.
+        let ordering = left.cmp(&right);
+
+        // Then: the in-process merge must not treat them as the same sortable item.
+        assert_ne!(ordering, Ordering::Equal);
+        assert_ne!(left, right);
+        Ok(())
     }
 }

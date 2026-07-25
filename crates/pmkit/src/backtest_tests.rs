@@ -14,8 +14,11 @@ use pmkit_run::{EvidenceRequirement, RetrievalWait};
 use pmkit_runtime::StrategyRegistration;
 use pmkit_spec::{BacktestRun, ConservativeV1Config, ReplaySpec};
 use pmkit_store::{OwnerScope, TapeStore, TursoTapeStore};
+use pmkit_strategy::{
+    Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
+};
 use rust_decimal::Decimal;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
@@ -24,6 +27,51 @@ struct ScriptedHistory {
 }
 
 struct ScriptedReference;
+
+struct TwoMarketHistory;
+
+struct Taker;
+
+struct TakerFactory;
+
+struct PositionProbe(Arc<Mutex<Vec<usize>>>);
+
+struct PositionProbeFactory(Arc<Mutex<Vec<usize>>>);
+
+impl Strategy for Taker {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        let Some((price, _)) = context.book.best_ask() else {
+            return Ok(Actions::none());
+        };
+        Ok(Actions::place(pmkit_exec::PlaceOrder {
+            market: context.market.clone(),
+            outcome: Outcome::Up,
+            side: pmkit_book::Side::Buy,
+            price,
+            qty: Decimal::ONE,
+            post_only: false,
+        }))
+    }
+}
+
+impl StrategyFactory for TakerFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(Taker))
+    }
+}
+
+impl Strategy for PositionProbe {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        self.0.lock().unwrap().push(context.positions.len());
+        Ok(Actions::none())
+    }
+}
+
+impl StrategyFactory for PositionProbeFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(PositionProbe(Arc::clone(&self.0))))
+    }
+}
 
 #[async_trait]
 impl HistoricalDataSource for ScriptedReference {
@@ -58,6 +106,35 @@ impl HistoricalDataSource for ScriptedReference {
         ))))
         .await
         .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+#[async_trait]
+impl HistoricalDataSource for TwoMarketHistory {
+    async fn replay(
+        &self,
+        _query: ReplayQuery,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        let first = MarketId::new("first-5m").map_err(|_| DataSourceError::NotAvailable)?;
+        let second = MarketId::new("second-5m").map_err(|_| DataSourceError::NotAvailable)?;
+        for (market, timestamp_ms) in [(first.clone(), 1), (first, 2), (second, 3)] {
+            sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
+                market,
+                outcome: Outcome::Up,
+                bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+                asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
+                timestamp_ms,
+            }))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        }
         sink.send(SourceSignal::Watermark(i64::MAX))
             .await
             .map_err(|_| DataSourceError::SinkClosed)?;
@@ -152,6 +229,50 @@ async fn backtest_drives_replay_through_strategy_to_fill() -> Result<(), Box<dyn
     let manifest = app.manifest(&RunId::new("bt")?).ok_or("missing manifest")?;
     assert_eq!(manifest["mode"], "backtest");
     assert_eq!(manifest["run"], "bt");
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_market_positions_isolated() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: a first market that fills before a second market's strategy runs.
+    let observed_positions = Arc::new(Mutex::new(Vec::new()));
+    let replay = ReplaySpec::new(
+        Arc::new(TwoMarketHistory),
+        "2026-01-01T00:00:00Z".parse()?,
+        "2026-02-01T00:00:00Z".parse()?,
+        EvidenceRequirement::CorroboratedOnly,
+        RetrievalWait::ReturnPending,
+    );
+    let run = BacktestRun::new(
+        RunId::new("two-market")?,
+        PortfolioId::new("research")?,
+        replay,
+        Money::usdc(1_000),
+        risk()?,
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("first-taker")?,
+        MarketId::new("first-5m")?,
+        Arc::new(TakerFactory),
+    ))
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("second-probe")?,
+        MarketId::new("second-5m")?,
+        Arc::new(PositionProbeFactory(Arc::clone(&observed_positions))),
+    ));
+
+    // When: the backtest drives both markets through their registered strategies.
+    Pmkit::builder(config()?).run(run).start().await?;
+
+    // Then: the second market's strategy cannot observe the first market's fill.
+    assert_eq!(*observed_positions.lock().unwrap(), [0]);
     Ok(())
 }
 
