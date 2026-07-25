@@ -20,6 +20,8 @@ struct ScriptedLive;
 
 struct StaleMarkLive;
 
+struct FailingLive;
+
 #[async_trait]
 impl LiveDataSource for ScriptedLive {
     async fn subscribe(
@@ -87,6 +89,18 @@ impl LiveDataSource for StaleMarkLive {
     }
 }
 
+#[async_trait]
+impl LiveDataSource for FailingLive {
+    async fn subscribe(
+        &self,
+        _market: MarketId,
+        _outcome: Outcome,
+        _sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        Err(DataSourceError::NotAvailable)
+    }
+}
+
 #[tokio::test]
 async fn paper_run_drives_live_feed_to_fill() -> Result<(), Box<dyn std::error::Error>> {
     let run = PaperRun::new(
@@ -120,6 +134,76 @@ async fn paper_run_drives_live_feed_to_fill() -> Result<(), Box<dyn std::error::
         "the taker buy should fill against the ask"
     );
     assert!(paper.exposure.portfolio_notional > Decimal::ZERO);
+    Ok(())
+}
+
+#[tokio::test]
+async fn paper_failure_retains_restored_fill_diagnostics() -> Result<(), Box<dyn std::error::Error>>
+{
+    // Given: a durable paper run with an authoritative fill.
+    let directory = tempfile::tempdir()?;
+    let store: Arc<dyn TapeStore> =
+        Arc::new(TursoTapeStore::open_local(directory.path().join("paper.db")).await?);
+    let run_id = RunId::new("paper-failure-diagnostics")?;
+    let initial_run = PaperRun::new(
+        run_id.clone(),
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        risk()?,
+        Arc::new(ScriptedLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(BuyFactory),
+    ));
+    Pmkit::builder(config()?)
+        .storage(Arc::clone(&store))
+        .run(initial_run)
+        .start()
+        .await?;
+
+    let failing_run = PaperRun::new(
+        run_id.clone(),
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        risk()?,
+        Arc::new(FailingLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(BuyFactory),
+    ));
+
+    // When: the restored paper run fails through the public start boundary.
+    let error = Pmkit::builder(config()?)
+        .storage(store)
+        .run(failing_run)
+        .start()
+        .await
+        .err()
+        .ok_or("failing paper feed unexpectedly completed")?;
+
+    // Then: its typed diagnostics retain the restored authoritative fill count.
+    let diagnostics = error.diagnostics().ok_or("missing diagnostics")?;
+    println!("paper failure diagnostics: {diagnostics:?}");
+    assert_eq!(diagnostics.run, run_id);
+    assert!(diagnostics.fills > 0, "diagnostics: {diagnostics:?}");
     Ok(())
 }
 

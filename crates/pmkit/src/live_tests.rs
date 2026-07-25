@@ -26,6 +26,11 @@ mod live_tape_tests;
 
 struct RecordingExec;
 
+#[derive(Default)]
+struct RejectedExec {
+    submissions: AtomicUsize,
+}
+
 #[async_trait]
 impl Executor for RecordingExec {
     async fn preflight(&self) -> Result<ExecutionSnapshot, ExecError> {
@@ -38,6 +43,32 @@ impl Executor for RecordingExec {
 
     async fn submit(&self, _order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
         Ok(OrderId("live-1".to_owned()))
+    }
+
+    async fn cancel(&self, _order_id: &OrderId) -> Result<(), ExecError> {
+        Ok(())
+    }
+
+    async fn cancel_all(&self) -> Result<(), ExecError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Executor for RejectedExec {
+    async fn preflight(&self) -> Result<ExecutionSnapshot, ExecError> {
+        Ok(ExecutionSnapshot::default())
+    }
+
+    async fn reconcile(&self) -> Result<ExecutionSnapshot, ExecError> {
+        Ok(ExecutionSnapshot::default())
+    }
+
+    async fn submit(&self, _order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
+        self.submissions.fetch_add(1, Ordering::Relaxed);
+        Err(ExecError::Rejected {
+            reason: "venue rejected order".to_owned(),
+        })
     }
 
     async fn cancel(&self, _order_id: &OrderId) -> Result<(), ExecError> {
@@ -356,6 +387,33 @@ async fn live_run_preflights_and_rejects_at_open_order_limit()
     assert_eq!(executor.snapshots.load(Ordering::Relaxed), 3);
     assert_eq!(executor.submits.load(Ordering::Relaxed), 0);
     assert_eq!(report.rejected, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_run_counts_one_venue_rejection_once() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: one strategy action whose venue rejects its order.
+    let executor = Arc::new(RejectedExec::default());
+    let run = LiveRun::new(
+        RunId::new("live-venue-rejection")?,
+        PortfolioId::new("alice")?,
+        executor.clone(),
+        Arc::new(LiveWithBook),
+        risk()?,
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(BuyFactory),
+    ));
+
+    // When: the live driver reaches the executor boundary.
+    let report = live::drive(&run, &config()?).await?;
+
+    // Then: one venue rejection is reflected exactly once in public metrics.
+    assert_eq!(executor.submissions.load(Ordering::Relaxed), 1);
+    assert_eq!(report.rejected, 1);
+    assert_eq!(report.metrics.rejected, 1);
     Ok(())
 }
 
