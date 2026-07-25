@@ -108,7 +108,7 @@ pub(super) enum RiskStateError {
 }
 
 impl RiskStateError {
-    fn corrupt(message: impl Into<String>) -> Self {
+    pub(super) fn corrupt(message: impl Into<String>) -> Self {
         Self::CorruptRecord {
             message: message.into(),
         }
@@ -306,7 +306,7 @@ impl LiveRiskState {
         self.refresh_marks(limits)
     }
 
-    pub(super) fn apply_fill(&mut self, event: &MarketEvent, limits: &RiskLimits) {
+    pub(super) fn apply_fill(&mut self, event: &MarketEvent, limits: &RiskLimits) -> bool {
         let MarketEvent::Fill {
             order_id,
             market,
@@ -319,7 +319,7 @@ impl LiveRiskState {
             ..
         } = event
         else {
-            return;
+            return false;
         };
         if !self.applied_fills.insert((
             order_id.clone(),
@@ -330,7 +330,7 @@ impl LiveRiskState {
             *size,
             *timestamp_ms,
         )) {
-            return;
+            return false;
         }
         let positions = self.positions_by_market.entry(market.clone()).or_default();
         if let Some(position) = positions
@@ -354,6 +354,7 @@ impl LiveRiskState {
         self.fees += *fee;
         self.fill_count += 1;
         self.refresh_marks(limits);
+        true
     }
 
     pub(super) fn apply_durable_account_record(
@@ -447,14 +448,14 @@ impl LiveRiskState {
                 )));
             }
         };
-        self.apply_account_event(&event, limits)
+        self.apply_account_event(&event, limits).map(|_| ())
     }
 
     pub(super) fn apply_account_event(
         &mut self,
         event: &PmAccountEvent,
         limits: &RiskLimits,
-    ) -> Result<(), RiskStateError> {
+    ) -> Result<bool, RiskStateError> {
         match event {
             PmAccountEvent::Fill {
                 strategy,
@@ -467,44 +468,43 @@ impl LiveRiskState {
                 fee,
                 liquidity,
                 timestamp_ms,
-            } => {
-                self.apply_fill(
-                    &MarketEvent::Fill {
-                        strategy: strategy.clone(),
-                        order_id: order_id.clone(),
-                        market: market.clone(),
-                        outcome: *outcome,
-                        price: *price,
-                        size: *size,
-                        side: *side,
-                        fee: *fee,
-                        liquidity: *liquidity,
-                        timestamp_ms: *timestamp_ms,
-                    },
-                    limits,
-                );
-                Ok(())
-            }
+            } => Ok(self.apply_fill(
+                &MarketEvent::Fill {
+                    strategy: strategy.clone(),
+                    order_id: order_id.clone(),
+                    market: market.clone(),
+                    outcome: *outcome,
+                    price: *price,
+                    size: *size,
+                    side: *side,
+                    fee: *fee,
+                    liquidity: *liquidity,
+                    timestamp_ms: *timestamp_ms,
+                },
+                limits,
+            )),
             PmAccountEvent::Settlement {
                 market,
                 outcome,
                 settled_size,
                 proceeds,
                 timestamp_ms,
-            } => self.apply_settlement(
-                (
-                    market.clone(),
-                    *outcome,
-                    *settled_size,
-                    *proceeds,
-                    *timestamp_ms,
-                ),
-                limits,
-            ),
+            } => self
+                .apply_settlement(
+                    (
+                        market.clone(),
+                        *outcome,
+                        *settled_size,
+                        *proceeds,
+                        *timestamp_ms,
+                    ),
+                    limits,
+                )
+                .map(|()| false),
             PmAccountEvent::OrderAck { .. }
             | PmAccountEvent::OrderCancelled { .. }
             | PmAccountEvent::OrderRejected { .. }
-            | PmAccountEvent::OrderStatus { .. } => Ok(()),
+            | PmAccountEvent::OrderStatus { .. } => Ok(false),
         }
     }
 

@@ -147,6 +147,8 @@ pub async fn drive_with_control(
             };
             if let Some(mark) = book.mid_price() {
                 marks.insert((market.clone(), *outcome), mark);
+            } else {
+                marks.remove(&(market.clone(), *outcome));
             }
             sim.update_book(market, *outcome, book.clone());
             let drained = sim.drain_fills();

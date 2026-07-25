@@ -351,9 +351,15 @@ async fn reconstruct_risk_state(
         let next_cursor = page.next_cursor;
         for item in page.items {
             match item {
-                ReplayItem::Envelope(envelope) => state
-                    .apply_durable_account_record(&envelope.normalized, &scope.portfolio_id, limits)
-                    .map_err(|source| risk_storage_error(&source))?,
+                ReplayItem::Envelope(envelope) => {
+                    state
+                        .apply_durable_account_record(
+                            &envelope.normalized,
+                            &scope.portfolio_id,
+                            limits,
+                        )
+                        .map_err(|source| risk_storage_error(&source))?;
+                }
                 ReplayItem::Gap(gap) => {
                     return Err(StoreError::Storage {
                         message: format!(
@@ -417,14 +423,18 @@ fn apply_reservation_fill(
     open_orders: &mut HashSet<OrderId>,
     order_id: &str,
     size: rust_decimal::Decimal,
-) {
+) -> Result<(), RiskStateError> {
     if let Some(reservation) = reservations.get_mut(order_id) {
+        if size > reservation.remaining_qty {
+            return Err(RiskStateError::corrupt("fill exceeds known reservation"));
+        }
         reservation.remaining_qty -= size;
         if reservation.remaining_qty.is_zero() {
             reservations.remove(order_id);
             open_orders.remove(&OrderId(order_id.to_owned()));
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -455,7 +465,7 @@ mod reservation_tests {
             &mut open_orders,
             "order-1",
             Decimal::from(3),
-        );
+        )?;
 
         // Then: the seven unfilled shares remain reserved at their limit price.
         assert_eq!(reservations["order-1"].notional(), Decimal::new(35, 1));
@@ -465,7 +475,7 @@ mod reservation_tests {
             &mut open_orders,
             "order-1",
             Decimal::from(7),
-        );
+        )?;
         assert!(reservations.is_empty());
         assert!(open_orders.is_empty());
         Ok(())
@@ -653,7 +663,7 @@ async fn drive_with_control_and_rate_limits(
         }
         if let SourceEnvelope::PmAccount(envelope) = &merged.source {
             tape.append_account(run, envelope)?;
-            risk_state
+            let fill_was_applied = risk_state
                 .apply_account_event(&envelope.fact, &limits)
                 .map_err(|source| StartError::Storage {
                     run: run.id().clone(),
@@ -661,7 +671,18 @@ async fn drive_with_control_and_rate_limits(
                 })?;
             match &envelope.fact {
                 PmAccountEvent::Fill { order_id, size, .. } => {
-                    apply_reservation_fill(&mut reservations, &mut open_orders, order_id, *size);
+                    if fill_was_applied {
+                        apply_reservation_fill(
+                            &mut reservations,
+                            &mut open_orders,
+                            order_id,
+                            *size,
+                        )
+                        .map_err(|source| StartError::Storage {
+                            run: run.id().clone(),
+                            source: risk_storage_error(&source),
+                        })?;
+                    }
                 }
                 PmAccountEvent::OrderCancelled { order_id, .. }
                 | PmAccountEvent::OrderRejected { order_id, .. } => {
@@ -866,9 +887,14 @@ async fn drive_with_control_and_rate_limits(
                     }
                 }
             }
-            MarketEvent::Fill { order_id, size, .. } if !account_ledger_authoritative => {
-                risk_state.apply_fill(&event, &limits);
-                apply_reservation_fill(&mut reservations, &mut open_orders, order_id, *size);
+            MarketEvent::Fill { order_id, size, .. }
+                if !account_ledger_authoritative && risk_state.apply_fill(&event, &limits) =>
+            {
+                apply_reservation_fill(&mut reservations, &mut open_orders, order_id, *size)
+                    .map_err(|source| StartError::Storage {
+                        run: run.id().clone(),
+                        source: risk_storage_error(&source),
+                    })?;
             }
             _ => {}
         }
