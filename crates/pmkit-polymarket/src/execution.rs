@@ -8,6 +8,7 @@ use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
 use polymarket_client_sdk_v2::clob::types::response::OpenOrderResponse;
 use polymarket_client_sdk_v2::clob::types::{OrderStatusType, OrderType};
 use polymarket_client_sdk_v2::error::{Error as SdkError, Kind, Status, StatusCode};
+use rust_decimal::Decimal;
 
 use crate::{MarketTokens, venue_order_inputs};
 
@@ -17,6 +18,7 @@ pub struct PolymarketExecutor<S> {
     client: Client<Authenticated<Normal>>,
     signer: S,
     tokens: MarketTokens,
+    min_order_size: Option<Decimal>,
 }
 
 impl<S> PolymarketExecutor<S> {
@@ -31,7 +33,22 @@ impl<S> PolymarketExecutor<S> {
             client,
             signer,
             tokens,
+            min_order_size: None,
         }
+    }
+
+    /// Sets the venue minimum order size, below which submissions are
+    /// rejected locally with a typed error instead of a venue 400.
+    ///
+    /// Polymarket publishes this as `orderMinSize` on market metadata (Gamma
+    /// and CLOB), and the unit is **shares**, not a dollar notional: reading
+    /// 5 shares as $5 and dividing by a $0.45 price turns the minimum into
+    /// 12 shares, silently starving any strategy whose size cap sits between
+    /// the two.
+    #[must_use]
+    pub const fn with_min_order_size(mut self, min_order_size: Decimal) -> Self {
+        self.min_order_size = Some(min_order_size);
+        self
     }
 
     async fn snapshot(&self) -> Result<ExecutionSnapshot, ExecError>
@@ -82,6 +99,7 @@ where
     }
 
     async fn submit(&self, order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
+        ensure_min_order_size(order, self.min_order_size)?;
         let inputs =
             venue_order_inputs(order, &self.tokens).ok_or_else(|| ExecError::Rejected {
                 reason: format!(
@@ -146,6 +164,23 @@ where
                 reason: format!("Polymarket did not cancel: {:?}", response.not_canceled),
             })
         }
+    }
+}
+
+/// Rejects a sub-minimum order locally with a typed error carrying the
+/// shares semantics, instead of letting the venue answer with an opaque 400.
+fn ensure_min_order_size(
+    order: &PlaceOrder,
+    min_order_size: Option<Decimal>,
+) -> Result<(), ExecError> {
+    match min_order_size {
+        Some(min_order_size) if order.qty < min_order_size => Err(ExecError::Rejected {
+            reason: format!(
+                "order size {} is below the venue minimum of {min_order_size} shares",
+                order.qty
+            ),
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -223,8 +258,11 @@ mod tests {
     use polymarket_client_sdk_v2::types::U256;
     use rust_decimal::Decimal;
 
-    use super::{PolymarketExecutor, exec_error};
+    use super::{PolymarketExecutor, ensure_min_order_size, exec_error};
     use crate::MarketTokens;
+    use pmkit_book::Side;
+    use pmkit_exec::PlaceOrder;
+    use pmkit_market::Outcome;
 
     const PRIVATE_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
@@ -383,5 +421,39 @@ mod tests {
         assert!(matches!(rejected, ExecError::Rejected { .. }));
         assert!(matches!(server, ExecError::Transport { .. }));
         assert!(matches!(timeout, ExecError::Transport { .. }));
+    }
+
+    fn sized_order(qty: Decimal) -> Result<PlaceOrder, Box<dyn std::error::Error>> {
+        Ok(PlaceOrder {
+            market: MarketId::new("fixture")?,
+            outcome: Outcome::Up,
+            side: Side::Buy,
+            price: Decimal::new(50, 2),
+            qty,
+            post_only: false,
+        })
+    }
+
+    #[test]
+    fn sub_minimum_order_rejected_locally_with_shares_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let order = sized_order(Decimal::from(3))?;
+        let Err(ExecError::Rejected { reason }) =
+            ensure_min_order_size(&order, Some(Decimal::from(5)))
+        else {
+            return Err("expected a typed rejection".into());
+        };
+        assert!(reason.contains("below the venue minimum of 5 shares"));
+        Ok(())
+    }
+
+    #[test]
+    fn at_minimum_or_unset_minimum_passes() -> Result<(), Box<dyn std::error::Error>> {
+        let at_minimum = sized_order(Decimal::from(5))?;
+        assert!(ensure_min_order_size(&at_minimum, Some(Decimal::from(5))).is_ok());
+
+        let tiny = sized_order(Decimal::ONE)?;
+        assert!(ensure_min_order_size(&tiny, None).is_ok());
+        Ok(())
     }
 }

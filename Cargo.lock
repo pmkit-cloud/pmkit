@@ -3853,6 +3853,7 @@ dependencies = [
  "pmkit-runtime",
  "pmkit-sim",
  "pmkit-strategy",
+ "rust_decimal",
  "tokio",
 ]
 

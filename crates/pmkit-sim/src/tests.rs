@@ -245,3 +245,36 @@ fn default_fee_unchanged() -> Result<(), Box<dyn std::error::Error>> {
     ));
     Ok(())
 }
+
+#[test]
+fn sub_minimum_order_never_reaches_the_book() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = SimEngine::with_config(
+        "paper",
+        0,
+        MarketCategory::Crypto,
+        SimulationConfig {
+            min_order_size: Some(Decimal::from(5)),
+            ..SimulationConfig::default()
+        },
+    );
+    let market = MarketId::new("btc-5m")?;
+    engine.update_book(&market, Outcome::Up, ask_book());
+
+    // A four-share taker at a crossing price is refused like the venue would.
+    let mut small = order(Side::Buy, Decimal::new(50, 2), false)?;
+    small.qty = Decimal::from(4);
+    assert!(engine.submit(&small, 0).is_none());
+    assert!(engine.drain_fills().is_empty());
+
+    // A four-share maker never rests either.
+    let mut resting = order(Side::Buy, Decimal::new(45, 2), true)?;
+    resting.qty = Decimal::from(4);
+    assert!(engine.submit(&resting, 0).is_none());
+    assert_eq!(engine.resting_count(), 0);
+
+    // At the minimum the order trades normally.
+    let mut at_min = order(Side::Buy, Decimal::new(50, 2), false)?;
+    at_min.qty = Decimal::from(5);
+    assert!(engine.submit(&at_min, 0).is_some());
+    Ok(())
+}

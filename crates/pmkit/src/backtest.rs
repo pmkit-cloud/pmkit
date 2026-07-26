@@ -79,6 +79,7 @@ pub async fn drive_with_control(
         slippage_bps: simulation.slippage_bps,
         market_impact_bps: simulation.market_impact_bps,
         fee_model: Some(simulation.resolved_fee_model()),
+        min_order_size: simulation.min_order_size,
     };
     let mut sim = SimEngine::with_fee_config("bt", 0, simulation_config);
     let mut positions_by_market: HashMap<MarketId, Vec<pmkit_book::Position>> = HashMap::new();
@@ -401,6 +402,7 @@ mod tests {
                 slippage_bps: 0,
                 market_impact_bps: 0,
                 fee_model: None,
+                min_order_size: None,
             },
         ))
     }
