@@ -3,7 +3,7 @@
 ## Durable version boundary
 
 `pm_envelopes.schema_version` is the version of the normalized envelope and its
-serialized metadata. The current version is `5`, defined by
+serialized metadata. The current version is `6`, defined by
 `pmkit-store::schema::PM_ENVELOPE_VERSION`.
 
 Version `4` adds a stable stream identity that includes the envelope kind and,
@@ -19,6 +19,14 @@ fill economics or timestamps. New normalized account payloads are version `3`
 and require the tagged identity. Migrated version-1 and version-2 payloads keep
 their immutable normalized JSON and derive the same transport identity during
 replay from the durable envelope columns.
+
+Version `6` adds the same typed identity boundary to normalized account
+settlements. Settlement identity is either venue-assigned or the persisted
+transport coordinates (`source_id`, `connection_id`, `connection_epoch`, and
+`frame_sequence`); settlement economics and timestamps are never identity.
+New normalized account payloads are version `4` and require the tagged
+settlement identity. Migrated version-1 through version-3 payloads retain their
+immutable normalized JSON and derive transport identity during replay.
 
 Readers must reject unsupported versions with a typed replay/integrity error;
 they must not silently deserialize an unknown shape or substitute defaults.
@@ -92,13 +100,20 @@ settlements, and version-3 fills carrying venue identity. During replay, only
 legacy normalized account versions may derive transport identity when the field
 is absent; missing identity in a version-3 fill fails closed.
 
+Database migration version `9` advances version-5 PM envelopes to version `6`.
+Raw frames, normalized JSON, and both integrity hashes remain byte-for-byte
+unchanged. Checked-in account fixtures cover legacy identity-free settlements
+and the version-4 payload carrying stable settlement identity. Missing identity
+in a version-4 settlement fails closed; older payloads use only durable
+transport coordinates as their migration fallback.
+
 Opening fails with a typed `StoreError` when the newest on-disk version exceeds
 the binary's maximum supported version. PMKit never auto-downgrades a database.
 
 Rollback is operational: stop the process and restore the prior database file
 from backup, then run the prior binary. In-process migrations are forward-only;
-there is no reverse-migration or automatic downgrade path. A pre-v8 binary
-rejects a v8 database as too new, so rollback requires the pre-v8 backup.
+there is no reverse-migration or automatic downgrade path. A pre-v9 binary
+rejects a v9 database as too new, so rollback requires the pre-v9 backup.
 
 ## Change policy
 

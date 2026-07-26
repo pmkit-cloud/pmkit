@@ -4,14 +4,15 @@ use crate::{
 };
 use async_trait::async_trait;
 use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
-use pmkit_data::{DataSourceError, LiveDataSource, SourceSignal};
-use pmkit_event::MarketEvent;
+use pmkit_data::{DataSourceError, LiveAccountDataSource, LiveDataSource, SourceSignal};
+use pmkit_event::{MarketEvent, PmAccountEnvelope, PmAccountEvent, SourceEnvelope, StreamMetadata};
 use pmkit_market::Outcome;
 use pmkit_money::Money;
 use pmkit_runtime::StrategyRegistration;
 use pmkit_spec::{ConservativeV1Config, PaperRun};
 use pmkit_store::{OwnerScope, TapeStore, TursoTapeStore};
 use rust_decimal::Decimal;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
@@ -21,6 +22,52 @@ struct ScriptedLive;
 struct StaleMarkLive;
 
 struct FailingLive;
+
+struct MismatchedAccountSource;
+
+#[async_trait]
+impl LiveAccountDataSource for MismatchedAccountSource {
+    async fn subscribe_account(
+        &self,
+        _portfolio: PortfolioId,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        sink.send(SourceSignal::Data(Box::new(SourceEnvelope::PmAccount(
+            PmAccountEnvelope {
+                portfolio: PortfolioId::new("mallory").map_err(|error| {
+                    DataSourceError::ReplayGap {
+                        message: error.to_string(),
+                    }
+                })?,
+                metadata: StreamMetadata {
+                    schema_version: 4,
+                    source_id: "mismatched-account".into(),
+                    source_time_ms: 1,
+                    canonical_source_rank: 0,
+                    receipt_time_ms: 1,
+                    connection_id: "mismatched-account".into(),
+                    connection_epoch: 0,
+                    frame_sequence: 1,
+                    ingest_sequence: 1,
+                },
+                raw_frame: Vec::new(),
+                fact: PmAccountEvent::OrderAck {
+                    strategy: None,
+                    order_id: "foreign-order".into(),
+                    timestamp_ms: 1,
+                },
+            },
+        ))))
+        .await
+        .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
 
 #[async_trait]
 impl LiveDataSource for ScriptedLive {
@@ -134,6 +181,46 @@ async fn paper_run_drives_live_feed_to_fill() -> Result<(), Box<dyn std::error::
         "the taker buy should fill against the ask"
     );
     assert!(paper.exposure.portfolio_notional > Decimal::ZERO);
+    Ok(())
+}
+
+#[tokio::test]
+async fn paper_run_rejects_mismatched_account_owner() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: a store-backed paper run receives another portfolio's account envelope.
+    let directory = tempfile::tempdir()?;
+    let store =
+        Arc::new(TursoTapeStore::open_local(directory.path().join("owner-check.db")).await?);
+    let run = PaperRun::new(
+        RunId::new("paper-owner-check")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        risk()?,
+        Arc::new(ScriptedLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+        },
+    )
+    .account_data(Arc::new(MismatchedAccountSource));
+    let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
+
+    // When: the public paper boundary starts the run.
+    let result = Pmkit::builder(config()?)
+        .storage(store.clone())
+        .run(run)
+        .start()
+        .await;
+    let page = store
+        .read_envelopes(&scope, None, NonZeroUsize::MIN)
+        .await?;
+
+    // Then: owner mismatch aborts before durable or ledger mutation.
+    assert!(result.is_err());
+    assert!(page.items.is_empty());
+    drop(store);
     Ok(())
 }
 

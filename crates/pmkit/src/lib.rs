@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use tokio::{sync::mpsc, task::JoinSet};
 
 use pmkit_accounting::PortfolioExposure;
-use pmkit_core::{MarketId, RunId, StrategyId};
+use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
 use pmkit_data::SourceSignal;
 use pmkit_event::{CanonicalSourceKey, SourceEnvelope};
 use pmkit_exec::ExecError;
@@ -731,6 +731,28 @@ async fn store_signal(
         SourceSignal::Watermark(_) | SourceSignal::Eof => return Ok(()),
     };
     store.store_envelope(&envelope).await
+}
+
+fn validate_account_owner(
+    run: &RunId,
+    portfolio: &PortfolioId,
+    source: &SourceEnvelope,
+) -> Result<(), StartError> {
+    let SourceEnvelope::PmAccount(envelope) = source else {
+        return Ok(());
+    };
+    if envelope.portfolio == *portfolio {
+        return Ok(());
+    }
+    Err(StartError::Source {
+        run: run.clone(),
+        source: pmkit_data::DataSourceError::ReplayGap {
+            message: format!(
+                "account event owner {} does not match run {portfolio}",
+                envelope.portfolio
+            ),
+        },
+    })
 }
 
 fn instantiate_strategies(

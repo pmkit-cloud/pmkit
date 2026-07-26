@@ -93,7 +93,7 @@ impl LiveAccountDataSource for PolymarketUserData {
                 PmAccountEnvelope {
                     portfolio: self.portfolio.clone(),
                     metadata: StreamMetadata {
-                        schema_version: 3,
+                        schema_version: 4,
                         source_id: SOURCE_ID.into(),
                         source_time_ms: timestamp_ms,
                         canonical_source_rank: 0,

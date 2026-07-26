@@ -53,7 +53,7 @@ impl LiveTape {
             source: std::io::Error::other("live tape frame sequence exceeds signed range"),
         })?;
         let metadata = StreamMetadata {
-            schema_version: 3,
+            schema_version: 4,
             source_id: "pmkit-live".into(),
             source_time_ms: timestamp_ms,
             canonical_source_rank: 0,

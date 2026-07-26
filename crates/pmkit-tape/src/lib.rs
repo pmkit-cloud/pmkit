@@ -9,7 +9,7 @@ use std::io::{self, Write};
 use pmkit_book::Side;
 use pmkit_event::{
     CexReferenceEnvelope, CexReferenceEvent, FillIdentity, Liquidity, MarketEvent,
-    PmAccountEnvelope, PmAccountEvent, PmMarketEnvelope, StreamMetadata,
+    PmAccountEnvelope, PmAccountEvent, PmMarketEnvelope, SettlementIdentity, StreamMetadata,
 };
 use serde_json::json;
 
@@ -88,6 +88,27 @@ fn fill_identity_json(identity: &FillIdentity) -> serde_json::Value {
             "id": id,
         }),
         FillIdentity::Transport {
+            source_id,
+            connection_id,
+            connection_epoch,
+            frame_sequence,
+        } => json!({
+            "source": "transport",
+            "source_id": source_id,
+            "connection_id": connection_id,
+            "connection_epoch": connection_epoch,
+            "frame_sequence": frame_sequence,
+        }),
+    }
+}
+
+fn settlement_identity_json(identity: &SettlementIdentity) -> serde_json::Value {
+    match identity {
+        SettlementIdentity::Venue(id) => json!({
+            "source": "venue",
+            "id": id,
+        }),
+        SettlementIdentity::Transport {
             source_id,
             connection_id,
             connection_epoch,
@@ -281,6 +302,7 @@ pub fn account_envelope_json(envelope: &PmAccountEnvelope) -> serde_json::Value 
             "status": status,
         }),
         PmAccountEvent::Settlement {
+            identity,
             market,
             outcome,
             settled_size,
@@ -289,6 +311,7 @@ pub fn account_envelope_json(envelope: &PmAccountEnvelope) -> serde_json::Value 
         } => json!({
             "kind": "settlement",
             "ts": timestamp_ms,
+            "identity": settlement_identity_json(identity),
             "market": market.to_string(),
             "outcome": outcome.to_string(),
             "settled_size": settled_size.to_string(),
@@ -343,9 +366,11 @@ fn envelope_json(metadata: &StreamMetadata, payload: &serde_json::Value) -> serd
 
 #[cfg(test)]
 mod tests {
-    use super::{JsonLinesTape, UserTapeSink};
-    use pmkit_core::PortfolioId;
-    use pmkit_event::{PmAccountEnvelope, PmAccountEvent, StreamMetadata};
+    use super::{JsonLinesTape, UserTapeSink, account_envelope_json};
+    use pmkit_core::{MarketId, PortfolioId};
+    use pmkit_event::{PmAccountEnvelope, PmAccountEvent, SettlementIdentity, StreamMetadata};
+    use pmkit_market::Outcome;
+    use rust_decimal::Decimal;
 
     #[test]
     fn writes_one_json_line_per_account_envelope() -> Result<(), Box<dyn std::error::Error>> {
@@ -381,6 +406,53 @@ mod tests {
         assert!(lines[0].contains("\"connection_epoch\":3"));
         assert!(lines[0].contains("\"frame_sequence\":4"));
         assert!(lines[0].contains("\"ingest_sequence\":3"));
+        Ok(())
+    }
+
+    #[test]
+    fn settlement_transport_identity_survives_json_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Given: a settlement identified by exact transport coordinates.
+        let envelope = PmAccountEnvelope {
+            portfolio: PortfolioId::new("paper")?,
+            metadata: StreamMetadata {
+                schema_version: 4,
+                source_id: "polymarket:user-ws".into(),
+                source_time_ms: 1,
+                canonical_source_rank: 0,
+                receipt_time_ms: 2,
+                connection_id: "account-1".into(),
+                connection_epoch: 3,
+                frame_sequence: 4,
+                ingest_sequence: 5,
+            },
+            raw_frame: Vec::new(),
+            fact: PmAccountEvent::Settlement {
+                identity: SettlementIdentity::Transport {
+                    source_id: "polymarket:user-ws".into(),
+                    connection_id: "account-1".into(),
+                    connection_epoch: 3,
+                    frame_sequence: 4,
+                },
+                market: MarketId::new("btc-5m")?,
+                outcome: Outcome::Up,
+                settled_size: Decimal::from(10),
+                proceeds: Decimal::from(10),
+                timestamp_ms: 1,
+            },
+        };
+
+        // When: the account envelope crosses the durable JSON boundary.
+        let value = account_envelope_json(&envelope);
+
+        // Then: identity is transport provenance, not settlement economics.
+        assert_eq!(value["payload"]["identity"]["source"], "transport");
+        assert_eq!(
+            value["payload"]["identity"]["source_id"],
+            "polymarket:user-ws"
+        );
+        assert_eq!(value["payload"]["identity"]["connection_epoch"], 3);
+        assert_eq!(value["payload"]["identity"]["frame_sequence"], 4);
         Ok(())
     }
 }

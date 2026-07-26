@@ -1,6 +1,7 @@
 use super::{
     LiveReport, RunControl, RunLifecycleEvent, StartError, StrategyInstance,
     instantiate_strategies, observe_reconnect, store_signal as persist_signal,
+    validate_account_owner,
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_accounting::{ExposureReservation, aggregate_exposure};
@@ -14,6 +15,22 @@ use pmkit_store::{CausalIdentity, OwnerScope, ReplayItem, StoreError, TapeStore}
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableFillAuthority {
+    Account,
+    Market,
+}
+
+impl DurableFillAuthority {
+    fn for_run(run: &LiveRun) -> Self {
+        if run.account_data_ref().is_some() {
+            Self::Account
+        } else {
+            Self::Market
+        }
+    }
+}
 
 #[path = "live_recovery.rs"]
 mod live_recovery;
@@ -281,6 +298,7 @@ async fn reconstruct_risk_state(
     store: &dyn TapeStore,
     scope: &OwnerScope,
     limits: &pmkit_runtime::RiskLimits,
+    authority: DurableFillAuthority,
 ) -> Result<LiveRiskState, StoreError> {
     let page_size = NonZeroUsize::new(256).unwrap_or(NonZeroUsize::MIN);
     let mut cursor = None;
@@ -291,9 +309,17 @@ async fn reconstruct_risk_state(
         for item in page.items {
             match item {
                 ReplayItem::Envelope(envelope) => {
-                    state
-                        .apply_durable_account_record(&envelope, &scope.portfolio_id, limits)
-                        .map_err(|source| risk_storage_error(&source))?;
+                    match authority {
+                        DurableFillAuthority::Account => state.apply_durable_account_record(
+                            &envelope,
+                            &scope.portfolio_id,
+                            limits,
+                        ),
+                        DurableFillAuthority::Market => {
+                            state.apply_durable_market_record(&envelope, limits)
+                        }
+                    }
+                    .map_err(|source| risk_storage_error(&source))?;
                 }
                 ReplayItem::Gap(gap) => {
                     return Err(StoreError::Storage {
@@ -553,7 +579,7 @@ async fn drive_with_control_and_rate_limits(
         return Err(StartError::KillSwitchActive(run.id().clone()));
     }
     let mut open_orders = initial_open_orders(run, runtime).await?;
-    let account_ledger_authoritative = run.account_data_ref().is_some();
+    let fill_authority = DurableFillAuthority::for_run(run);
     let max_open_orders = usize::try_from(limits.max_open_orders.get()).unwrap_or(usize::MAX);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1024);
     let feed = MergedFeed::from_tasks(FeedMode::Live, sources(run, &strategies), None)
@@ -564,7 +590,7 @@ async fn drive_with_control_and_rate_limits(
     let mut risk_state = LiveRiskState::default();
     let mut reservations: HashMap<String, Reservation> = HashMap::new();
     if let Some(store) = store {
-        risk_state = reconstruct_risk_state(store, &scope, &limits)
+        risk_state = reconstruct_risk_state(store, &scope, &limits, fill_authority)
             .await
             .map_err(|source| StartError::Storage {
                 run: run.id().clone(),
@@ -578,7 +604,7 @@ async fn drive_with_control_and_rate_limits(
             })?;
         order_rate_state.restore(rate_limits, submissions);
         recover_intents(run, runtime, store, &scope).await?;
-        let recovered = reconstruct_accepted_orders(run, runtime, store, &mut risk_state).await?;
+        let recovered = reconstruct_accepted_orders(run, runtime, store, &risk_state).await?;
         if recovered.open_orders != open_orders {
             return Err(StartError::Storage {
                 run: run.id().clone(),
@@ -627,6 +653,7 @@ async fn drive_with_control_and_rate_limits(
             )
             .await;
         }
+        validate_account_owner(run.id(), run.portfolio(), &merged.source)?;
         if observe_reconnect(&merged.source, &mut connection_epochs) {
             metrics.reconnect();
         }
@@ -870,7 +897,7 @@ async fn drive_with_control_and_rate_limits(
                 }
             }
             MarketEvent::Fill { order_id, size, .. }
-                if !account_ledger_authoritative
+                if fill_authority == DurableFillAuthority::Market
                     && risk_state.apply_fill(
                         &event,
                         &FillIdentity::transport(&envelope.metadata),
@@ -948,7 +975,7 @@ async fn finish(
 mod recovery_tests {
     use super::{
         DurableOrder, LiveRiskState, StartError, apply_status_fill, drive_with_store,
-        recover_intents, strategy_correlation_id,
+        reconstruct_accepted_orders, recover_intents, strategy_correlation_id,
     };
     use crate::test_support::{BuyFactory, config, risk};
     use async_trait::async_trait;
@@ -961,7 +988,10 @@ mod recovery_tests {
     use pmkit_market::Outcome;
     use pmkit_runtime::{LiveOrderPolicy, StrategyRegistration};
     use pmkit_spec::LiveRun;
-    use pmkit_store::{CausalIdentity, IntentOutcome, OwnerScope, TapeStore, TursoTapeStore};
+    use pmkit_store::{
+        CausalIdentity, IntentOutcome, OwnerScope, PM_ENVELOPE_VERSION, PmEnvelope, TapeStore,
+        TursoTapeStore,
+    };
     use rust_decimal::Decimal;
     use serde_json::json;
     use std::{sync::Arc, time::Duration};
@@ -1129,6 +1159,40 @@ mod recovery_tests {
         })
     }
 
+    fn market_fill_envelope(scope: &OwnerScope, order_id: &str, size: Decimal) -> PmEnvelope {
+        PmEnvelope {
+            schema_version: PM_ENVELOPE_VERSION,
+            scope: scope.clone(),
+            venue_id: "polymarket".into(),
+            config_hash: "runtime".into(),
+            source_id: "polymarket:market-ws".into(),
+            connection_id: "market-1".into(),
+            source_timestamp_ms: 1_001,
+            canonical_source_rank: 0,
+            connection_epoch: 1,
+            frame_sequence: 1,
+            receipt_timestamp_ms: 1_001,
+            ingest_sequence: 1,
+            raw_frame: Vec::new(),
+            normalized: json!({
+                "schema_version": 1,
+                "payload": {
+                    "kind": "fill",
+                    "ts": 1_001,
+                    "strategy": "maker",
+                    "order_id": order_id,
+                    "market": "btc-5m",
+                    "outcome": "up",
+                    "price": "0.41",
+                    "size": size.to_string(),
+                    "side": "buy",
+                    "fee": "0.03",
+                    "liquidity": "taker"
+                }
+            }),
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::significant_drop_tightening)]
     async fn recover_terminal_intent() -> Result<(), Box<dyn std::error::Error>> {
@@ -1230,6 +1294,13 @@ mod recovery_tests {
         store
             .transition_intent_with_order(&identity, IntentOutcome::Accepted, Some("venue-open"))
             .await?;
+        store
+            .store_envelope(&market_fill_envelope(
+                &scope,
+                "venue-open",
+                Decimal::from(3),
+            ))
+            .await?;
         let mut runtime = config()?;
         runtime.shutdown.live_orders = LiveOrderPolicy::Leave;
 
@@ -1280,6 +1351,13 @@ mod recovery_tests {
         store
             .transition_intent_with_order(&identity, IntentOutcome::Accepted, Some("venue-matched"))
             .await?;
+        store
+            .store_envelope(&market_fill_envelope(
+                &scope,
+                "venue-matched",
+                Decimal::from(10),
+            ))
+            .await?;
         let mut runtime = config()?;
         runtime.shutdown.live_orders = LiveOrderPolicy::Leave;
 
@@ -1292,7 +1370,7 @@ mod recovery_tests {
                     status: OrderStatus::Accepted(OrderStatusDetails {
                         filled_qty: Some(Decimal::from(10)),
                         price: Some(Decimal::new(52, 2)),
-                        fee: Some(Decimal::new(10, 2)),
+                        fee: None,
                         settlement_reference: None,
                     }),
                 },
@@ -1383,7 +1461,7 @@ mod recovery_tests {
     }
 
     #[test]
-    fn matched_status_applies_only_missing_durable_fill_delta()
+    fn unmatched_status_total_does_not_synthesize_missing_fill_economics()
     -> Result<(), Box<dyn std::error::Error>> {
         // Given: four durable shares and a matched venue aggregate of ten shares for one order.
         let limits = risk()?;
@@ -1393,12 +1471,8 @@ mod recovery_tests {
             order_id: OrderId("venue-delta".into()),
             strategy: strategy.clone(),
             market: market.clone(),
-            outcome: Outcome::Up,
-            side: pmkit_book::Side::Buy,
             price: Decimal::new(50, 2),
             qty: Decimal::from(10),
-            post_only: true,
-            submitted_ms: 1_000,
         };
         let mut state = LiveRiskState::default();
         state.apply_account_event(
@@ -1424,15 +1498,81 @@ mod recovery_tests {
             settlement_reference: None,
         };
 
-        // When: matched recovery observes the same aggregate status twice.
-        apply_status_fill(&order, &details, &mut state, &limits)?;
-        apply_status_fill(&order, &details, &mut state, &limits)?;
+        let exact = OrderStatusDetails {
+            filled_qty: Some(Decimal::from(4)),
+            price: Some(Decimal::new(99, 2)),
+            fee: None,
+            settlement_reference: None,
+        };
 
-        // Then: only the six-share delta is added under one recovered fill identity.
-        assert_eq!(state.filled_qty("venue-delta"), Decimal::from(10));
-        assert_eq!(state.fees_for_order("venue-delta"), Decimal::new(10, 2));
-        assert_eq!(state.fill_count(), 2);
-        assert_eq!(state.positions(&market)[0].qty, Decimal::from(10));
+        // When: exact status quantity has no fee, then a later total has no durable economics.
+        assert_eq!(apply_status_fill(&order, &exact, &state)?, Decimal::from(4));
+        let result = apply_status_fill(&order, &details, &state);
+
+        // Then: recovery fails closed without inventing price, fee, or trade identity.
+        assert!(result.is_err());
+        assert_eq!(state.filled_qty("venue-delta"), Decimal::from(4));
+        assert_eq!(state.fees_for_order("venue-delta"), Decimal::new(4, 2));
+        assert_eq!(state.fill_count(), 1);
+        assert_eq!(state.positions(&market)[0].qty, Decimal::from(4));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
+    async fn cancelled_status_with_unmatched_fill_total_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Given: three exact durable shares for an accepted order later cancelled at four filled.
+        let dir = tempfile::tempdir()?;
+        let store = TursoTapeStore::open_local(dir.path().join("cancelled-unmatched.db")).await?;
+        let run = restart_run(
+            "cancelled-unmatched",
+            RestartExecutor {
+                open_orders: Vec::new(),
+                status: OrderStatus::Cancelled(OrderStatusDetails {
+                    filled_qty: Some(Decimal::from(4)),
+                    price: Some(Decimal::new(52, 2)),
+                    fee: None,
+                    settlement_reference: None,
+                }),
+            },
+        )?;
+        let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
+        let correlation =
+            strategy_correlation_id(&StrategyId::new("maker")?, &MarketId::new("btc-5m")?, 1_000);
+        let intent = recovery_identity(&scope, &format!("{correlation}:0"));
+        store
+            .store_intent_pending(&intent, &accepted_intent_payload())
+            .await?;
+        store
+            .transition_intent_with_order(&intent, IntentOutcome::Accepted, Some("venue-cancelled"))
+            .await?;
+        let limits = risk()?;
+        let mut state = LiveRiskState::default();
+        state.apply_account_event(
+            &pmkit_event::PmAccountEvent::Fill {
+                identity: pmkit_event::FillIdentity::Venue("trade-1".into()),
+                strategy: Some(StrategyId::new("maker")?),
+                order_id: "venue-cancelled".into(),
+                market: MarketId::new("btc-5m")?,
+                outcome: Outcome::Up,
+                price: Decimal::new(41, 2),
+                size: Decimal::from(3),
+                side: pmkit_book::Side::Buy,
+                fee: Decimal::new(3, 2),
+                liquidity: pmkit_event::Liquidity::Taker,
+                timestamp_ms: 1_001,
+            },
+            &limits,
+        )?;
+
+        // When: accepted-order reconstruction checks the terminal venue status.
+        let result = reconstruct_accepted_orders(&run, &config()?, &store, &state).await;
+
+        // Then: startup aborts instead of closing over one unmatched synthetic share.
+        assert!(matches!(result, Err(StartError::Storage { .. })));
+        assert_eq!(state.filled_qty("venue-cancelled"), Decimal::from(3));
+        store.delete_database()?;
         Ok(())
     }
 }
@@ -1483,7 +1623,12 @@ mod rate_limit_tests {
         }
 
         async fn query_status(&self, _order_id: &OrderId) -> Result<OrderStatus, ExecError> {
-            Ok(OrderStatus::Cancelled(OrderStatusDetails::default()))
+            Ok(OrderStatus::Cancelled(OrderStatusDetails {
+                filled_qty: Some(Decimal::ZERO),
+                price: None,
+                fee: None,
+                settlement_reference: None,
+            }))
         }
 
         async fn submit(&self, _order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
@@ -1632,7 +1777,7 @@ mod rate_limit_tests {
     #[allow(clippy::significant_drop_tightening)]
     async fn accepted_intents_fill_decision_crash_window_without_double_counting()
     -> Result<(), Box<dyn std::error::Error>> {
-        // Given: one accepted intent with its decision and one accepted before decision storage.
+        // Given: accepted and rejected intents on both sides of decision persistence.
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("live-rate-accepted-intents.db");
         let store = TursoTapeStore::open_local(&path).await?;
@@ -1645,30 +1790,53 @@ mod rate_limit_tests {
         let strategy = StrategyId::new("rate-strategy")?;
         let market = MarketId::new("btc-5m")?;
         let first_correlation = strategy_correlation_id(&strategy, &market, 1_000);
-        let first_decision = CausalIdentity {
-            scope: scope.clone(),
-            correlation_id: first_correlation.clone(),
-            source_timestamp_ms: 1_000,
-            ingest_sequence: 1,
-        };
-        store
-            .store_decision(&CausalDecision {
-                identity: first_decision,
-                payload: json!({
-                    "snapshot": {"timing": {"decision_ms": 1_000}},
-                    "decision": {
-                        "kind": "actions",
-                        "risk": [{"action_index": 0, "verdict": {"kind": "accepted"}}]
-                    }
-                }),
-            })
-            .await?;
+        let rejected_correlation = strategy_correlation_id(&strategy, &market, 1_075);
         for (correlation_id, timestamp_ms, ingest_sequence) in [
-            (format!("{first_correlation}:0"), 1_000, 1),
+            (first_correlation.clone(), 1_000, 1),
+            (rejected_correlation.clone(), 1_075, 3),
+        ] {
+            store
+                .store_decision(&CausalDecision {
+                    identity: CausalIdentity {
+                        scope: scope.clone(),
+                        correlation_id,
+                        source_timestamp_ms: timestamp_ms,
+                        ingest_sequence,
+                    },
+                    payload: json!({
+                        "snapshot": {"timing": {"decision_ms": timestamp_ms}},
+                        "decision": {
+                            "kind": "actions",
+                            "risk": [{"action_index": 0, "verdict": {"kind": "accepted"}}]
+                        }
+                    }),
+                })
+                .await?;
+        }
+        for (correlation_id, timestamp_ms, ingest_sequence, outcome) in [
+            (
+                format!("{first_correlation}:0"),
+                1_000,
+                1,
+                IntentOutcome::Accepted,
+            ),
             (
                 format!("{}:0", strategy_correlation_id(&strategy, &market, 1_050)),
                 1_050,
                 2,
+                IntentOutcome::Accepted,
+            ),
+            (
+                format!("{rejected_correlation}:0"),
+                1_075,
+                3,
+                IntentOutcome::Rejected,
+            ),
+            (
+                format!("{}:0", strategy_correlation_id(&strategy, &market, 1_090)),
+                1_090,
+                4,
+                IntentOutcome::Rejected,
             ),
         ] {
             let intent = CausalIdentity {
@@ -1682,21 +1850,19 @@ mod rate_limit_tests {
                 .await?;
             let venue_order_id = format!("venue-{ingest_sequence}");
             store
-                .transition_intent_with_order(
-                    &intent,
-                    IntentOutcome::Accepted,
-                    Some(&venue_order_id),
-                )
+                .transition_intent_with_order(&intent, outcome, Some(&venue_order_id))
                 .await?;
         }
 
         // When: accepted submission history is reconstructed after the crash window.
         let submissions = accepted_submissions(&store, &scope, run.strategies()).await?;
 
-        // Then: both accepted submissions contribute, and the decision-backed one contributes once.
-        assert_eq!(submissions.len(), 2);
+        // Then: every admitted intent contributes, and decision-backed states contribute once.
+        assert_eq!(submissions.len(), 4);
         assert!(submissions.contains(&(Some(strategy.clone()), 1_000)));
-        assert!(submissions.contains(&(Some(strategy), 1_050)));
+        assert!(submissions.contains(&(Some(strategy.clone()), 1_050)));
+        assert!(submissions.contains(&(Some(strategy.clone()), 1_075)));
+        assert!(submissions.contains(&(Some(strategy), 1_090)));
         store.delete_database()?;
         Ok(())
     }
@@ -1704,7 +1870,7 @@ mod rate_limit_tests {
 
 #[cfg(test)]
 mod risk_reconstruction_tests {
-    use super::reconstruct_risk_state;
+    use super::{DurableFillAuthority, reconstruct_risk_state};
     use crate::test_support::risk;
     use pmkit_book::OrderBookL2;
     use pmkit_core::{MarketId, PortfolioId, RunId};
@@ -1785,7 +1951,8 @@ mod risk_reconstruction_tests {
         let limits = risk()?;
 
         // When: startup reconstructs a fresh ledger and the first book marks it.
-        let mut state = reconstruct_risk_state(&store, &scope, &limits).await?;
+        let mut state =
+            reconstruct_risk_state(&store, &scope, &limits, DurableFillAuthority::Account).await?;
         state.update_book(
             &market,
             Outcome::Up,
@@ -1852,7 +2019,8 @@ mod risk_reconstruction_tests {
         }
 
         // When: startup reconstructs the authoritative ledger.
-        let state = reconstruct_risk_state(&store, &scope, &risk()?).await?;
+        let state =
+            reconstruct_risk_state(&store, &scope, &risk()?, DurableFillAuthority::Account).await?;
 
         // Then: the repeated identity applies once and the distinct identity applies separately.
         let position = state
@@ -1861,6 +2029,54 @@ mod risk_reconstruction_tests {
             .ok_or("missing reconstructed position")?;
         assert_eq!(position.qty, Decimal::from(20));
         assert_eq!(state.fill_count(), 2);
+        store.delete_database()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
+    async fn risk_state_replays_market_fill_without_account_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Given: one exact PM market fill durably recorded without an account owner field.
+        let dir = tempfile::tempdir()?;
+        let store = TursoTapeStore::open_local(dir.path().join("market-fill-restart.db")).await?;
+        let scope = OwnerScope::new(
+            PortfolioId::new("risk-portfolio")?,
+            RunId::new("market-fill-restart")?,
+        );
+        let market = MarketId::new("btc-5m")?;
+        let mut envelope = account_envelope(
+            &scope,
+            1,
+            &json!({
+                "kind": "fill",
+                "ts": 1_000,
+                "strategy": null,
+                "order_id": "venue-1",
+                "market": market.to_string(),
+                "outcome": "up",
+                "price": "0.4",
+                "size": "3",
+                "side": "buy",
+                "fee": "0.1",
+                "liquidity": "taker",
+            }),
+        );
+        envelope.source_id = "polymarket:market-ws".into();
+        envelope
+            .normalized
+            .as_object_mut()
+            .ok_or("normalized object")?
+            .remove("portfolio");
+        store.store_envelope(&envelope).await?;
+
+        // When: startup reconstructs a run with no authoritative account source.
+        let state =
+            reconstruct_risk_state(&store, &scope, &risk()?, DurableFillAuthority::Market).await?;
+
+        // Then: the exact durable market fill is the restart authority too.
+        assert_eq!(state.fill_count(), 1);
+        assert_eq!(state.positions(&market)[0].qty, Decimal::from(3));
         store.delete_database()?;
         Ok(())
     }
@@ -1891,7 +2107,8 @@ mod risk_reconstruction_tests {
             .await?;
 
         // When: startup attempts authoritative reconstruction.
-        let result = reconstruct_risk_state(&store, &scope, &risk()?).await;
+        let result =
+            reconstruct_risk_state(&store, &scope, &risk()?, DurableFillAuthority::Account).await;
 
         // Then: startup fails closed through the typed storage error path.
         assert!(matches!(result, Err(StoreError::Storage { .. })));

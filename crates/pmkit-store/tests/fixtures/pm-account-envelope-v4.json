@@ -1,0 +1,27 @@
+{
+  "schema_version": 6,
+  "normalized": {
+    "schema_version": 4,
+    "source_id": "polymarket:user-ws",
+    "source_time_ms": 1004,
+    "canonical_source_rank": 0,
+    "receipt_time_ms": 1005,
+    "connection_id": "account-1",
+    "connection_epoch": 1,
+    "frame_sequence": 4,
+    "ingest_sequence": 4,
+    "portfolio": "paper",
+    "payload": {
+      "kind": "settlement",
+      "ts": 1004,
+      "identity": {
+        "source": "venue",
+        "id": "settlement-4"
+      },
+      "market": "btc-5m",
+      "outcome": "up",
+      "settled_size": "10",
+      "proceeds": "10"
+    }
+  }
+}

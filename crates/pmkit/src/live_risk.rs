@@ -1,7 +1,7 @@
 use pmkit_accounting::PositionExposure;
 use pmkit_book::Position;
 use pmkit_core::{MarketId, PortfolioId, StrategyId};
-use pmkit_event::{FillIdentity, MarketEvent, PmAccountEvent};
+use pmkit_event::{FillIdentity, MarketEvent, PmAccountEvent, SettlementIdentity};
 use pmkit_exec::PlaceOrder;
 use pmkit_market::Outcome;
 use pmkit_runtime::RiskLimits;
@@ -91,8 +91,6 @@ pub fn mark_positions(
     Some(portfolio_unrealized_pnl)
 }
 
-type SettlementIdentity = (MarketId, Outcome, Decimal, Decimal, i64);
-
 #[derive(Debug, thiserror::Error)]
 pub(super) enum RiskStateError {
     #[error("durable risk history is corrupt or inconsistent: {message}")]
@@ -141,7 +139,7 @@ fn durable_fill_identity(
                 connection_epoch: record.connection_epoch,
                 frame_sequence: record.frame_sequence,
             }),
-            3 => Err(RiskStateError::corrupt("fill identity is missing")),
+            3 | 4 => Err(RiskStateError::corrupt("fill identity is missing")),
             _ => Err(RiskStateError::corrupt(format!(
                 "unsupported account schema version {account_schema_version}"
             ))),
@@ -163,6 +161,45 @@ fn durable_fill_identity(
         }),
         source => Err(RiskStateError::corrupt(format!(
             "unsupported fill identity source {source}"
+        ))),
+    }
+}
+
+fn durable_settlement_identity(
+    record: &PmEnvelope,
+    payload: &Value,
+    account_schema_version: u64,
+) -> Result<SettlementIdentity, RiskStateError> {
+    let Some(identity) = payload.get("identity") else {
+        return match account_schema_version {
+            1..=3 => Ok(SettlementIdentity::Transport {
+                source_id: record.source_id.clone(),
+                connection_id: record.connection_id.clone(),
+                connection_epoch: record.connection_epoch,
+                frame_sequence: record.frame_sequence,
+            }),
+            4 => Err(RiskStateError::corrupt("settlement identity is missing")),
+            _ => Err(RiskStateError::corrupt(format!(
+                "unsupported account schema version {account_schema_version}"
+            ))),
+        };
+    };
+    match string_field(identity, "source")? {
+        "venue" => Ok(SettlementIdentity::Venue(
+            string_field(identity, "id")?.to_owned(),
+        )),
+        "transport" => Ok(SettlementIdentity::Transport {
+            source_id: string_field(identity, "source_id")?.to_owned(),
+            connection_id: string_field(identity, "connection_id")?.to_owned(),
+            connection_epoch: identity["connection_epoch"]
+                .as_i64()
+                .ok_or_else(|| RiskStateError::corrupt("connection_epoch is missing or invalid"))?,
+            frame_sequence: identity["frame_sequence"]
+                .as_i64()
+                .ok_or_else(|| RiskStateError::corrupt("frame_sequence is missing or invalid"))?,
+        }),
+        source => Err(RiskStateError::corrupt(format!(
+            "unsupported settlement identity source {source}"
         ))),
     }
 }
@@ -314,6 +351,14 @@ pub(super) struct LiveRiskState {
     pub(super) loss_breached: bool,
 }
 
+struct LiveSettlement {
+    identity: SettlementIdentity,
+    market: MarketId,
+    outcome: Outcome,
+    settled_size: Decimal,
+    proceeds: Decimal,
+}
+
 impl LiveRiskState {
     pub(super) fn positions(&self, market: &MarketId) -> &[Position] {
         self.positions_by_market
@@ -412,7 +457,7 @@ impl LiveRiskState {
         let account_schema_version = normalized["schema_version"].as_u64().ok_or_else(|| {
             RiskStateError::corrupt("account schema version is missing or invalid")
         })?;
-        if !matches!(account_schema_version, 1..=3) {
+        if !matches!(account_schema_version, 1..=4) {
             return Err(RiskStateError::corrupt(format!(
                 "unsupported account schema version {account_schema_version}"
             )));
@@ -476,6 +521,7 @@ impl LiveRiskState {
                 }
             }
             "settlement" => PmAccountEvent::Settlement {
+                identity: durable_settlement_identity(record, payload, account_schema_version)?,
                 market: MarketId::new(string_field(payload, "market")?)
                     .map_err(|error| RiskStateError::corrupt(error.to_string()))?,
                 outcome: outcome_field(payload)?,
@@ -493,6 +539,81 @@ impl LiveRiskState {
             }
         };
         self.apply_account_event(&event, limits).map(|_| ())
+    }
+
+    pub(super) fn apply_durable_market_record(
+        &mut self,
+        record: &PmEnvelope,
+        limits: &RiskLimits,
+    ) -> Result<(), RiskStateError> {
+        if record.normalized.get("portfolio").is_some() {
+            return Ok(());
+        }
+        let payload = record
+            .normalized
+            .get("payload")
+            .ok_or_else(|| RiskStateError::corrupt("market payload is missing"))?;
+        if string_field(payload, "kind")? != "fill" {
+            return Ok(());
+        }
+        let strategy = match payload.get("strategy") {
+            Some(Value::Null) | None => None,
+            Some(Value::String(strategy)) => Some(
+                StrategyId::new(strategy)
+                    .map_err(|error| RiskStateError::corrupt(error.to_string()))?,
+            ),
+            Some(_) => return Err(RiskStateError::corrupt("strategy is invalid")),
+        };
+        let price = decimal_field(payload, "price")?;
+        let size = decimal_field(payload, "size")?;
+        let fee = decimal_field(payload, "fee")?;
+        if price < Decimal::ZERO || size <= Decimal::ZERO || fee < Decimal::ZERO {
+            return Err(RiskStateError::corrupt(
+                "fill price, size, or fee is outside its valid range",
+            ));
+        }
+        let event = MarketEvent::Fill {
+            strategy,
+            order_id: string_field(payload, "order_id")?.to_owned(),
+            market: MarketId::new(string_field(payload, "market")?)
+                .map_err(|error| RiskStateError::corrupt(error.to_string()))?,
+            outcome: outcome_field(payload)?,
+            price,
+            size,
+            side: match string_field(payload, "side")? {
+                "buy" => pmkit_book::Side::Buy,
+                "sell" => pmkit_book::Side::Sell,
+                unknown_side => {
+                    return Err(RiskStateError::corrupt(format!(
+                        "unsupported side {unknown_side}"
+                    )));
+                }
+            },
+            fee,
+            liquidity: match string_field(payload, "liquidity")? {
+                "maker" => pmkit_event::Liquidity::Maker,
+                "taker" => pmkit_event::Liquidity::Taker,
+                liquidity => {
+                    return Err(RiskStateError::corrupt(format!(
+                        "unsupported liquidity {liquidity}"
+                    )));
+                }
+            },
+            timestamp_ms: payload["ts"]
+                .as_i64()
+                .ok_or_else(|| RiskStateError::corrupt("event timestamp is missing or invalid"))?,
+        };
+        self.apply_fill(
+            &event,
+            &FillIdentity::Transport {
+                source_id: record.source_id.clone(),
+                connection_id: record.connection_id.clone(),
+                connection_epoch: record.connection_epoch,
+                frame_sequence: record.frame_sequence,
+            },
+            limits,
+        );
+        Ok(())
     }
 
     pub(super) fn apply_account_event(
@@ -530,20 +651,21 @@ impl LiveRiskState {
                 limits,
             )),
             PmAccountEvent::Settlement {
+                identity,
                 market,
                 outcome,
                 settled_size,
                 proceeds,
-                timestamp_ms,
+                timestamp_ms: _,
             } => self
                 .apply_settlement(
-                    (
-                        market.clone(),
-                        *outcome,
-                        *settled_size,
-                        *proceeds,
-                        *timestamp_ms,
-                    ),
+                    &LiveSettlement {
+                        identity: identity.clone(),
+                        market: market.clone(),
+                        outcome: *outcome,
+                        settled_size: *settled_size,
+                        proceeds: *proceeds,
+                    },
                     limits,
                 )
                 .map(|()| false),
@@ -556,42 +678,43 @@ impl LiveRiskState {
 
     fn apply_settlement(
         &mut self,
-        settlement: SettlementIdentity,
+        settlement: &LiveSettlement,
         limits: &RiskLimits,
     ) -> Result<(), RiskStateError> {
-        if self.applied_settlements.contains(&settlement) {
+        if self.applied_settlements.contains(&settlement.identity) {
             return Ok(());
         }
-        let (market, outcome, settled_size, proceeds, _) = &settlement;
-        if *settled_size <= Decimal::ZERO || *proceeds < Decimal::ZERO {
+        if settlement.settled_size <= Decimal::ZERO || settlement.proceeds < Decimal::ZERO {
             return Err(RiskStateError::corrupt(
                 "settlement size or proceeds is outside its valid range",
             ));
         }
         let position = self
             .positions_by_market
-            .get(market)
+            .get(&settlement.market)
             .and_then(|positions| {
                 positions
                     .iter()
-                    .find(|position| position.outcome == *outcome)
+                    .find(|position| position.outcome == settlement.outcome)
             })
             .ok_or_else(|| RiskStateError::corrupt("settlement has no matching position"))?;
-        if position.qty < *settled_size {
+        if position.qty < settlement.settled_size {
             return Err(RiskStateError::corrupt(
                 "settlement exceeds the matching position",
             ));
         }
         let average_entry = position.avg_entry;
-        self.applied_settlements.insert(settlement.clone());
-        let (market, outcome, settled_size, proceeds, _) = settlement;
-        let positions = self.positions_by_market.entry(market).or_default();
-        self.realized_pnl += proceeds - average_entry * settled_size;
+        self.applied_settlements.insert(settlement.identity.clone());
+        let positions = self
+            .positions_by_market
+            .entry(settlement.market.clone())
+            .or_default();
+        self.realized_pnl += settlement.proceeds - average_entry * settlement.settled_size;
         if let Some(position) = positions
             .iter_mut()
-            .find(|position| position.outcome == outcome)
+            .find(|position| position.outcome == settlement.outcome)
         {
-            position.qty -= settled_size;
+            position.qty -= settlement.settled_size;
         }
         positions.retain(|position| !position.qty.is_zero());
         self.refresh_marks(limits);
@@ -609,6 +732,7 @@ impl LiveRiskState {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     pub(super) fn fees_for_order(&self, order_id: &str) -> Decimal {
         self.fees_by_order
             .get(order_id)
@@ -690,7 +814,7 @@ mod ledger_tests {
     use crate::test_support::risk;
     use pmkit_book::{OrderBookL2, Side};
     use pmkit_core::MarketId;
-    use pmkit_event::{FillIdentity, Liquidity, PmAccountEvent};
+    use pmkit_event::{FillIdentity, Liquidity, PmAccountEvent, SettlementIdentity};
     use pmkit_market::Outcome;
     use rust_decimal::Decimal;
 
@@ -775,6 +899,7 @@ mod ledger_tests {
         let limits = risk()?;
         let fill = fill("fill-1", market.clone());
         let settlement = PmAccountEvent::Settlement {
+            identity: SettlementIdentity::Venue("settlement-1".into()),
             market: market.clone(),
             outcome: Outcome::Up,
             settled_size: Decimal::from(10),
@@ -793,6 +918,37 @@ mod ledger_tests {
         assert_eq!(state.realized_pnl(), Decimal::from(6));
         assert_eq!(state.daily_pnl(), Some(Decimal::new(59, 1)));
         assert_eq!(state.fill_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_settlement_identities_apply_same_value_and_time_twice()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Given: one twenty-share position and two equal settlements from distinct venue records.
+        let market = MarketId::new("btc-5m")?;
+        let limits = risk()?;
+        let mut state = LiveRiskState::default();
+        state.apply_account_event(&fill("fill-1", market.clone()), &limits)?;
+        state.apply_account_event(&fill("fill-2", market.clone()), &limits)?;
+        let settlement = |identity| PmAccountEvent::Settlement {
+            identity: SettlementIdentity::Venue(identity),
+            market: market.clone(),
+            outcome: Outcome::Up,
+            settled_size: Decimal::from(10),
+            proceeds: Decimal::from(10),
+            timestamp_ms: 2_000,
+        };
+        let first = settlement("settlement-1".into());
+        let second = settlement("settlement-2".into());
+
+        // When: one exact repeat and one distinct identity are reconstructed.
+        for event in [&first, &first, &second] {
+            state.apply_account_event(event, &limits)?;
+        }
+
+        // Then: only the exact repeat is deduplicated.
+        assert!(state.positions(&market).is_empty());
+        assert_eq!(state.realized_pnl(), Decimal::from(12));
         Ok(())
     }
 }

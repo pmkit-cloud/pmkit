@@ -58,6 +58,37 @@ impl FillIdentity {
     }
 }
 
+/// Stable identity of one settlement, preserving whether it came from a venue or transport frame.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SettlementIdentity {
+    /// Identity assigned by the venue or settlement transport.
+    Venue(String),
+    /// Identity derived from a transport frame at a boundary without a venue settlement id.
+    Transport {
+        /// Stable source identity.
+        source_id: String,
+        /// Connection that delivered the frame.
+        connection_id: String,
+        /// Connection epoch for the source.
+        connection_epoch: i64,
+        /// Frame number within the connection epoch.
+        frame_sequence: i64,
+    },
+}
+
+impl SettlementIdentity {
+    /// Derives identity from transport coordinates when the boundary has no venue settlement id.
+    #[must_use]
+    pub fn transport(metadata: &StreamMetadata) -> Self {
+        Self::Transport {
+            source_id: metadata.source_id.clone(),
+            connection_id: metadata.connection_id.clone(),
+            connection_epoch: metadata.connection_epoch,
+            frame_sequence: metadata.frame_sequence,
+        }
+    }
+}
+
 /// A single event flowing through a per-market loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarketEvent {
@@ -250,6 +281,8 @@ pub enum PmAccountEvent {
     },
     /// An owner-scoped settlement of outcome tokens into proceeds.
     Settlement {
+        /// Stable venue or transport settlement identity.
+        identity: SettlementIdentity,
         /// Exact market identity.
         market: MarketId,
         /// Settled outcome token.
@@ -372,7 +405,7 @@ mod tests {
 
     use super::{
         Liquidity, MarketEvent, MarketResolutionEvent, PmAccountEnvelope, PmAccountEvent,
-        PmMarketEnvelope, SourceEnvelope, StrategyFact, StreamMetadata,
+        PmMarketEnvelope, SettlementIdentity, SourceEnvelope, StrategyFact, StreamMetadata,
     };
     use pmkit_book::Side;
     use pmkit_core::{MarketId, PortfolioId};
@@ -441,6 +474,7 @@ mod tests {
             },
             raw_frame: Vec::new(),
             fact: PmAccountEvent::Settlement {
+                identity: SettlementIdentity::Venue("settlement-1".into()),
                 market: market.clone(),
                 outcome: Outcome::Up,
                 settled_size: Decimal::from(10),
@@ -456,12 +490,14 @@ mod tests {
         assert!(matches!(
             fact,
             StrategyFact::Account(PmAccountEvent::Settlement {
+                identity: SettlementIdentity::Venue(identity),
                 market: actual_market,
                 outcome: Outcome::Up,
                 settled_size,
                 proceeds,
                 timestamp_ms: 1_700_000_000_000,
-            }) if actual_market == market
+            }) if identity == "settlement-1"
+                && actual_market == market
                 && settled_size == Decimal::from(10)
                 && proceeds == Decimal::from(10)
         ));

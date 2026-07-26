@@ -12,6 +12,7 @@ use crate::{
 const PM_ACCOUNT_ENVELOPE_V1: &str = include_str!("../tests/fixtures/pm-account-envelope-v1.json");
 const PM_ACCOUNT_ENVELOPE_V2: &str = include_str!("../tests/fixtures/pm-account-envelope-v2.json");
 const PM_ACCOUNT_ENVELOPE_V3: &str = include_str!("../tests/fixtures/pm-account-envelope-v3.json");
+const PM_ACCOUNT_ENVELOPE_V4: &str = include_str!("../tests/fixtures/pm-account-envelope-v4.json");
 const PM_MARKET_ENVELOPE_V3: &str = include_str!("../tests/fixtures/pm-market-envelope-v3.json");
 const PM_MARKET_ENVELOPE_V4: &str = include_str!("../tests/fixtures/pm-market-envelope-v4.json");
 const OLD_CAUSAL_DECISION: &str = include_str!("../tests/fixtures/causal-decision-v1.json");
@@ -77,7 +78,8 @@ async fn migration_applies_and_is_idempotent() -> Result<(), Box<dyn std::error:
             (5, fifth_applied_at),
             (6, sixth_applied_at),
             (7, seventh_applied_at),
-            (8, eighth_applied_at)
+            (8, eighth_applied_at),
+            (9, ninth_applied_at)
         ]
             if !first_applied_at.is_empty()
                 && !second_applied_at.is_empty()
@@ -87,6 +89,7 @@ async fn migration_applies_and_is_idempotent() -> Result<(), Box<dyn std::error:
                 && !sixth_applied_at.is_empty()
                 && !seventh_applied_at.is_empty()
                 && !eighth_applied_at.is_empty()
+                && !ninth_applied_at.is_empty()
     ));
     assert_eq!(reopened_rows, first_rows);
     Ok(())
@@ -101,7 +104,7 @@ async fn migration_rejects_newer_version() -> Result<(), Box<dyn std::error::Err
     let (database, connection) = open_connection(&path).await?;
     connection
         .execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (9, CURRENT_TIMESTAMP)",
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (10, CURRENT_TIMESTAMP)",
             (),
         )
         .await?;
@@ -113,8 +116,8 @@ async fn migration_rejects_newer_version() -> Result<(), Box<dyn std::error::Err
     assert!(matches!(
         TursoTapeStore::open_local(&path).await,
         Err(StoreError::DatabaseSchemaTooNew {
-            database_version: 9,
-            max_supported_version: 8,
+            database_version: 10,
+            max_supported_version: 9,
         })
     ));
     Ok(())
@@ -229,7 +232,7 @@ async fn migration_adds_stream_identity_and_limit_one_cursor()
         let row = rows.next().await?.ok_or("migrated PM row")?;
         assert_eq!(row.get::<String>(0)?, "btc-5m");
         assert_eq!(row.get::<String>(1)?, "market:btc-5m:up");
-        assert_eq!(row.get::<i64>(2)?, 5);
+        assert_eq!(row.get::<i64>(2)?, 6);
         drop(rows);
         store.store_envelope(&down).await?;
         store.store_envelope(&account).await?;
@@ -274,7 +277,7 @@ async fn migration_adds_stream_identity_and_limit_one_cursor()
 #[tokio::test]
 async fn migration_rolls_back_on_failure() -> Result<(), Box<dyn std::error::Error>> {
     const FAILING_MIGRATION: Migration = Migration::new(
-        9,
+        10,
         &[
             "CREATE TABLE migration_partial_change (value INTEGER NOT NULL)",
             "CREATE TABLE migration_partial_change (",
@@ -316,7 +319,8 @@ async fn migration_rolls_back_on_failure() -> Result<(), Box<dyn std::error::Err
             (5, _),
             (6, _),
             (7, _),
-            (8, _)
+            (8, _),
+            (9, _)
         ]
     ));
     assert_eq!(partial_table_count, 0);
@@ -357,33 +361,35 @@ fn pm_account_fixture(
 #[tokio::test]
 async fn pm_account_envelope_version_migrates_old_and_reads_new_fixtures()
 -> Result<(), Box<dyn std::error::Error>> {
-    // Given: a database at the pre-bump version containing v1 and v2 account envelopes.
+    // Given: a database at the pre-bump version containing v1 through v3 account envelopes.
     let (_dir, path) = database_path("pm-account-envelope-version")?;
     let scope = OwnerScope::new(PortfolioId::new("paper")?, RunId::new("run")?);
     let old_v1 = pm_account_fixture(PM_ACCOUNT_ENVELOPE_V1, scope.clone(), 1)?;
     let old_v2 = pm_account_fixture(PM_ACCOUNT_ENVELOPE_V2, scope.clone(), 2)?;
+    let old_v3 = pm_account_fixture(PM_ACCOUNT_ENVELOPE_V3, scope.clone(), 3)?;
     let store = TursoTapeStore::open_local(&path).await?;
     store.store_envelope(&old_v1).await?;
     store.store_envelope(&old_v2).await?;
+    store.store_envelope(&old_v3).await?;
     store
         .connection
         .execute(
-            "DELETE FROM schema_migrations WHERE version IN (4, 5, 6, 7, 8)",
+            "DELETE FROM schema_migrations WHERE version IN (4, 5, 6, 7, 8, 9)",
             (),
         )
         .await?;
     drop(store);
 
-    // When: the current store migrates the database and appends a current fill envelope.
+    // When: the current store migrates the database and appends a current settlement envelope.
     let (items, migrations, new) = {
         let store = TursoTapeStore::open_local(&path).await?;
-        let new = pm_account_fixture(PM_ACCOUNT_ENVELOPE_V3, scope.clone(), 3)?;
+        let new = pm_account_fixture(PM_ACCOUNT_ENVELOPE_V4, scope.clone(), 4)?;
         store.store_envelope(&new).await?;
         let page = store
             .read_envelopes(
                 &scope,
                 None,
-                std::num::NonZeroUsize::new(3).ok_or("fixture page size")?,
+                std::num::NonZeroUsize::new(4).ok_or("fixture page size")?,
             )
             .await?;
         let migrations = migration_rows(&store.connection).await?;
@@ -394,14 +400,17 @@ async fn pm_account_envelope_version_migrates_old_and_reads_new_fixtures()
 
     // Then: both fixtures replay under the current envelope version without losing JSON evidence.
     let mut migrated_v1 = old_v1;
-    migrated_v1.schema_version = 5;
+    migrated_v1.schema_version = 6;
     let mut migrated_v2 = old_v2;
-    migrated_v2.schema_version = 5;
+    migrated_v2.schema_version = 6;
+    let mut migrated_v3 = old_v3;
+    migrated_v3.schema_version = 6;
     assert_eq!(
         items,
         vec![
             ReplayItem::Envelope(migrated_v1),
             ReplayItem::Envelope(migrated_v2),
+            ReplayItem::Envelope(migrated_v3),
             ReplayItem::Envelope(new)
         ]
     );
@@ -415,7 +424,8 @@ async fn pm_account_envelope_version_migrates_old_and_reads_new_fixtures()
             (5, _),
             (6, _),
             (7, _),
-            (8, _)
+            (8, _),
+            (9, _)
         ]
     ));
     Ok(())
@@ -499,7 +509,8 @@ async fn decision_version_round_trip() -> Result<(), Box<dyn std::error::Error>>
             (5, _),
             (6, _),
             (7, _),
-            (8, _)
+            (8, _),
+            (9, _)
         ]
     ));
     assert!(killed);
@@ -537,7 +548,7 @@ async fn decision_schema_v1_migrates_and_v2_reads() -> Result<(), Box<dyn std::e
     store
         .connection
         .execute(
-            "DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8)",
+            "DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9)",
             (),
         )
         .await?;
@@ -592,7 +603,8 @@ async fn decision_schema_v1_migrates_and_v2_reads() -> Result<(), Box<dyn std::e
             (5, _),
             (6, _),
             (7, _),
-            (8, _)
+            (8, _),
+            (9, _)
         ]
     ));
     drop(store);

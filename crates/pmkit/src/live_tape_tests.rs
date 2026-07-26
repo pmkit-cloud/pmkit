@@ -24,7 +24,7 @@ async fn live_run_writes_account_events_to_required_tape() -> Result<(), Box<dyn
 
     assert_eq!(report.events_processed, 2);
     assert_eq!(tape.lines().count(), 1);
-    assert_eq!(record["schema_version"], 3);
+    assert_eq!(record["schema_version"], 4);
     assert_eq!(record["payload"]["kind"], "fill");
     assert_eq!(record["payload"]["identity"]["source"], "transport");
     assert_eq!(record["payload"]["identity"]["source_id"], "pmkit-live");

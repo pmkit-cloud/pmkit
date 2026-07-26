@@ -347,7 +347,6 @@ async fn pending_unknown_and_accepted_intents_are_enumerated()
     store
         .transition_intent_with_order(&accepted, IntentOutcome::Accepted, Some("venue-accepted"))
         .await?;
-
     // When: pending, unknown, and accepted intents are enumerated.
     let pending = store.read_pending_intents(&scope).await?;
     let unknowns = store.read_unknown_intents(&scope).await?;
@@ -379,6 +378,35 @@ async fn pending_unknown_and_accepted_intents_are_enumerated()
 
     store.delete_database()?;
     assert!(!path.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejected_intents_are_enumerated() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: one durable intent rejected by the venue.
+    let (_dir, path) = database_path("rejected-intents")?;
+    let scope = owner_scope("paper")?;
+    let store = TursoTapeStore::open_local(&path).await?;
+    let rejected = CausalIdentity {
+        scope: scope.clone(),
+        correlation_id: "rejected".into(),
+        source_timestamp_ms: 1_000,
+        ingest_sequence: 1,
+    };
+    store
+        .store_intent_pending(&rejected, &json!({"submitted_ms": 1_000}))
+        .await?;
+    store
+        .transition_intent(&rejected, IntentOutcome::Rejected)
+        .await?;
+
+    // When: rejected intents are read for restart rate reconstruction.
+    let intents = store.read_rejected_intents(&scope).await?;
+
+    // Then: the terminal intent remains available exactly once.
+    assert_eq!(intents.len(), 1);
+    assert_eq!(intents[0].identity.correlation_id, "rejected");
+    store.delete_database()?;
     Ok(())
 }
 

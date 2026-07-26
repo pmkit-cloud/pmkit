@@ -1,6 +1,6 @@
 use super::{
     PaperReport, RunControl, RunLifecycleEvent, StartError, instantiate_strategies,
-    observe_reconnect, store_signal,
+    observe_reconnect, store_signal, validate_account_owner,
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_accounting::{
@@ -240,6 +240,7 @@ pub async fn drive_with_control(
                 exposure: report_exposure(&paper.account_state(), &marks),
             });
         }
+        validate_account_owner(run.id(), run.portfolio(), &merged.source)?;
         if observe_reconnect(&merged.source, &mut connection_epochs) {
             metrics.reconnect();
         }
@@ -264,6 +265,7 @@ pub async fn drive_with_control(
                 settled_size,
                 proceeds,
                 timestamp_ms,
+                ..
             } = &envelope.fact
             {
                 paper

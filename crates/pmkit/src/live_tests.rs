@@ -5,15 +5,17 @@ use crate::{
 use async_trait::async_trait;
 use pmkit_book::Side;
 use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
-use pmkit_data::{DataSourceError, LiveDataSource, SourceSignal};
-use pmkit_event::{Liquidity, MarketEvent};
+use pmkit_data::{DataSourceError, LiveAccountDataSource, LiveDataSource, SourceSignal};
+use pmkit_event::{
+    Liquidity, MarketEvent, PmAccountEnvelope, PmAccountEvent, SourceEnvelope, StreamMetadata,
+};
 use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
 use pmkit_market::Outcome;
 use pmkit_runtime::{LiveOrderPolicy, StrategyRegistration};
 use pmkit_spec::LiveRun;
 use pmkit_store::{OwnerScope, TapeStore, TursoTapeStore};
 use rust_decimal::Decimal;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -216,6 +218,52 @@ struct LiveWithBook;
 
 struct LiveWithDuplicatePartialFill;
 
+struct MismatchedAccountSource;
+
+#[async_trait]
+impl LiveAccountDataSource for MismatchedAccountSource {
+    async fn subscribe_account(
+        &self,
+        _portfolio: PortfolioId,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        sink.send(SourceSignal::Data(Box::new(SourceEnvelope::PmAccount(
+            PmAccountEnvelope {
+                portfolio: PortfolioId::new("mallory").map_err(|error| {
+                    DataSourceError::ReplayGap {
+                        message: error.to_string(),
+                    }
+                })?,
+                metadata: StreamMetadata {
+                    schema_version: 4,
+                    source_id: "mismatched-account".into(),
+                    source_time_ms: 1,
+                    canonical_source_rank: 0,
+                    receipt_time_ms: 1,
+                    connection_id: "mismatched-account".into(),
+                    connection_epoch: 0,
+                    frame_sequence: 1,
+                    ingest_sequence: 1,
+                },
+                raw_frame: Vec::new(),
+                fact: PmAccountEvent::OrderAck {
+                    strategy: None,
+                    order_id: "foreign-order".into(),
+                    timestamp_ms: 1,
+                },
+            },
+        ))))
+        .await
+        .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
 #[async_trait]
 impl LiveDataSource for LiveWithFill {
     async fn subscribe(
@@ -353,6 +401,44 @@ async fn live_run_routes_orders_and_counts_fills() -> Result<(), Box<dyn std::er
     assert_eq!(report.fills, 1);
     assert_eq!(report.rejected, 0);
     assert!(report.exposure.portfolio_notional > Decimal::ZERO);
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
+async fn live_run_rejects_mismatched_account_owner() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: a public account source emits an envelope owned by another portfolio.
+    let run = LiveRun::new(
+        RunId::new("live-owner-check")?,
+        PortfolioId::new("alice")?,
+        Arc::new(RecordingExec),
+        Arc::new(LiveWithBook),
+        risk()?,
+    )
+    .account_data(Arc::new(MismatchedAccountSource));
+    let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
+    let dir = tempfile::tempdir()?;
+
+    // When: the live runtime receives the foreign account envelope.
+    let (result, page) = {
+        let store = TursoTapeStore::open_local(dir.path().join("owner-check.db")).await?;
+        let result = live::drive_with_store(&run, &config()?, Some(&store)).await;
+        let page = store
+            .read_envelopes(&scope, None, NonZeroUsize::MIN)
+            .await?;
+        store.delete_database()?;
+        (result, page)
+    };
+
+    // Then: it fails before durable storage, tape, or ledger mutation.
+    assert!(matches!(
+        result,
+        Err(StartError::Source {
+            source: DataSourceError::ReplayGap { message },
+            ..
+        }) if message == "account event owner mallory does not match run alice"
+    ));
+    assert!(page.items.is_empty());
     Ok(())
 }
 

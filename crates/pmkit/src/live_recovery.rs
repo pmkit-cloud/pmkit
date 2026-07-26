@@ -1,10 +1,5 @@
-use super::{
-    LiveRiskState, Reservation, StartError, correlation_strategy, query_order_status,
-    risk_storage_error,
-};
-use pmkit_event::{FillIdentity, Liquidity, PmAccountEvent};
+use super::{LiveRiskState, Reservation, StartError, correlation_strategy, query_order_status};
 use pmkit_exec::{ExecError, OrderId, OrderStatus, OrderStatusDetails};
-use pmkit_market::Outcome;
 use pmkit_runtime::{RuntimeConfig, StrategyRegistration};
 use pmkit_spec::LiveRun;
 use pmkit_store::{DurableIntent, OwnerScope, StoreError, TapeStore};
@@ -73,6 +68,7 @@ pub(super) async fn accepted_submissions(
     let mut intents = store.read_pending_intents(scope).await?;
     intents.extend(store.read_unknown_intents(scope).await?);
     intents.extend(store.read_accepted_intents(scope).await?);
+    intents.extend(store.read_rejected_intents(scope).await?);
     for intent in intents {
         if accepted_intent_ids.contains(&intent.identity.correlation_id) {
             continue;
@@ -97,7 +93,6 @@ pub(super) fn corrupt_order(message: impl Into<String>) -> StoreError {
 #[derive(Deserialize)]
 struct IntentPayload {
     action_index: u32,
-    submitted_ms: i64,
     order: IntentOrder,
     venue_order_id: String,
 }
@@ -105,23 +100,16 @@ struct IntentPayload {
 #[derive(Deserialize)]
 struct IntentOrder {
     market: String,
-    outcome: String,
-    side: String,
     price: Decimal,
     qty: Decimal,
-    post_only: bool,
 }
 
 pub(super) struct DurableOrder {
     pub(super) order_id: OrderId,
     pub(super) strategy: pmkit_core::StrategyId,
     pub(super) market: pmkit_core::MarketId,
-    pub(super) outcome: Outcome,
-    pub(super) side: pmkit_book::Side,
     pub(super) price: Decimal,
     pub(super) qty: Decimal,
-    pub(super) post_only: bool,
-    pub(super) submitted_ms: i64,
 }
 
 fn durable_order(
@@ -165,32 +153,15 @@ fn durable_order(
         order_id: OrderId(payload.venue_order_id),
         strategy,
         market,
-        outcome: match payload.order.outcome.as_str() {
-            "Up" => Outcome::Up,
-            "Down" => Outcome::Down,
-            outcome => {
-                return Err(corrupt_order(format!(
-                    "unsupported order outcome {outcome}"
-                )));
-            }
-        },
-        side: match payload.order.side.as_str() {
-            "buy" => pmkit_book::Side::Buy,
-            "sell" => pmkit_book::Side::Sell,
-            side => return Err(corrupt_order(format!("unsupported order side {side}"))),
-        },
         price: payload.order.price,
         qty: payload.order.qty,
-        post_only: payload.order.post_only,
-        submitted_ms: payload.submitted_ms,
     })
 }
 
 pub(super) fn apply_status_fill(
     order: &DurableOrder,
     details: &OrderStatusDetails,
-    risk_state: &mut LiveRiskState,
-    limits: &pmkit_runtime::RiskLimits,
+    risk_state: &LiveRiskState,
 ) -> Result<Decimal, StoreError> {
     let filled_qty = details
         .filled_qty
@@ -201,49 +172,9 @@ pub(super) fn apply_status_fill(
         ));
     }
     let durable_qty = risk_state.filled_qty(&order.order_id.0);
-    if durable_qty > filled_qty {
+    if durable_qty != filled_qty {
         return Err(corrupt_order(
-            "venue filled quantity regressed behind durable fills",
-        ));
-    }
-    let missing_qty = filled_qty - durable_qty;
-    if missing_qty.is_zero() {
-        return Ok(filled_qty);
-    }
-    let price = details
-        .price
-        .filter(|price| !price.is_sign_negative())
-        .ok_or_else(|| corrupt_order("venue fill price is missing or invalid"))?;
-    let durable_fee = risk_state.fees_for_order(&order.order_id.0);
-    let total_fee = details
-        .fee
-        .filter(|fee| *fee >= durable_fee)
-        .ok_or_else(|| corrupt_order("venue fill fee is missing or regressed"))?;
-    if !risk_state
-        .apply_account_event(
-            &PmAccountEvent::Fill {
-                identity: FillIdentity::Venue(format!("recovered-order:{}", order.order_id.0)),
-                strategy: Some(order.strategy.clone()),
-                order_id: order.order_id.0.clone(),
-                market: order.market.clone(),
-                outcome: order.outcome,
-                price,
-                size: missing_qty,
-                side: order.side,
-                fee: total_fee - durable_fee,
-                liquidity: if order.post_only {
-                    Liquidity::Maker
-                } else {
-                    Liquidity::Taker
-                },
-                timestamp_ms: order.submitted_ms,
-            },
-            limits,
-        )
-        .map_err(|source| risk_storage_error(&source))?
-    {
-        return Err(corrupt_order(
-            "recovered fill identity conflicts with durable ledger state",
+            "venue filled quantity differs from exact durable fills",
         ));
     }
     Ok(filled_qty)
@@ -258,7 +189,7 @@ pub(super) async fn reconstruct_accepted_orders(
     run: &LiveRun,
     runtime: &RuntimeConfig,
     store: &dyn TapeStore,
-    risk_state: &mut LiveRiskState,
+    risk_state: &LiveRiskState,
 ) -> Result<RecoveredOrders, StartError> {
     let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
     let intents = store
@@ -290,10 +221,12 @@ pub(super) async fn reconstruct_accepted_orders(
         }
         match query_order_status(run, runtime, &order.order_id).await? {
             OrderStatus::Open(details) => {
-                let filled_qty = apply_status_fill(&order, &details, risk_state, run.risk())
-                    .map_err(|source| StartError::Storage {
-                        run: run.id().clone(),
-                        source,
+                let filled_qty =
+                    apply_status_fill(&order, &details, risk_state).map_err(|source| {
+                        StartError::Storage {
+                            run: run.id().clone(),
+                            source,
+                        }
                     })?;
                 let remaining_qty = order.qty - filled_qty;
                 if remaining_qty.is_zero() {
@@ -314,12 +247,12 @@ pub(super) async fn reconstruct_accepted_orders(
                 );
             }
             OrderStatus::Accepted(details) => {
-                if apply_status_fill(&order, &details, risk_state, run.risk()).map_err(
-                    |source| StartError::Storage {
+                if apply_status_fill(&order, &details, risk_state).map_err(|source| {
+                    StartError::Storage {
                         run: run.id().clone(),
                         source,
-                    },
-                )? != order.qty
+                    }
+                })? != order.qty
                 {
                     return Err(StartError::Storage {
                         run: run.id().clone(),
@@ -329,7 +262,14 @@ pub(super) async fn reconstruct_accepted_orders(
                     });
                 }
             }
-            OrderStatus::Rejected(_) | OrderStatus::Cancelled(_) => {}
+            OrderStatus::Rejected(details) | OrderStatus::Cancelled(details) => {
+                apply_status_fill(&order, &details, risk_state).map_err(|source| {
+                    StartError::Storage {
+                        run: run.id().clone(),
+                        source,
+                    }
+                })?;
+            }
             OrderStatus::Unknown(_) => {
                 return Err(StartError::ExecutionState {
                     run: run.id().clone(),

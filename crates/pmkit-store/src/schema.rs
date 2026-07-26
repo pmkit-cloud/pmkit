@@ -1,8 +1,8 @@
 /// Current durable PM envelope schema version.
-pub const PM_ENVELOPE_VERSION: u16 = 5;
+pub const PM_ENVELOPE_VERSION: u16 = 6;
 pub const CAUSAL_DECISION_SCHEMA_VERSION: i64 = 2;
 pub const DURABLE_INTENT_SCHEMA_VERSION: i64 = 1;
-pub const CURRENT_SCHEMA_VERSION: i64 = 8;
+pub const CURRENT_SCHEMA_VERSION: i64 = 9;
 
 pub const CREATE_SCHEMA_MIGRATIONS: &str = "
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -26,6 +26,9 @@ UPDATE pm_envelopes SET schema_version = 2 WHERE schema_version = 1";
 
 pub const MIGRATE_PM_ENVELOPES_V4_TO_V5: &str = "
 UPDATE pm_envelopes SET schema_version = 5 WHERE schema_version = 4";
+
+pub const MIGRATE_PM_ENVELOPES_V5_TO_V6: &str = "
+UPDATE pm_envelopes SET schema_version = 6 WHERE schema_version = 5";
 
 pub const MIGRATE_CAUSAL_DECISIONS_V1_TO_V2: &str = "
 UPDATE causal_decisions SET schema_version = 2 WHERE schema_version = 1";
@@ -280,6 +283,12 @@ pub const READ_ACCEPTED_INTENTS: &str = "
 SELECT portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence, schema_version, payload_json
 FROM durable_intents
 WHERE portfolio_id = ?1 AND run_id = ?2 AND state = 'accepted'
+ORDER BY source_timestamp_ms, ingest_sequence";
+
+pub const READ_REJECTED_INTENTS: &str = "
+SELECT portfolio_id, run_id, correlation_id, source_timestamp_ms, ingest_sequence, schema_version, payload_json
+FROM durable_intents
+WHERE portfolio_id = ?1 AND run_id = ?2 AND state = 'rejected'
 ORDER BY source_timestamp_ms, ingest_sequence";
 
 pub const READ_DECISIONS: &str = "

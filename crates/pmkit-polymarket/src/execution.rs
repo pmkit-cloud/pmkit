@@ -309,6 +309,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_status_retains_quantity_without_fee()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Given: Polymarket returns a cancelled order with a partial matched quantity.
+        let executor = fixture_executor(order_response("CANCELED")).await?;
+
+        // When: status is queried through the real adapter seam.
+        let status = executor
+            .query_status(&OrderId("order-1".to_owned()))
+            .await?;
+
+        // Then: exact quantity is retained and unavailable fee economics remain absent.
+        let OrderStatus::Cancelled(details) = status else {
+            return Err("expected cancelled status".into());
+        };
+        assert_eq!(details.filled_qty, Some(Decimal::from(4)));
+        assert_eq!(details.price, Some(Decimal::new(52, 2)));
+        assert_eq!(details.fee, None);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn status_ambiguous_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
         // Given a venue response whose status is not part of the known lifecycle.
         let executor = fixture_executor(order_response("PENDING_REVIEW")).await?;

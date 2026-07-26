@@ -755,12 +755,13 @@ fn account_event_detail_key(event: &pmkit_event::PmAccountEvent) -> String {
             ..
         } => format!("{order_id}:{status}:{timestamp_ms}"),
         pmkit_event::PmAccountEvent::Settlement {
+            identity,
             market,
             outcome,
             settled_size,
             proceeds,
             timestamp_ms,
-        } => format!("{market}:{outcome:?}:{settled_size}:{proceeds}:{timestamp_ms}"),
+        } => format!("{identity:?}:{market}:{outcome:?}:{settled_size}:{proceeds}:{timestamp_ms}"),
     }
 }
 
