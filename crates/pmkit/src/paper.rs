@@ -484,7 +484,7 @@ mod ledger_tests {
     use async_trait::async_trait;
     use pmkit_book::{OrderBookL2, Side};
     use pmkit_core::{MarketId, PortfolioId, RunId};
-    use pmkit_exec::{Executor, PlaceOrder};
+    use pmkit_exec::{Executor, PlaceOrder, TimeInForce};
     use pmkit_market::Outcome;
     use pmkit_money::Money;
     use pmkit_paper::PaperExecutor;
@@ -596,6 +596,7 @@ mod ledger_tests {
             price,
             qty,
             post_only,
+            tif: TimeInForce::Gtc,
         }
     }
 

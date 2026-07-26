@@ -495,7 +495,7 @@ mod tests {
     use pmkit_book::{OrderBookL2, Side};
     use pmkit_core::MarketId;
     use pmkit_event::{Liquidity, MarketEvent};
-    use pmkit_exec::{Executor, PlaceOrder};
+    use pmkit_exec::{Executor, PlaceOrder, TimeInForce};
     use pmkit_market::Outcome;
     use pmkit_sim::MarketCategory;
     use rust_decimal::Decimal;
@@ -527,6 +527,7 @@ mod tests {
             price: Decimal::new(50, 2),
             qty: Decimal::from(10),
             post_only: false,
+            tif: TimeInForce::Gtc,
         };
         let id = paper.submit(&order, 100).await?;
         assert!(id.0.starts_with("paper-"));
@@ -567,6 +568,7 @@ mod tests {
             price: Decimal::new(45, 2),
             qty: Decimal::from(10),
             post_only: true,
+            tif: TimeInForce::Gtc,
         };
         let id = paper.submit(&order, 100).await?;
 

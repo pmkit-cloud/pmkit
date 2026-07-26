@@ -4,7 +4,7 @@ use pmkit_accounting::{AccountingError, LedgerFill, LedgerPosition, PortfolioLed
 use pmkit_book::{OrderBookL2, Side};
 use pmkit_core::{MarketId, StrategyId};
 use pmkit_event::MarketEvent;
-use pmkit_exec::{OrderId, PlaceOrder};
+use pmkit_exec::{OrderId, PlaceOrder, TimeInForce};
 use pmkit_market::Outcome;
 use pmkit_money::Money;
 use pmkit_sim::{SimEngine, SimulationConfig};
@@ -113,6 +113,7 @@ pub struct RecordedOrder {
     pub(crate) price: Decimal,
     pub(crate) qty: Decimal,
     pub(crate) post_only: bool,
+    pub(crate) tif: TimeInForce,
 }
 
 impl RecordedOrder {
@@ -125,6 +126,7 @@ impl RecordedOrder {
             price: order.price,
             qty: order.qty,
             post_only: order.post_only,
+            tif: order.tif,
         }
     }
 
@@ -136,6 +138,7 @@ impl RecordedOrder {
             price: self.price,
             qty: self.qty,
             post_only: self.post_only,
+            tif: self.tif,
         }
     }
 }

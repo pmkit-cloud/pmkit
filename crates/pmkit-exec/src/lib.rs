@@ -50,6 +50,25 @@ pub enum OrderStatus {
     Unknown(OrderStatusDetails),
 }
 
+/// How long an order stays working before the venue removes it.
+///
+/// On short-lived markets an order that outlives its strategy is an orphan
+/// that can fill long after the process died. Every mode honors the same
+/// contract: the order stops being fillable at `expire_at_ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimeInForce {
+    /// Good-til-cancelled: the order rests until filled or cancelled.
+    #[default]
+    Gtc,
+    /// Good-til-date: the order stops being fillable at `expire_at_ms`
+    /// (Unix epoch milliseconds, event time).
+    Gtd {
+        /// The instant, in Unix epoch milliseconds, after which the order
+        /// must no longer fill.
+        expire_at_ms: i64,
+    },
+}
+
 /// An order to place on a single market outcome.
 #[derive(Debug, Clone)]
 pub struct PlaceOrder {
@@ -65,6 +84,8 @@ pub struct PlaceOrder {
     pub qty: Decimal,
     /// Whether the order must rest as a maker (post-only).
     pub post_only: bool,
+    /// How long the order stays working.
+    pub tif: TimeInForce,
 }
 
 /// An execution error.
@@ -171,7 +192,7 @@ pub trait Executor: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
+    use super::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder, TimeInForce};
     use pmkit_book::Side;
     use pmkit_core::MarketId;
     use pmkit_market::Outcome;
@@ -214,6 +235,7 @@ mod tests {
             price: Decimal::new(50, 2),
             qty: Decimal::from(10),
             post_only: true,
+            tif: TimeInForce::Gtc,
         })
     }
 

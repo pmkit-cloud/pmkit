@@ -959,7 +959,7 @@ mod override_tests {
     use crate::test_support::{risk, risk_overrides};
     use pmkit_book::Side;
     use pmkit_core::{MarketId, StrategyId};
-    use pmkit_exec::PlaceOrder;
+    use pmkit_exec::{PlaceOrder, TimeInForce};
     use pmkit_market::Outcome;
     use pmkit_money::Money;
     use pmkit_runtime::PartialRiskLimits;
@@ -973,6 +973,7 @@ mod override_tests {
             price: Decimal::ONE,
             qty: Decimal::from(10),
             post_only: false,
+            tif: TimeInForce::Gtc,
         }
     }
 

@@ -3,7 +3,7 @@
 use pmkit_book::{OrderBookL2, Position};
 use pmkit_core::MarketId;
 use pmkit_event::{MarketEvent, StrategyFact};
-use pmkit_exec::PlaceOrder;
+use pmkit_exec::{PlaceOrder, TimeInForce};
 use pmkit_market::Outcome;
 use pmkit_strategy::{Action, Actions, LogicalTimestamp, Strategy, StrategyContext, StrategyError};
 use rust_decimal::Decimal;
@@ -30,6 +30,7 @@ impl Strategy for ThresholdTaker {
             price: ask,
             qty: Decimal::ONE,
             post_only: false,
+            tif: TimeInForce::Gtc,
         }))
     }
 }

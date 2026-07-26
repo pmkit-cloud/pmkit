@@ -2,7 +2,7 @@ use super::{FeeModel, MarketCategory, SimEngine, SimulationConfig};
 use pmkit_book::{OrderBookL2, Side};
 use pmkit_core::MarketId;
 use pmkit_event::{Liquidity, MarketEvent};
-use pmkit_exec::PlaceOrder;
+use pmkit_exec::{PlaceOrder, TimeInForce};
 use pmkit_market::Outcome;
 use rust_decimal::Decimal;
 
@@ -27,6 +27,7 @@ fn order(
         price,
         qty: Decimal::from(10),
         post_only,
+        tif: TimeInForce::Gtc,
     })
 }
 
@@ -211,6 +212,63 @@ fn custom_fee_applied() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn gtd_order(
+    side: Side,
+    price: Decimal,
+    post_only: bool,
+    expire_at_ms: i64,
+) -> Result<PlaceOrder, pmkit_core::EmptyIdError> {
+    Ok(PlaceOrder {
+        tif: TimeInForce::Gtd { expire_at_ms },
+        ..order(side, price, post_only)?
+    })
+}
+
+#[test]
+fn gtd_maker_expires_instead_of_filling() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = SimEngine::new("paper", 0, MarketCategory::Crypto);
+    let market = MarketId::new("btc-5m")?;
+    engine.update_book(&market, Outcome::Up, ask_book());
+    let id = engine.submit(&gtd_order(Side::Buy, Decimal::new(45, 2), true, 50)?, 0);
+    assert!(id.is_some());
+    assert_eq!(engine.resting_count(), 1);
+
+    // The crossing book arrives after expiry: the order is gone, not filled.
+    let crossed = OrderBookL2 {
+        bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+        asks: vec![(Decimal::new(45, 2), Decimal::from(50))],
+        timestamp_ms: 101,
+        last_trade_price: None,
+    };
+    engine.update_book(&market, Outcome::Up, crossed);
+    assert!(engine.drain_fills().is_empty());
+    assert_eq!(engine.resting_count(), 0);
+    Ok(())
+}
+
+#[test]
+fn gtd_maker_fills_before_expiry() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = SimEngine::new("paper", 0, MarketCategory::Crypto);
+    let market = MarketId::new("btc-5m")?;
+    engine.update_book(&market, Outcome::Up, ask_book());
+    engine.submit(&gtd_order(Side::Buy, Decimal::new(45, 2), true, 200)?, 0);
+    let crossed = OrderBookL2 {
+        bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+        asks: vec![(Decimal::new(45, 2), Decimal::from(50))],
+        timestamp_ms: 101,
+        last_trade_price: None,
+    };
+    engine.update_book(&market, Outcome::Up, crossed);
+    assert!(matches!(
+        engine.drain_fills().as_slice(),
+        [MarketEvent::Fill {
+            liquidity: Liquidity::Maker,
+            ..
+        }]
+    ));
+    Ok(())
+}
+
 #[test]
 fn invalid_fee_rejected() {
     // Given / When: fee inputs exceed the documented rebate floor and fee ceiling.
@@ -243,5 +301,57 @@ fn default_fee_unchanged() -> Result<(), Box<dyn std::error::Error>> {
         engine.drain_fills().as_slice(),
         [MarketEvent::Fill { fee, .. }] if *fee == Decimal::new(17_388, 5)
     ));
+    Ok(())
+}
+
+#[test]
+fn gtd_expiry_wins_over_fill_at_the_same_timestamp() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = SimEngine::new("paper", 0, MarketCategory::Crypto);
+    let market = MarketId::new("btc-5m")?;
+    engine.update_book(&market, Outcome::Up, ask_book());
+    engine.submit(&gtd_order(Side::Buy, Decimal::new(45, 2), true, 101)?, 0);
+    let crossed = OrderBookL2 {
+        bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+        asks: vec![(Decimal::new(45, 2), Decimal::from(50))],
+        timestamp_ms: 101,
+        last_trade_price: None,
+    };
+    engine.update_book(&market, Outcome::Up, crossed);
+    assert!(engine.drain_fills().is_empty());
+    assert_eq!(engine.resting_count(), 0);
+    Ok(())
+}
+
+#[test]
+fn already_expired_gtd_order_is_rejected_on_submit() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = SimEngine::new("paper", 0, MarketCategory::Crypto);
+    let market = MarketId::new("btc-5m")?;
+    engine.update_book(&market, Outcome::Up, ask_book());
+    let id = engine.submit(&gtd_order(Side::Buy, Decimal::new(50, 2), false, 50)?, 100);
+    assert!(id.is_none());
+    assert!(engine.drain_fills().is_empty());
+    Ok(())
+}
+
+#[test]
+fn delayed_taker_expiring_before_activation_never_fills() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut engine = SimEngine::with_config(
+        "paper",
+        0,
+        MarketCategory::Crypto,
+        SimulationConfig {
+            activation_latency_ms: 10,
+            ..SimulationConfig::default()
+        },
+    );
+    let market = MarketId::new("btc-5m")?;
+    engine.update_book(&market, Outcome::Up, ask_book());
+    engine.submit(&gtd_order(Side::Buy, Decimal::new(50, 2), false, 5)?, 0);
+    assert!(engine.drain_fills().is_empty());
+    let mut active = ask_book();
+    active.timestamp_ms = 10;
+    engine.update_book(&market, Outcome::Up, active);
+    assert!(engine.drain_fills().is_empty());
     Ok(())
 }

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use pmkit_book::{OrderBookL2, Side};
 use pmkit_core::{MarketId, StrategyId};
 use pmkit_event::{Liquidity, MarketEvent};
-use pmkit_exec::{OrderId, PlaceOrder};
+use pmkit_exec::{OrderId, PlaceOrder, TimeInForce};
 use pmkit_market::Outcome;
 use pmkit_math::fill::walk_book;
 use rust_decimal::Decimal;
@@ -135,15 +135,19 @@ impl SimEngine {
         }
     }
 
-    /// Replaces the book for one market outcome and fills any crossed makers.
+    /// Replaces the book for one market outcome, expires GTD orders the new
+    /// book time has passed, and fills any crossed makers.
     pub fn update_book(&mut self, market: &MarketId, outcome: Outcome, book: OrderBookL2) {
+        let now_ms = book.timestamp_ms;
         self.books.insert((market.clone(), outcome), book);
+        self.expire_orders(market, outcome, now_ms);
         self.activate_delayed(market, outcome);
         self.check_resting_fills(market, outcome);
     }
 
     /// Submits an order. Post-only orders rest; others take liquidity. Returns
-    /// the minted order id, or `None` when there is no book or no fill.
+    /// the minted order id, or `None` when there is no book, no fill, or the
+    /// order is already expired.
     pub fn submit(&mut self, order: &PlaceOrder, now_ms: i64) -> Option<OrderId> {
         self.submit_with_strategy(order, None, now_ms)
     }
@@ -164,6 +168,9 @@ impl SimEngine {
         strategy: Option<StrategyId>,
         now_ms: i64,
     ) -> Option<OrderId> {
+        if Self::expired(order, now_ms) {
+            return None;
+        }
         let order_id = self.next_order_id();
         if order.post_only {
             self.submit_maker(order_id, order, strategy, now_ms)
@@ -330,6 +337,30 @@ impl SimEngine {
             timestamp_ms: fill_ms.max(submitted_ms),
         });
         Some(OrderId(order_id))
+    }
+
+    const fn expired(order: &PlaceOrder, now_ms: i64) -> bool {
+        match order.tif {
+            TimeInForce::Gtc => false,
+            TimeInForce::Gtd { expire_at_ms } => expire_at_ms <= now_ms,
+        }
+    }
+
+    /// Removes expired GTD orders for one market outcome before any fill
+    /// check, mirroring the venue removing them server-side. Expiry at the
+    /// book timestamp wins over a fill at the same timestamp: an order that
+    /// expired at `t` must not fill at `t`.
+    fn expire_orders(&mut self, market: &MarketId, outcome: Outcome, now_ms: i64) {
+        self.resting.retain(|_, resting| {
+            resting.order.market != *market
+                || resting.order.outcome != outcome
+                || !Self::expired(&resting.order, now_ms)
+        });
+        self.delayed.retain(|delayed| {
+            delayed.order.market != *market
+                || delayed.order.outcome != outcome
+                || !Self::expired(&delayed.order, now_ms)
+        });
     }
 
     fn activate_delayed(&mut self, market: &MarketId, outcome: Outcome) {

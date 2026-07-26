@@ -8,7 +8,7 @@
 use pmkit_book::{OrderBookL2, Position, Side};
 use pmkit_core::MarketId;
 use pmkit_event::{MarketEvent, StrategyFact};
-use pmkit_exec::PlaceOrder;
+use pmkit_exec::{PlaceOrder, TimeInForce};
 use pmkit_market::Outcome;
 use pmkit_strategy::{Action, Actions, LogicalTimestamp, Strategy, StrategyContext, StrategyError};
 use rust_decimal::Decimal;
@@ -40,6 +40,7 @@ impl Strategy for MarketMaker {
             price: bid_price,
             qty: self.size,
             post_only: true,
+            tif: TimeInForce::Gtc,
         }));
         actions.push(Action::Place(PlaceOrder {
             market: context.market.clone(),
@@ -48,6 +49,7 @@ impl Strategy for MarketMaker {
             price: ask_price,
             qty: self.size,
             post_only: true,
+            tif: TimeInForce::Gtc,
         }));
         Ok(actions)
     }

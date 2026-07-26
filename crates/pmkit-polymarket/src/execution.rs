@@ -1,5 +1,7 @@
+use chrono::{DateTime, Utc};
 use pmkit_exec::{
     ExecError, ExecutionSnapshot, Executor, OrderId, OrderStatus, OrderStatusDetails, PlaceOrder,
+    TimeInForce,
 };
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::{Normal, Signer};
@@ -10,6 +12,27 @@ use polymarket_client_sdk_v2::clob::types::{OrderStatusType, OrderType};
 use polymarket_client_sdk_v2::error::{Error as SdkError, Kind, Status, StatusCode};
 
 use crate::{MarketTokens, venue_order_inputs};
+
+/// Polymarket enforces a one-minute security threshold on GTD expirations: an
+/// order meant to stop resting at `t` must be sent with expiration `t + 60s`.
+const GTD_SECURITY_BUFFER_MS: i64 = 60_000;
+
+/// Builds the SDK expiration datetime for a GTD order expiring at
+/// `expire_at_ms` (Unix epoch milliseconds).
+///
+/// The CLOB v2 backend expects the order `expiration` field in
+/// **milliseconds**, but SDK `0.6.0-canary.1` serializes
+/// `expiration.timestamp()` — whole seconds — verbatim, and the backend
+/// rejects a seconds value with HTTP 400 "invalid expiration value". Until
+/// the SDK is fixed, this forges a datetime whose seconds timestamp carries
+/// the millisecond value. Bumping the pinned SDK requires re-verifying this
+/// workaround first: an SDK that converts to milliseconds itself would
+/// multiply this value by 1000 again, silently producing an order that
+/// effectively never expires.
+fn gtd_expiration(expire_at_ms: i64) -> Option<DateTime<Utc>> {
+    let padded_ms = expire_at_ms.checked_add(GTD_SECURITY_BUFFER_MS)?;
+    DateTime::from_timestamp(padded_ms, 0)
+}
 
 /// Authenticated Polymarket CLOB order executor.
 #[derive(Debug)]
@@ -90,15 +113,25 @@ where
                     self.tokens.market()
                 ),
             })?;
-        let response = self
+        let builder = self
             .client
             .limit_order()
             .token_id(inputs.token_id)
             .side(inputs.side)
             .price(inputs.price)
             .size(inputs.size)
-            .post_only(inputs.post_only)
-            .order_type(OrderType::GTC)
+            .post_only(inputs.post_only);
+        let builder = match order.tif {
+            TimeInForce::Gtc => builder.order_type(OrderType::GTC),
+            TimeInForce::Gtd { expire_at_ms } => {
+                let expiration =
+                    gtd_expiration(expire_at_ms).ok_or_else(|| ExecError::Rejected {
+                        reason: format!("GTD expiration out of range: {expire_at_ms}"),
+                    })?;
+                builder.order_type(OrderType::GTD).expiration(expiration)
+            }
+        };
+        let response = builder
             .build_sign_and_post(&self.signer)
             .await
             .map_err(|error| exec_error(&error))?;
@@ -223,7 +256,7 @@ mod tests {
     use polymarket_client_sdk_v2::types::U256;
     use rust_decimal::Decimal;
 
-    use super::{PolymarketExecutor, exec_error};
+    use super::{GTD_SECURITY_BUFFER_MS, PolymarketExecutor, exec_error, gtd_expiration};
     use crate::MarketTokens;
 
     const PRIVATE_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -345,6 +378,29 @@ mod tests {
             other => return Err(format!("expected ambiguous status error, got {other:?}").into()),
         }
         Ok(())
+    }
+
+    #[test]
+    fn gtd_expiration_carries_the_millisecond_value_in_the_seconds_slot() {
+        // 2026-07-24T00:00:00Z as Unix milliseconds.
+        let expire_at_ms = 1_784_851_200_000_i64;
+        let expiration = gtd_expiration(expire_at_ms).expect("in range");
+
+        // The SDK serializes `timestamp()` (whole seconds) verbatim while the
+        // CLOB v2 backend reads milliseconds, so the forged datetime's seconds
+        // slot must hold the buffered millisecond value. If an SDK bump makes
+        // this assertion fail, the SDK now converts to milliseconds itself and
+        // the workaround must be removed, not kept: keeping it would produce
+        // orders that effectively never expire.
+        assert_eq!(
+            expiration.timestamp(),
+            expire_at_ms + GTD_SECURITY_BUFFER_MS
+        );
+    }
+
+    #[test]
+    fn gtd_expiration_rejects_out_of_range_values() {
+        assert!(gtd_expiration(i64::MAX).is_none());
     }
 
     #[test]
