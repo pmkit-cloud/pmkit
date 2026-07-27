@@ -7,7 +7,7 @@ use serde_json::json;
 use crate::{
     CacheChecksum, CausalDecision, CausalIdentity, IntentOutcome, OwnerScope, PM_ENVELOPE_VERSION,
     PmEnvelope, ReplayCursor, ReplayGapReason, ReplayItem, StoreError, TapeStore, TursoTapeStore,
-    export_replay_bundle,
+    export_market_segments, export_market_segments_with_artifacts, export_replay_bundle,
 };
 
 fn database_path(name: &str) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
@@ -516,6 +516,71 @@ async fn replay_bundle_gathers_manifest_evidence_and_decisions()
     let cache = bundle["cache_checksums"].as_array().ok_or("cache array")?;
     assert_eq!(cache.len(), 1);
     assert_eq!(cache[0]["sha256_hex"], "abc123");
+    store.delete_database()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn market_segment_export_is_cloud_compatible() -> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, path) = database_path("market-segments")?;
+    let scope = owner_scope("run")?;
+    let store = TursoTapeStore::open_local(&path).await?;
+    let mut envelope = envelope(scope.clone(), 1);
+    envelope.normalized = json!({"canonical_market_id": "token-1", "payload": {"price": "0.42"}});
+    envelope.source_timestamp_ms = 1_000;
+    store.store_envelope(&envelope).await?;
+
+    let bundle = export_market_segments(
+        &store,
+        &scope,
+        &json!({
+            "mode": "backtest", "portfolio": "paper", "run": "run"
+        }),
+    )
+    .await?;
+
+    assert_eq!(bundle["schema_version"], 1);
+    assert_eq!(bundle["segments"][0]["token_id"], "token-1");
+    assert_eq!(bundle["segments"][0]["from_ts_ms"], 1_000);
+    assert_eq!(bundle["segments"][0]["to_ts_ms"], 1_000);
+    assert_eq!(bundle["segments"][0]["rows"], 1);
+    assert!(bundle["segments"][0]["sha256"].as_str().is_some());
+    store.delete_database()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn market_segment_export_returns_uploadable_utc_day_bodies()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, path) = database_path("market-segment-bodies")?;
+    let scope = owner_scope("run")?;
+    let store = TursoTapeStore::open_local(&path).await?;
+    let mut first = envelope(scope.clone(), 1);
+    first.normalized = json!({"canonical_market_id": "token-1", "payload": {"price": "0.42"}});
+    first.source_timestamp_ms = 86_400_000;
+    let mut second = envelope(scope.clone(), 2);
+    second.normalized = first.normalized.clone();
+    second.source_timestamp_ms = 86_400_001;
+    store.store_envelope(&first).await?;
+    store.store_envelope(&second).await?;
+
+    let output = export_market_segments_with_artifacts(
+        &store,
+        &scope,
+        &json!({
+            "mode": "backtest", "portfolio": "paper", "run": "run"
+        }),
+    )
+    .await?;
+
+    assert_eq!(output.segments.len(), 1);
+    let segment = &output.segments[0];
+    assert_eq!(segment.declaration["from_ts_ms"], 86_400_000);
+    assert_eq!(segment.declaration["to_ts_ms"], 86_400_001);
+    assert_eq!(segment.declaration["rows"], 2);
+    assert_eq!(segment.declaration["bytes"], segment.bytes.len());
+    assert_eq!(output.manifest["segments"][0], segment.declaration);
+    assert_eq!(segment.bytes.split(|byte| *byte == b'\n').count() - 1, 2);
     store.delete_database()?;
     Ok(())
 }

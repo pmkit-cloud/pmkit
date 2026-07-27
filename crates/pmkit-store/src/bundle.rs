@@ -7,8 +7,10 @@
 //! non-UTF-8 raw frame so an exported bundle never claims incomplete or corrupt
 //! evidence.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
+use pmkit_core::RunId;
 use serde_json::{Value, json};
 
 use crate::{OwnerScope, ReplayItem, StoreError, TapeStore};
@@ -18,6 +20,179 @@ use crate::{OwnerScope, ReplayItem, StoreError, TapeStore};
 pub const REPLAY_BUNDLE_VERSION: u16 = 1;
 
 const EXPORT_PAGE_SIZE: usize = 512;
+const UTC_DAY_MS: i64 = 86_400_000;
+
+/// One uploadable, treated market/time segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializedMarketSegment {
+    /// Cloud catalog segment declaration.
+    pub declaration: Value,
+    /// Exact newline-delimited JSON bytes addressed by `declaration.sha256`.
+    pub bytes: Vec<u8>,
+}
+
+/// A Cloud-compatible manifest plus the segment bodies it declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializedMarketSegments {
+    /// Bundle manifest for the Cloud publication endpoint.
+    pub manifest: Value,
+    /// Bodies to upload using each segment's `artifact_key`.
+    pub segments: Vec<MaterializedMarketSegment>,
+}
+
+/// Materializes verified replay envelopes into deterministic, market-scoped
+/// JSONL segments and a Cloud-compatible segment manifest.
+///
+/// # Errors
+///
+/// Returns a storage error when the source contains a replay gap, an envelope
+/// without a market identity, or an invalid timestamp/serialization result.
+pub async fn export_market_segments(
+    store: &dyn TapeStore,
+    scope: &OwnerScope,
+    manifest: &Value,
+) -> Result<Value, StoreError> {
+    Ok(
+        export_market_segments_with_artifacts(store, scope, manifest)
+            .await?
+            .manifest,
+    )
+}
+
+/// Materializes verified replay envelopes into UTC-day, market-scoped JSONL
+/// segments and returns both their Cloud manifest and exact upload bodies.
+///
+/// # Errors
+///
+/// Returns a storage error when the source contains a replay gap, an envelope
+/// without a market identity, or an invalid timestamp/serialization result.
+pub async fn export_market_segments_with_artifacts(
+    store: &dyn TapeStore,
+    scope: &OwnerScope,
+    manifest: &Value,
+) -> Result<MaterializedMarketSegments, StoreError> {
+    let page_size = NonZeroUsize::new(EXPORT_PAGE_SIZE).unwrap_or(NonZeroUsize::MIN);
+    let mut segments: BTreeMap<(String, i64), Vec<Value>> = BTreeMap::new();
+    let mut cursor = None;
+
+    loop {
+        let page = store.read_envelopes(scope, cursor, page_size).await?;
+        for item in page.items {
+            match item {
+                ReplayItem::Envelope(envelope) => {
+                    let token_id = envelope.canonical_market_id().to_owned();
+                    if token_id.is_empty() {
+                        return Err(StoreError::Storage {
+                            message: format!(
+                                "market segment export cannot classify envelope at source_timestamp_ms {}",
+                                envelope.source_timestamp_ms
+                            ),
+                        });
+                    }
+                    if envelope.source_timestamp_ms < 0 {
+                        return Err(StoreError::Storage {
+                            message: format!(
+                                "market segment export cannot use negative source_timestamp_ms {}",
+                                envelope.source_timestamp_ms
+                            ),
+                        });
+                    }
+                    let day_start = envelope.source_timestamp_ms / UTC_DAY_MS * UTC_DAY_MS;
+                    segments
+                        .entry((token_id, day_start))
+                        .or_default()
+                        .push(json!({
+                            "source_timestamp_ms": envelope.source_timestamp_ms,
+                            "ingest_sequence": envelope.ingest_sequence,
+                            "source_id": envelope.source_id,
+                            "normalized": envelope.normalized,
+                        }));
+                }
+                ReplayItem::Gap(gap) => {
+                    return Err(StoreError::Storage {
+                        message: format!(
+                            "market segment export evidence gap at source_timestamp_ms {} ingest_sequence {}: {:?}",
+                            gap.source_timestamp_ms, gap.ingest_sequence, gap.reason
+                        ),
+                    });
+                }
+            }
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    let mut declared = Vec::new();
+    let mut materialized = Vec::new();
+    for ((token_id, day_start), rows) in segments {
+        let (declaration, content) =
+            materialize_segment(&scope.run_id, &token_id, day_start, &rows)?;
+        declared.push(declaration.clone());
+        materialized.push(MaterializedMarketSegment {
+            declaration,
+            bytes: content.into_bytes(),
+        });
+    }
+
+    Ok(MaterializedMarketSegments {
+        manifest: with_artifact_sha256(json!({
+        "schema_version": REPLAY_BUNDLE_VERSION,
+        "scope": {
+            "portfolio": scope.portfolio_id.to_string(),
+            "run": scope.run_id.to_string(),
+        },
+        "manifest": manifest.clone(),
+        "segments": declared,
+        })),
+        segments: materialized,
+    })
+}
+
+fn materialize_segment(
+    run_id: &RunId,
+    token_id: &str,
+    day_start: i64,
+    rows: &[Value],
+) -> Result<(Value, String), StoreError> {
+    let content = rows
+        .iter()
+        .map(|row| {
+            serde_json::to_string(row)
+                .map(|line| format!("{line}\n"))
+                .map_err(|error| StoreError::Storage {
+                    message: error.to_string(),
+                })
+        })
+        .collect::<Result<String, _>>()?;
+    let from_ts_ms = rows
+        .first()
+        .and_then(|row| row["source_timestamp_ms"].as_i64())
+        .ok_or_else(|| StoreError::Storage {
+            message: "segment has no lower bound".into(),
+        })?;
+    let to_ts_ms = rows
+        .last()
+        .and_then(|row| row["source_timestamp_ms"].as_i64())
+        .ok_or_else(|| StoreError::Storage {
+            message: "segment has no upper bound".into(),
+        })?;
+    let segment_id = format!("{run_id}-{token_id}-{day_start}");
+    Ok((
+        json!({
+            "segment_id": segment_id,
+            "token_id": token_id,
+            "artifact_key": format!("segments/{token_id}/{segment_id}.jsonl"),
+            "from_ts_ms": from_ts_ms,
+            "to_ts_ms": to_ts_ms,
+            "rows": rows.len(),
+            "bytes": content.len(),
+            "sha256": crate::integrity::sha256_hex(content.as_bytes()),
+        }),
+        content,
+    ))
+}
 
 /// A verified CEX archive checksum recorded alongside a replay bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -24,6 +24,7 @@ use thiserror::Error;
 mod bundle;
 mod chain;
 mod chain_store;
+mod cloud_publish;
 mod decoder;
 mod finalized_store;
 mod integrity;
@@ -50,9 +51,13 @@ mod record_version_tests;
 #[cfg(test)]
 mod chain_tests;
 
-pub use bundle::{CacheChecksum, REPLAY_BUNDLE_VERSION, export_replay_bundle};
+pub use bundle::{
+    CacheChecksum, MaterializedMarketSegment, MaterializedMarketSegments, REPLAY_BUNDLE_VERSION,
+    export_market_segments, export_market_segments_with_artifacts, export_replay_bundle,
+};
 pub use chain::{Address, AddressError, ChainId, ContractRegistry, LegacyV1Contracts};
 pub use chain_store::CanonicalLogStore;
+pub use cloud_publish::{CloudPublishError, CloudPublishProgress, CloudPublisher};
 pub use decoder::{DecodeError, decode_raw_log};
 pub use finalized_store::ingest_finalized_batch;
 pub use log::{
