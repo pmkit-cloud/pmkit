@@ -36,7 +36,7 @@ changes until `0.1.0` stabilizes.
 | [`pmkit-paper`](crates/pmkit-paper) | `PaperExecutor` implementing the executor trait over the sim engine. |
 | [`pmkit-spec`](crates/pmkit-spec) | Run specs: `BacktestRun`/`PaperRun`/`LiveRun`/`RunSpec`/`ReplaySpec`. |
 | [`pmkit-tape`](crates/pmkit-tape) | Local JSON-lines user-tape sink for market events and envelope serialization. |
-| [`pmkit-store`](crates/pmkit-store) | Durable Turso-backed `TapeStore` for lossless PM envelopes, causal decisions, and idempotent order intents, plus versioned replay-bundle export. |
+| [`pmkit-store`](crates/pmkit-store) | Durable Turso-backed `TapeStore` for lossless PM envelopes, causal decisions, and idempotent order intents, plus versioned replay-bundle and Cloud market-segment export. |
 | [`pmkit`](crates/pmkit) | Orchestration engine: `Pmkit` builder, `AppHandle`, deterministic feed merge, causal recording, and the backtest/paper/live drivers. |
 | [`pmkit-polymarket`](crates/pmkit-polymarket) | Polymarket venue adapter: live WebSocket data, authenticated CLOB execution, raw frame interception, and neutral/venue mapping. |
 | [`pmkit-collector`](crates/pmkit-collector) | Reliable OSS raw-frame collector: reconnect, subscription sharding, bounded-channel backpressure, heartbeat, and graceful shutdown over a `RawTapeSink`, with a `tokio-tungstenite` transport. |
@@ -189,6 +189,30 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+### Publishing treated market segments
+
+The publisher never sends raw tape. It materializes verified envelopes into
+UTC-day, market-scoped JSONL segments, then publishes the manifest and uploads
+the exact digest-checked segment bodies:
+
+```sh
+cargo run -p pmkit-store --example publish_market_segments
+```
+
+The example is a dry run unless both variables are set:
+
+```sh
+PMKIT_CLOUD_URL=https://pmkit.cloud \
+PMKIT_STORAGE_TOKEN=... \
+cargo run -p pmkit-store --example publish_market_segments
+```
+
+Publication is idempotent by bundle ID. If a segment upload fails after the
+manifest is accepted, rerun the same command with the same bundle ID; the
+manifest is reused and deterministic segment PUTs complete the missing bodies.
+The publisher validates every segment's byte count and SHA-256 before making
+the first request.
 
 ## License
 
