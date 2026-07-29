@@ -1,10 +1,11 @@
 use pmkit_exec::{
     ExecError, ExecutionSnapshot, Executor, OrderId, OrderStatus, OrderStatusDetails, PlaceOrder,
 };
+use pmkit_market::Outcome;
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::{Normal, Signer};
 use polymarket_client_sdk_v2::clob::Client;
-use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
+use polymarket_client_sdk_v2::clob::types::request::{OrderBookSummaryRequest, OrdersRequest};
 use polymarket_client_sdk_v2::clob::types::response::OpenOrderResponse;
 use polymarket_client_sdk_v2::clob::types::{OrderStatusType, OrderType};
 use polymarket_client_sdk_v2::error::{Error as SdkError, Kind, Status, StatusCode};
@@ -49,6 +50,34 @@ impl<S> PolymarketExecutor<S> {
     pub const fn with_min_order_size(mut self, min_order_size: Decimal) -> Self {
         self.min_order_size = Some(min_order_size);
         self
+    }
+
+    /// Resolves the venue minimum order size from the market's own metadata
+    /// and stores it for submission-time enforcement.
+    ///
+    /// This is the recommended setup path: it cannot drift from the venue and
+    /// cannot be forgotten the way a manual [`Self::with_min_order_size`] can
+    /// (an unconfigured executor silently falls back to the venue's opaque
+    /// 400 rejection). The value is read from the CLOB book summary
+    /// (`min_order_size`, in shares) of the Up outcome token; Polymarket
+    /// publishes one minimum per market, so both outcome tokens carry the
+    /// same value.
+    ///
+    /// # Errors
+    ///
+    /// Returns the mapped [`ExecError`] when the book metadata cannot be
+    /// fetched; construction should fail loudly rather than run unguarded.
+    pub async fn with_resolved_min_order_size(mut self) -> Result<Self, ExecError> {
+        let request = OrderBookSummaryRequest::builder()
+            .token_id(self.tokens.token(Outcome::Up))
+            .build();
+        let book = self
+            .client
+            .order_book(&request)
+            .await
+            .map_err(|error| exec_error(&error))?;
+        self.min_order_size = Some(book.min_order_size);
+        Ok(self)
     }
 
     async fn snapshot(&self) -> Result<ExecutionSnapshot, ExecError>
@@ -454,6 +483,68 @@ mod tests {
 
         let tiny = sized_order(Decimal::ONE)?;
         assert!(ensure_min_order_size(&tiny, None).is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolved_minimum_from_book_metadata_guards_submissions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Given a venue publishing a five-share minimum in its book summary.
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0_u8; 4096];
+            let Ok(read) = stream.read(&mut request) else {
+                return;
+            };
+            if !String::from_utf8_lossy(&request[..read]).starts_with("GET /book") {
+                return;
+            }
+            let body = r#"{
+                "market":"0x0000000000000000000000000000000000000000000000000000000000000001",
+                "asset_id":"1",
+                "timestamp":"0",
+                "bids":[],
+                "asks":[],
+                "min_order_size":"5",
+                "neg_risk":false,
+                "tick_size":"0.01"
+            }"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes());
+            let _ = stream.flush();
+        });
+
+        let signer = LocalSigner::from_str(PRIVATE_KEY)?.with_chain_id(Some(POLYGON));
+        let credentials = Credentials::new(
+            Uuid::nil(),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            "fixture-passphrase".to_owned(),
+        );
+        let client = Client::new(&format!("http://{address}"), Config::default())?
+            .authentication_builder(&signer)
+            .credentials(credentials)
+            .authenticate()
+            .await?;
+        let tokens = MarketTokens::new(MarketId::new("fixture")?, U256::from(1), U256::from(2));
+
+        // When the executor resolves its minimum at construction.
+        let executor = PolymarketExecutor::new(client, signer, tokens)
+            .with_resolved_min_order_size()
+            .await?;
+
+        // Then a sub-minimum order is rejected locally, before any submission.
+        let order = sized_order(Decimal::from(3))?;
+        let Err(ExecError::Rejected { reason }) = executor.submit(&order, 0).await else {
+            return Err("expected a typed rejection".into());
+        };
+        assert!(reason.contains("below the venue minimum of 5 shares"));
         Ok(())
     }
 }
