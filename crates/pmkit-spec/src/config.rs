@@ -20,6 +20,10 @@ pub struct ConservativeV1Config {
     /// sub-minimum orders are rejected instead of filled. Unset skips the
     /// check.
     pub min_order_size: Option<Decimal>,
+    /// Venue price increment: valid prices are multiples of it inside
+    /// `[tick, 1 - tick]`; off-grid orders are rejected instead of filled.
+    /// Unset skips the check.
+    pub tick_size: Option<Decimal>,
 }
 
 impl ConservativeV1Config {

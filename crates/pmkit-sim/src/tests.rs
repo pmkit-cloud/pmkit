@@ -388,3 +388,38 @@ fn sub_minimum_order_never_reaches_the_book() -> Result<(), Box<dyn std::error::
     assert!(engine.submit(&at_min, 0).is_some());
     Ok(())
 }
+
+#[test]
+fn off_tick_price_never_reaches_the_book() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = SimEngine::with_config(
+        "paper",
+        0,
+        MarketCategory::Crypto,
+        SimulationConfig {
+            tick_size: Some(Decimal::new(1, 2)),
+            ..SimulationConfig::default()
+        },
+    );
+    let market = MarketId::new("btc-5m")?;
+    engine.update_book(&market, Outcome::Up, ask_book());
+
+    // A crossing taker priced between grid points is refused like the venue
+    // would refuse to quote it.
+    let off_grid = order(Side::Buy, Decimal::new(505, 3), false)?;
+    assert!(engine.submit(&off_grid, 0).is_none());
+    assert!(engine.drain_fills().is_empty());
+
+    // An off-grid maker never rests either.
+    let off_grid_maker = order(Side::Buy, Decimal::new(455, 3), true)?;
+    assert!(engine.submit(&off_grid_maker, 0).is_none());
+    assert_eq!(engine.resting_count(), 0);
+
+    // Out-of-bounds grid multiples are refused: no venue quotes 0 or 1.
+    let too_high = order(Side::Buy, Decimal::ONE, false)?;
+    assert!(engine.submit(&too_high, 0).is_none());
+
+    // An on-grid price trades normally.
+    let on_grid = order(Side::Buy, Decimal::new(50, 2), false)?;
+    assert!(engine.submit(&on_grid, 0).is_some());
+    Ok(())
+}

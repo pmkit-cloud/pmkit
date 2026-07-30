@@ -167,6 +167,7 @@ mod tests {
                 market_impact_bps: 0,
                 fee_model: None,
                 min_order_size: None,
+                tick_size: None,
             },
         );
         assert!(matches!(

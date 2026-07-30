@@ -135,6 +135,7 @@ pub async fn drive_with_control(
         market_impact_bps: simulation.market_impact_bps,
         fee_model: Some(simulation.resolved_fee_model()),
         min_order_size: simulation.min_order_size,
+        tick_size: simulation.tick_size,
     };
     let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
     let paper = if let Some(store) = store {
@@ -622,6 +623,7 @@ mod ledger_tests {
             market_impact_bps: 0,
             fee_model: None,
             min_order_size: None,
+            tick_size: None,
         };
         let (fill_tx, _fill_rx) = mpsc::channel(32);
         let paper =

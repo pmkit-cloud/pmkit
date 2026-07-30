@@ -75,6 +75,10 @@ pub struct SimulationConfig {
     /// executors reject smaller orders the way the venue would. Unset skips
     /// the check.
     pub min_order_size: Option<Decimal>,
+    /// Venue price increment: valid prices are multiples of it inside
+    /// `[tick, 1 - tick]`. Off-grid orders are refused the way the venue
+    /// would refuse them instead of filling. Unset skips the check.
+    pub tick_size: Option<Decimal>,
 }
 
 /// A conservative fill-simulation engine shared by paper and backtest modes.
@@ -172,7 +176,10 @@ impl SimEngine {
         strategy: Option<StrategyId>,
         now_ms: i64,
     ) -> Option<OrderId> {
-        if Self::expired(order, now_ms) || self.below_min_order_size(order) {
+        if Self::expired(order, now_ms)
+            || self.below_min_order_size(order)
+            || self.off_tick_grid(order)
+        {
             return None;
         }
         let order_id = self.next_order_id();
@@ -398,6 +405,18 @@ impl SimEngine {
         self.config
             .min_order_size
             .is_some_and(|min_order_size| order.qty < min_order_size)
+    }
+
+    /// True when the config sets a venue tick and the price is off its grid.
+    /// Valid venue prices are multiples of the tick inside `[tick, 1 - tick]`;
+    /// a book-crossing fill at an off-grid price reports an edge the venue
+    /// would refuse to quote.
+    fn off_tick_grid(&self, order: &PlaceOrder) -> bool {
+        self.config.tick_size.is_some_and(|tick_size| {
+            order.price < tick_size
+                || order.price > Decimal::ONE - tick_size
+                || !(order.price % tick_size).is_zero()
+        })
     }
 
     fn next_order_id(&self) -> String {

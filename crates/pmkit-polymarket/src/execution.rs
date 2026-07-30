@@ -43,41 +43,45 @@ pub struct PolymarketExecutor<S> {
     signer: S,
     tokens: MarketTokens,
     min_order_size: Decimal,
+    tick_size: Decimal,
 }
 
 impl<S> PolymarketExecutor<S> {
-    /// Creates an executor whose venue minimum order size is already known.
+    /// Creates an executor whose venue market limits are already known.
     ///
-    /// Prefer [`Self::connect`], which reads the value from the venue itself.
-    /// Polymarket publishes this as `orderMinSize` on market metadata (Gamma
+    /// Prefer [`Self::connect`], which reads both values from the venue
+    /// itself. Polymarket publishes `orderMinSize` on market metadata (Gamma
     /// and CLOB), and the unit is **shares**, not a dollar notional: reading
     /// 5 shares as $5 and dividing by a $0.45 price turns the minimum into
     /// 12 shares, silently starving any strategy whose size cap sits between
-    /// the two.
+    /// the two. `tick_size` is the market's price increment: valid prices
+    /// are multiples of it inside `[tick, 1 - tick]`.
     #[must_use]
-    pub const fn with_min_order_size(
+    pub const fn with_market_limits(
         client: Client<Authenticated<Normal>>,
         signer: S,
         tokens: MarketTokens,
         min_order_size: Decimal,
+        tick_size: Decimal,
     ) -> Self {
         Self {
             client,
             signer,
             tokens,
             min_order_size,
+            tick_size,
         }
     }
 
-    /// Creates an executor, reading the venue minimum order size (shares)
-    /// from the market's own book metadata.
+    /// Creates an executor, reading the venue market limits — minimum order
+    /// size (shares) and price tick — from the market's own book metadata.
     ///
-    /// The minimum is not optional: no executor exists without one, so the
-    /// guard can neither drift from the venue nor be forgotten and leave
-    /// submissions falling back to the venue's opaque 400 rejection. The
-    /// value is read from the CLOB book summary (`min_order_size`, in shares)
-    /// of the Up outcome token; Polymarket publishes one minimum per market,
-    /// so both outcome tokens carry the same value.
+    /// The limits are not optional: no executor exists without them, so the
+    /// guards can neither drift from the venue nor be forgotten and leave
+    /// submissions falling back to the venue's opaque 400 rejection. Both
+    /// values come from one CLOB book summary (`min_order_size` in shares,
+    /// `tick_size`) of the Up outcome token; Polymarket publishes one set of
+    /// limits per market, so both outcome tokens carry the same values.
     ///
     /// # Errors
     ///
@@ -100,6 +104,7 @@ impl<S> PolymarketExecutor<S> {
             signer,
             tokens,
             min_order_size: book.min_order_size,
+            tick_size: book.tick_size.as_decimal(),
         })
     }
 
@@ -152,6 +157,7 @@ where
 
     async fn submit(&self, order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
         ensure_min_order_size(order, self.min_order_size)?;
+        ensure_price_on_tick(order, self.tick_size)?;
         let inputs =
             venue_order_inputs(order, &self.tokens).ok_or_else(|| ExecError::Rejected {
                 reason: format!(
@@ -243,6 +249,23 @@ fn ensure_min_order_size(order: &PlaceOrder, min_order_size: Decimal) -> Result<
     Ok(())
 }
 
+/// Rejects a price off the venue tick grid locally with a typed error,
+/// instead of letting the venue answer with an opaque 400. Valid Polymarket
+/// prices are multiples of the market tick inside `[tick, 1 - tick]`.
+fn ensure_price_on_tick(order: &PlaceOrder, tick_size: Decimal) -> Result<(), ExecError> {
+    let max_price = Decimal::ONE - tick_size;
+    if order.price < tick_size || order.price > max_price || !(order.price % tick_size).is_zero() {
+        return Err(ExecError::Rejected {
+            reason: format!(
+                "price {} is off the venue tick grid: prices are multiples of {tick_size} within \
+                 [{tick_size}, {max_price}]",
+                order.price
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn order_status(order_id: &OrderId, order: &OpenOrderResponse) -> Result<OrderStatus, ExecError> {
     let details = OrderStatusDetails {
         filled_qty: Some(order.size_matched),
@@ -321,8 +344,8 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::{
-        GTD_SECURITY_BUFFER_MS, PolymarketExecutor, ensure_min_order_size, exec_error,
-        gtd_expiration,
+        GTD_SECURITY_BUFFER_MS, PolymarketExecutor, ensure_min_order_size, ensure_price_on_tick,
+        exec_error, gtd_expiration,
     };
     use crate::MarketTokens;
 
@@ -375,11 +398,12 @@ mod tests {
     ) -> Result<impl Executor, Box<dyn std::error::Error>> {
         let signer = test_signer()?;
         let client = authenticated_client(address, &signer).await?;
-        Ok(PolymarketExecutor::with_min_order_size(
+        Ok(PolymarketExecutor::with_market_limits(
             client,
             signer,
             fixture_tokens()?,
             Decimal::ONE,
+            Decimal::new(1, 2),
         ))
     }
 
@@ -724,6 +748,58 @@ mod tests {
             return Err("expected a typed rejection".into());
         };
         assert!(reason.contains("below the venue minimum of 5 shares"));
+        Ok(())
+    }
+
+    #[test]
+    fn off_tick_price_rejected_with_grid_semantics() -> Result<(), Box<dyn std::error::Error>> {
+        let tick_size = Decimal::new(1, 2);
+        let mut order = sized_order(Decimal::from(10))?;
+
+        // 0.455 sits between the 0.01 grid points.
+        order.price = Decimal::new(455, 3);
+        let Err(ExecError::Rejected { reason }) = ensure_price_on_tick(&order, tick_size) else {
+            return Err("expected a typed rejection".into());
+        };
+        assert!(reason.contains("off the venue tick grid"));
+
+        // The bounds are exclusive of 0 and 1 even though both sit on the grid.
+        order.price = Decimal::ZERO;
+        assert!(ensure_price_on_tick(&order, tick_size).is_err());
+        order.price = Decimal::ONE;
+        assert!(ensure_price_on_tick(&order, tick_size).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn on_grid_prices_pass_including_boundaries() -> Result<(), Box<dyn std::error::Error>> {
+        let tick_size = Decimal::new(1, 2);
+        let mut order = sized_order(Decimal::from(10))?;
+        for cents in [1_i64, 50, 99] {
+            order.price = Decimal::new(cents, 2);
+            assert!(ensure_price_on_tick(&order, tick_size).is_ok());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolved_tick_from_book_metadata_guards_submissions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Given a venue publishing a one-cent tick in its book summary.
+        let (address, _posted) = spawn_order_capture_server()?;
+        let signer = test_signer()?;
+        let client = authenticated_client(address, &signer).await?;
+        let executor = PolymarketExecutor::connect(client, signer, fixture_tokens()?).await?;
+
+        // When an off-grid price is submitted (size clears the minimum).
+        let mut order = sized_order(Decimal::from(10))?;
+        order.price = Decimal::new(455, 3);
+
+        // Then it is rejected locally, before any submission.
+        let Err(ExecError::Rejected { reason }) = executor.submit(&order, 0).await else {
+            return Err("expected a typed rejection".into());
+        };
+        assert!(reason.contains("off the venue tick grid"));
         Ok(())
     }
 }

@@ -315,6 +315,7 @@ impl PaperExecutor {
                 last_timestamp_ms,
             } = &mut *state;
             ensure_min_order_size(order, config)?;
+            ensure_price_on_tick(order, config)?;
             let (placement_id, expected_order_id) = ledger
                 .begin_order(order, Some(strategy.clone()), now_ms)
                 .map_err(|error| execution_error(&error))?;
@@ -385,6 +386,27 @@ fn ensure_min_order_size(order: &PlaceOrder, config: &SimulationConfig) -> Resul
     }
 }
 
+/// Rejects a price off the venue tick grid before it reaches the ledger or
+/// the book, mirroring the venue refusing to quote it. Valid venue prices are
+/// multiples of the tick inside `[tick, 1 - tick]`; a paper run that fills
+/// off-grid prices reports an edge the live venue cannot execute.
+fn ensure_price_on_tick(order: &PlaceOrder, config: &SimulationConfig) -> Result<(), ExecError> {
+    let Some(tick_size) = config.tick_size else {
+        return Ok(());
+    };
+    let max_price = Decimal::ONE - tick_size;
+    if order.price < tick_size || order.price > max_price || !(order.price % tick_size).is_zero() {
+        return Err(ExecError::Rejected {
+            reason: format!(
+                "price {} is off the venue tick grid: prices are multiples of {tick_size} within \
+                 [{tick_size}, {max_price}]",
+                order.price
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Executor for PaperExecutor {
     async fn preflight(&self) -> Result<ExecutionSnapshot, ExecError> {
@@ -405,6 +427,7 @@ impl Executor for PaperExecutor {
                 last_timestamp_ms,
             } = &mut *state;
             ensure_min_order_size(order, config)?;
+            ensure_price_on_tick(order, config)?;
             let (placement_id, expected_order_id) = ledger
                 .begin_order(order, None, now_ms)
                 .map_err(|error| execution_error(&error))?;
@@ -642,6 +665,57 @@ mod tests {
 
         // At the minimum the order trades normally.
         order.qty = Decimal::from(5);
+        paper.submit(&order, 100).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn off_tick_price_is_rejected_before_the_ledger() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (tx, _rx) = mpsc::channel(8);
+        let paper = PaperExecutor::with_config(
+            tx,
+            "paper",
+            MarketCategory::Crypto,
+            SimulationConfig {
+                tick_size: Some(Decimal::new(1, 2)),
+                ..SimulationConfig::default()
+            },
+        );
+        let market = MarketId::new("btc-5m")?;
+        paper
+            .update_book(
+                &market,
+                Outcome::Up,
+                OrderBookL2 {
+                    bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+                    asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
+                    timestamp_ms: 0,
+                    last_trade_price: None,
+                },
+            )
+            .await?;
+        paper.drain_ledger();
+
+        let mut order = PlaceOrder {
+            market,
+            outcome: Outcome::Up,
+            side: Side::Buy,
+            price: Decimal::new(505, 3),
+            qty: Decimal::from(10),
+            post_only: false,
+            tif: TimeInForce::Gtc,
+        };
+        let Err(ExecError::Rejected { reason }) = paper.submit(&order, 100).await else {
+            return Err("expected a typed rejection".into());
+        };
+        assert!(reason.contains("off the venue tick grid"));
+        // The rejection happens before the ledger: an off-grid price the
+        // venue would refuse leaves no durable trace to replay.
+        assert!(paper.pending_ledger_entry().is_none());
+
+        // On the grid the order trades normally.
+        order.price = Decimal::new(50, 2);
         paper.submit(&order, 100).await?;
         Ok(())
     }
