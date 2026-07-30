@@ -314,8 +314,7 @@ impl PaperExecutor {
                 config,
                 last_timestamp_ms,
             } = &mut *state;
-            ensure_min_order_size(order, config)?;
-            ensure_price_on_tick(order, config)?;
+            ensure_market_limits(order, config)?;
             let (placement_id, expected_order_id) = ledger
                 .begin_order(order, Some(strategy.clone()), now_ms)
                 .map_err(|error| execution_error(&error))?;
@@ -371,40 +370,19 @@ impl PaperExecutor {
     }
 }
 
-/// Rejects an order below the venue minimum before it reaches the ledger or
-/// the book, mirroring the venue rejecting it server-side. A paper run that
-/// fills sub-minimum orders reports an edge the live venue would refuse.
-fn ensure_min_order_size(order: &PlaceOrder, config: &SimulationConfig) -> Result<(), ExecError> {
-    match config.min_order_size {
-        Some(min_order_size) if order.qty < min_order_size => Err(ExecError::Rejected {
-            reason: format!(
-                "order size {} is below the venue minimum of {min_order_size} shares",
-                order.qty
-            ),
-        }),
-        _ => Ok(()),
-    }
-}
-
-/// Rejects a price off the venue tick grid before it reaches the ledger or
-/// the book, mirroring the venue refusing to quote it. Valid venue prices are
-/// multiples of the tick inside `[tick, 1 - tick]`; a paper run that fills
-/// off-grid prices reports an edge the live venue cannot execute.
-fn ensure_price_on_tick(order: &PlaceOrder, config: &SimulationConfig) -> Result<(), ExecError> {
-    let Some(tick_size) = config.tick_size else {
-        return Ok(());
-    };
-    let max_price = Decimal::ONE - tick_size;
-    if order.price < tick_size || order.price > max_price || !(order.price % tick_size).is_zero() {
-        return Err(ExecError::Rejected {
-            reason: format!(
-                "price {} is off the venue tick grid: prices are multiples of {tick_size} within \
-                 [{tick_size}, {max_price}]",
-                order.price
-            ),
-        });
-    }
-    Ok(())
+/// Rejects an order that violates the venue market limits before it reaches
+/// the ledger or the book, mirroring the venue rejecting it server-side. A
+/// paper run that fills such orders reports an edge the live venue would
+/// refuse; the rule itself lives in [`pmkit_exec::MarketLimits::check`], so
+/// paper cannot drift from what live enforces.
+fn ensure_market_limits(order: &PlaceOrder, config: &SimulationConfig) -> Result<(), ExecError> {
+    config.market_limits.map_or(Ok(()), |limits| {
+        limits
+            .check(order)
+            .map_err(|violation| ExecError::Rejected {
+                reason: violation.to_string(),
+            })
+    })
 }
 
 #[async_trait]
@@ -426,8 +404,7 @@ impl Executor for PaperExecutor {
                 config,
                 last_timestamp_ms,
             } = &mut *state;
-            ensure_min_order_size(order, config)?;
-            ensure_price_on_tick(order, config)?;
+            ensure_market_limits(order, config)?;
             let (placement_id, expected_order_id) = ledger
                 .begin_order(order, None, now_ms)
                 .map_err(|error| execution_error(&error))?;
@@ -535,7 +512,7 @@ mod tests {
     use pmkit_book::{OrderBookL2, Side};
     use pmkit_core::MarketId;
     use pmkit_event::{Liquidity, MarketEvent};
-    use pmkit_exec::{ExecError, Executor, PlaceOrder, TimeInForce};
+    use pmkit_exec::{ExecError, Executor, MarketLimits, PlaceOrder, TimeInForce};
     use pmkit_market::Outcome;
     use pmkit_sim::{MarketCategory, SimulationConfig};
     use rust_decimal::Decimal;
@@ -627,7 +604,10 @@ mod tests {
             "paper",
             MarketCategory::Crypto,
             SimulationConfig {
-                min_order_size: Some(Decimal::from(5)),
+                market_limits: Some(MarketLimits {
+                    min_order_size: Decimal::from(5),
+                    tick_size: Decimal::new(1, 2),
+                }),
                 ..SimulationConfig::default()
             },
         );
@@ -678,7 +658,10 @@ mod tests {
             "paper",
             MarketCategory::Crypto,
             SimulationConfig {
-                tick_size: Some(Decimal::new(1, 2)),
+                market_limits: Some(MarketLimits {
+                    min_order_size: Decimal::ONE,
+                    tick_size: Decimal::new(1, 2),
+                }),
                 ..SimulationConfig::default()
             },
         );

@@ -130,8 +130,7 @@ fn simulation() -> ConservativeV1Config {
         slippage_bps: 0,
         market_impact_bps: 0,
         fee_model: None,
-        min_order_size: None,
-        tick_size: None,
+        market_limits: None,
     }
 }
 

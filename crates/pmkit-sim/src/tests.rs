@@ -2,7 +2,7 @@ use super::{FeeModel, MarketCategory, SimEngine, SimulationConfig};
 use pmkit_book::{OrderBookL2, Side};
 use pmkit_core::MarketId;
 use pmkit_event::{Liquidity, MarketEvent};
-use pmkit_exec::{PlaceOrder, TimeInForce};
+use pmkit_exec::{MarketLimits, PlaceOrder, TimeInForce};
 use pmkit_market::Outcome;
 use rust_decimal::Decimal;
 
@@ -363,7 +363,10 @@ fn sub_minimum_order_never_reaches_the_book() -> Result<(), Box<dyn std::error::
         0,
         MarketCategory::Crypto,
         SimulationConfig {
-            min_order_size: Some(Decimal::from(5)),
+            market_limits: Some(MarketLimits {
+                min_order_size: Decimal::from(5),
+                tick_size: Decimal::new(1, 2),
+            }),
             ..SimulationConfig::default()
         },
     );
@@ -396,7 +399,10 @@ fn off_tick_price_never_reaches_the_book() -> Result<(), Box<dyn std::error::Err
         0,
         MarketCategory::Crypto,
         SimulationConfig {
-            tick_size: Some(Decimal::new(1, 2)),
+            market_limits: Some(MarketLimits {
+                min_order_size: Decimal::ONE,
+                tick_size: Decimal::new(1, 2),
+            }),
             ..SimulationConfig::default()
         },
     );

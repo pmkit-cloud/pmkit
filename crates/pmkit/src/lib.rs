@@ -177,6 +177,10 @@ impl RunMetrics {
         self.rejected.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn add_rejected(&self, rejected: usize) {
+        self.rejected.fetch_add(rejected, Ordering::Relaxed);
+    }
+
     pub(crate) fn reconnect(&self) {
         self.reconnects.fetch_add(1, Ordering::Relaxed);
     }

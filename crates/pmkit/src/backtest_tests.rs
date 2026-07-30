@@ -256,8 +256,7 @@ fn backtest_run() -> Result<BacktestRun, Box<dyn std::error::Error>> {
             slippage_bps: 0,
             market_impact_bps: 0,
             fee_model: None,
-            min_order_size: None,
-            tick_size: None,
+            market_limits: None,
         },
     )
     .strategy(StrategyRegistration::new(
@@ -341,8 +340,7 @@ async fn feed_gap_counted_and_still_aborts() -> Result<(), Box<dyn std::error::E
             slippage_bps: 0,
             market_impact_bps: 0,
             fee_model: None,
-            min_order_size: None,
-            tick_size: None,
+            market_limits: None,
         },
     );
 
@@ -474,8 +472,7 @@ async fn backtest_clears_exposure_when_book_loses_its_mark()
             slippage_bps: 0,
             market_impact_bps: 0,
             fee_model: None,
-            min_order_size: None,
-            tick_size: None,
+            market_limits: None,
         },
     )
     .strategy(StrategyRegistration::new(
@@ -518,8 +515,7 @@ async fn two_market_positions_isolated() -> Result<(), Box<dyn std::error::Error
             slippage_bps: 0,
             market_impact_bps: 0,
             fee_model: None,
-            min_order_size: None,
-            tick_size: None,
+            market_limits: None,
         },
     )
     .strategy(StrategyRegistration::new(
@@ -597,8 +593,7 @@ async fn backtest_records_one_decision_per_book_event() -> Result<(), Box<dyn st
             slippage_bps: 0,
             market_impact_bps: 0,
             fee_model: None,
-            min_order_size: None,
-            tick_size: None,
+            market_limits: None,
         },
     )
     .strategy(StrategyRegistration::new(

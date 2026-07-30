@@ -79,8 +79,7 @@ pub async fn drive_with_control(
         slippage_bps: simulation.slippage_bps,
         market_impact_bps: simulation.market_impact_bps,
         fee_model: Some(simulation.resolved_fee_model()),
-        min_order_size: simulation.min_order_size,
-        tick_size: simulation.tick_size,
+        market_limits: simulation.market_limits,
     };
     let mut sim = SimEngine::with_fee_config("bt", 0, simulation_config);
     let mut positions_by_market: HashMap<MarketId, Vec<pmkit_book::Position>> = HashMap::new();
@@ -163,16 +162,18 @@ pub async fn drive_with_control(
             sim.update_book(market, *outcome, book.clone());
             let drained = sim.drain_fills();
             metrics.add_fills(absorb_market_fills(&drained, &mut positions_by_market));
-            let (added, actions_placed, decisions) = run_strategies(&mut RunStrategiesInputs {
-                strategies: &mut strategies,
-                market,
-                outcome: *outcome,
-                book: &book,
-                positions_by_market: &mut positions_by_market,
-                timestamp_ms: *timestamp_ms,
-                sim: &mut sim,
-            });
+            let (added, actions_placed, rejected, decisions) =
+                run_strategies(&mut RunStrategiesInputs {
+                    strategies: &mut strategies,
+                    market,
+                    outcome: *outcome,
+                    book: &book,
+                    positions_by_market: &mut positions_by_market,
+                    timestamp_ms: *timestamp_ms,
+                    sim: &mut sim,
+                });
             metrics.add_fills(added);
+            metrics.add_rejected(rejected);
             metrics.add_decisions(decisions);
             if let Some(store) = store {
                 let identity = CausalIdentity {
@@ -288,9 +289,10 @@ struct RunStrategiesInputs<'a> {
     sim: &'a mut SimEngine,
 }
 
-fn run_strategies(inputs: &mut RunStrategiesInputs<'_>) -> (usize, u32, usize) {
+fn run_strategies(inputs: &mut RunStrategiesInputs<'_>) -> (usize, u32, usize, usize) {
     let mut fills = 0;
     let mut actions_placed = 0_u32;
+    let mut rejected = 0_usize;
     let mut decisions = 0;
     for instance in inputs.strategies.iter_mut() {
         if instance.market != *inputs.market {
@@ -317,17 +319,27 @@ fn run_strategies(inputs: &mut RunStrategiesInputs<'_>) -> (usize, u32, usize) {
         if let Ok(actions) = instance.strategy.on_event(context) {
             for action in actions.as_slice() {
                 if let Action::Place(order) = action {
-                    inputs
+                    // The engine returns None for orders it refuses — venue
+                    // limit violations, expired GTDs, unfillable takers.
+                    // Counting them as placed would move the optimistic bias
+                    // off the fill and onto the report: N placements, zero
+                    // fills, and no reason why.
+                    if inputs
                         .sim
-                        .submit_for_strategy(order, instance.id.clone(), inputs.timestamp_ms);
-                    actions_placed = actions_placed.saturating_add(1);
+                        .submit_for_strategy(order, instance.id.clone(), inputs.timestamp_ms)
+                        .is_some()
+                    {
+                        actions_placed = actions_placed.saturating_add(1);
+                    } else {
+                        rejected += 1;
+                    }
                 }
             }
         }
         let drained = inputs.sim.drain_fills();
         fills += absorb_market_fills(&drained, inputs.positions_by_market);
     }
-    (fills, actions_placed, decisions)
+    (fills, actions_placed, rejected, decisions)
 }
 
 #[cfg(test)]
@@ -403,8 +415,7 @@ mod tests {
                 slippage_bps: 0,
                 market_impact_bps: 0,
                 fee_model: None,
-                min_order_size: None,
-                tick_size: None,
+                market_limits: None,
             },
         ))
     }

@@ -90,8 +90,7 @@ async fn simulated_decision_records_timing_and_model_inputs()
         slippage_bps: 20,
         market_impact_bps: 30,
         fee_model: Some(FeeModel::try_new(-100, 200)?),
-        min_order_size: None,
-        tick_size: None,
+        market_limits: None,
     };
     CausalRecorder::new(&store)
         .record_evaluation(

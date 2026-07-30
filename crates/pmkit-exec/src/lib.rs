@@ -88,6 +88,74 @@ pub struct PlaceOrder {
     pub tif: TimeInForce,
 }
 
+/// Venue market limits enforced before an order reaches a book or the venue.
+///
+/// This is the single definition of the limit rules: live, paper and backtest
+/// all call [`MarketLimits::check`], so parity between modes is guaranteed by
+/// construction instead of by keeping copies in sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarketLimits {
+    /// Minimum order size in **shares** (Polymarket `orderMinSize`), not a
+    /// dollar notional: reading 5 shares as $5 and dividing by the price
+    /// inflates the minimum and silently starves the strategy.
+    pub min_order_size: Decimal,
+    /// Venue price increment: valid prices are multiples of it inside
+    /// `[tick, 1 - tick]`.
+    pub tick_size: Decimal,
+}
+
+impl MarketLimits {
+    /// Checks an order against the venue limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns the violated limit; callers map it to their rejection channel.
+    pub fn check(&self, order: &PlaceOrder) -> Result<(), LimitViolation> {
+        if order.qty < self.min_order_size {
+            return Err(LimitViolation::BelowMinOrderSize {
+                qty: order.qty,
+                min_order_size: self.min_order_size,
+            });
+        }
+        let max_price = Decimal::ONE - self.tick_size;
+        if order.price < self.tick_size
+            || order.price > max_price
+            || !(order.price % self.tick_size).is_zero()
+        {
+            return Err(LimitViolation::OffTickGrid {
+                price: order.price,
+                tick_size: self.tick_size,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A venue market limit an order violates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum LimitViolation {
+    /// The order is smaller than the venue minimum.
+    #[error("order size {qty} is below the venue minimum of {min_order_size} shares")]
+    BelowMinOrderSize {
+        /// The rejected order size, in shares.
+        qty: Decimal,
+        /// The venue minimum, in shares.
+        min_order_size: Decimal,
+    },
+    /// The price is off the venue tick grid or outside its bounds.
+    #[error(
+        "price {price} is off the venue tick grid: prices are multiples of {tick_size} within \
+         [{tick_size}, {max_price}]",
+        max_price = Decimal::ONE - *tick_size
+    )]
+    OffTickGrid {
+        /// The rejected limit price.
+        price: Decimal,
+        /// The venue price increment.
+        tick_size: Decimal,
+    },
+}
+
 /// An execution error.
 #[derive(Debug, Error)]
 pub enum ExecError {
@@ -192,7 +260,10 @@ pub trait Executor: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder, TimeInForce};
+    use super::{
+        ExecError, ExecutionSnapshot, Executor, LimitViolation, MarketLimits, OrderId, PlaceOrder,
+        TimeInForce,
+    };
     use pmkit_book::Side;
     use pmkit_core::MarketId;
     use pmkit_market::Outcome;
@@ -252,6 +323,64 @@ mod tests {
         );
         exec.cancel_batch(&ids).await?;
         exec.cancel_all().await?;
+        Ok(())
+    }
+
+    fn limits() -> MarketLimits {
+        MarketLimits {
+            min_order_size: Decimal::from(5),
+            tick_size: Decimal::new(1, 2),
+        }
+    }
+
+    #[test]
+    fn sub_minimum_order_violates_with_shares_semantics() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut small = order()?;
+        small.qty = Decimal::from(3);
+        let Err(violation) = limits().check(&small) else {
+            return Err("expected a violation".into());
+        };
+        assert!(matches!(
+            violation,
+            LimitViolation::BelowMinOrderSize { .. }
+        ));
+        assert!(
+            violation
+                .to_string()
+                .contains("below the venue minimum of 5 shares")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn off_tick_price_violates_with_grid_semantics() -> Result<(), Box<dyn std::error::Error>> {
+        let mut off_grid = order()?;
+
+        // 0.455 sits between the 0.01 grid points.
+        off_grid.price = Decimal::new(455, 3);
+        let Err(violation) = limits().check(&off_grid) else {
+            return Err("expected a violation".into());
+        };
+        assert!(matches!(violation, LimitViolation::OffTickGrid { .. }));
+        assert!(violation.to_string().contains("off the venue tick grid"));
+
+        // The bounds are exclusive of 0 and 1 even though both sit on the grid.
+        off_grid.price = Decimal::ZERO;
+        assert!(limits().check(&off_grid).is_err());
+        off_grid.price = Decimal::ONE;
+        assert!(limits().check(&off_grid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn conforming_orders_pass_including_boundaries() -> Result<(), Box<dyn std::error::Error>> {
+        let mut conforming = order()?;
+        conforming.qty = Decimal::from(5);
+        for cents in [1_i64, 50, 99] {
+            conforming.price = Decimal::new(cents, 2);
+            assert!(limits().check(&conforming).is_ok());
+        }
         Ok(())
     }
 }
