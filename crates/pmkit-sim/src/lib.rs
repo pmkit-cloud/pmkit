@@ -71,6 +71,10 @@ pub struct SimulationConfig {
     pub market_impact_bps: u16,
     /// Optional fee override; unset preserves the selected category's legacy fees.
     pub fee_model: Option<FeeModel>,
+    /// Venue minimum order size in **shares** (Polymarket `orderMinSize`);
+    /// executors reject smaller orders the way the venue would. Unset skips
+    /// the check.
+    pub min_order_size: Option<Decimal>,
 }
 
 /// A conservative fill-simulation engine shared by paper and backtest modes.
@@ -168,7 +172,7 @@ impl SimEngine {
         strategy: Option<StrategyId>,
         now_ms: i64,
     ) -> Option<OrderId> {
-        if Self::expired(order, now_ms) {
+        if Self::expired(order, now_ms) || self.below_min_order_size(order) {
             return None;
         }
         let order_id = self.next_order_id();
@@ -385,6 +389,15 @@ impl SimEngine {
             }
         }
         self.delayed = remaining;
+    }
+
+    /// True when the config sets a venue minimum and the order is smaller.
+    /// The minimum is in shares (Polymarket `orderMinSize`), not a notional:
+    /// dividing it by the price inflates the threshold and starves the run.
+    fn below_min_order_size(&self, order: &PlaceOrder) -> bool {
+        self.config
+            .min_order_size
+            .is_some_and(|min_order_size| order.qty < min_order_size)
     }
 
     fn next_order_id(&self) -> String {

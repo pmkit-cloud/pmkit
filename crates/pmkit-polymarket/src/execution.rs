@@ -3,13 +3,15 @@ use pmkit_exec::{
     ExecError, ExecutionSnapshot, Executor, OrderId, OrderStatus, OrderStatusDetails, PlaceOrder,
     TimeInForce,
 };
+use pmkit_market::Outcome;
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::{Normal, Signer};
 use polymarket_client_sdk_v2::clob::Client;
-use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
+use polymarket_client_sdk_v2::clob::types::request::{OrderBookSummaryRequest, OrdersRequest};
 use polymarket_client_sdk_v2::clob::types::response::OpenOrderResponse;
 use polymarket_client_sdk_v2::clob::types::{OrderStatusType, OrderType};
 use polymarket_client_sdk_v2::error::{Error as SdkError, Kind, Status, StatusCode};
+use rust_decimal::Decimal;
 
 use crate::{MarketTokens, venue_order_inputs};
 
@@ -40,21 +42,65 @@ pub struct PolymarketExecutor<S> {
     client: Client<Authenticated<Normal>>,
     signer: S,
     tokens: MarketTokens,
+    min_order_size: Decimal,
 }
 
 impl<S> PolymarketExecutor<S> {
-    /// Creates an executor from an authenticated SDK client and its signer.
+    /// Creates an executor whose venue minimum order size is already known.
+    ///
+    /// Prefer [`Self::connect`], which reads the value from the venue itself.
+    /// Polymarket publishes this as `orderMinSize` on market metadata (Gamma
+    /// and CLOB), and the unit is **shares**, not a dollar notional: reading
+    /// 5 shares as $5 and dividing by a $0.45 price turns the minimum into
+    /// 12 shares, silently starving any strategy whose size cap sits between
+    /// the two.
     #[must_use]
-    pub const fn new(
+    pub const fn with_min_order_size(
         client: Client<Authenticated<Normal>>,
         signer: S,
         tokens: MarketTokens,
+        min_order_size: Decimal,
     ) -> Self {
         Self {
             client,
             signer,
             tokens,
+            min_order_size,
         }
+    }
+
+    /// Creates an executor, reading the venue minimum order size (shares)
+    /// from the market's own book metadata.
+    ///
+    /// The minimum is not optional: no executor exists without one, so the
+    /// guard can neither drift from the venue nor be forgotten and leave
+    /// submissions falling back to the venue's opaque 400 rejection. The
+    /// value is read from the CLOB book summary (`min_order_size`, in shares)
+    /// of the Up outcome token; Polymarket publishes one minimum per market,
+    /// so both outcome tokens carry the same value.
+    ///
+    /// # Errors
+    ///
+    /// Returns the mapped [`ExecError`] when the book metadata cannot be
+    /// fetched; construction fails loudly rather than running unguarded.
+    pub async fn connect(
+        client: Client<Authenticated<Normal>>,
+        signer: S,
+        tokens: MarketTokens,
+    ) -> Result<Self, ExecError> {
+        let request = OrderBookSummaryRequest::builder()
+            .token_id(tokens.token(Outcome::Up))
+            .build();
+        let book = client
+            .order_book(&request)
+            .await
+            .map_err(|error| exec_error(&error))?;
+        Ok(Self {
+            client,
+            signer,
+            tokens,
+            min_order_size: book.min_order_size,
+        })
     }
 
     async fn snapshot(&self) -> Result<ExecutionSnapshot, ExecError>
@@ -105,6 +151,7 @@ where
     }
 
     async fn submit(&self, order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
+        ensure_min_order_size(order, self.min_order_size)?;
         let inputs =
             venue_order_inputs(order, &self.tokens).ok_or_else(|| ExecError::Rejected {
                 reason: format!(
@@ -182,6 +229,20 @@ where
     }
 }
 
+/// Rejects a sub-minimum order locally with a typed error carrying the
+/// shares semantics, instead of letting the venue answer with an opaque 400.
+fn ensure_min_order_size(order: &PlaceOrder, min_order_size: Decimal) -> Result<(), ExecError> {
+    if order.qty < min_order_size {
+        return Err(ExecError::Rejected {
+            reason: format!(
+                "order size {} is below the venue minimum of {min_order_size} shares",
+                order.qty
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn order_status(order_id: &OrderId, order: &OpenOrderResponse) -> Result<OrderStatus, ExecError> {
     let details = OrderStatusDetails {
         filled_qty: Some(order.size_matched),
@@ -252,33 +313,74 @@ mod tests {
     use pmkit_exec::{ExecError, Executor, OrderId, OrderStatus, PlaceOrder, TimeInForce};
     use pmkit_market::Outcome;
     use polymarket_client_sdk_v2::POLYGON;
-    use polymarket_client_sdk_v2::auth::{Credentials, LocalSigner, Signer as _, Uuid};
+    use polymarket_client_sdk_v2::auth::state::Authenticated;
+    use polymarket_client_sdk_v2::auth::{Credentials, LocalSigner, Normal, Signer, Uuid};
     use polymarket_client_sdk_v2::clob::{Client, Config};
     use polymarket_client_sdk_v2::error::{Error as SdkError, Kind, Method, StatusCode};
     use polymarket_client_sdk_v2::types::U256;
     use rust_decimal::Decimal;
 
-    use super::{GTD_SECURITY_BUFFER_MS, PolymarketExecutor, exec_error, gtd_expiration};
+    use super::{
+        GTD_SECURITY_BUFFER_MS, PolymarketExecutor, ensure_min_order_size, exec_error,
+        gtd_expiration,
+    };
     use crate::MarketTokens;
 
     const PRIVATE_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
-    async fn executor_at(
+    /// A CLOB book summary publishing a five-share venue minimum.
+    const BOOK_SUMMARY: &str = r#"{
+        "market":"0x0000000000000000000000000000000000000000000000000000000000000001",
+        "asset_id":"1",
+        "timestamp":"0",
+        "bids":[],
+        "asks":[],
+        "min_order_size":"5",
+        "neg_risk":false,
+        "tick_size":"0.01"
+    }"#;
+
+    fn test_signer() -> Result<impl Signer + Send + Sync, Box<dyn std::error::Error>> {
+        Ok(LocalSigner::from_str(PRIVATE_KEY)?.with_chain_id(Some(POLYGON)))
+    }
+
+    fn fixture_tokens() -> Result<MarketTokens, Box<dyn std::error::Error>> {
+        Ok(MarketTokens::new(
+            MarketId::new("fixture")?,
+            U256::from(1),
+            U256::from(2),
+        ))
+    }
+
+    async fn authenticated_client<S: Signer + Sync>(
         address: std::net::SocketAddr,
-    ) -> Result<impl Executor, Box<dyn std::error::Error>> {
-        let signer = LocalSigner::from_str(PRIVATE_KEY)?.with_chain_id(Some(POLYGON));
+        signer: &S,
+    ) -> Result<Client<Authenticated<Normal>>, Box<dyn std::error::Error>> {
         let credentials = Credentials::new(
             Uuid::nil(),
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
             "fixture-passphrase".to_owned(),
         );
-        let client = Client::new(&format!("http://{address}"), Config::default())?
-            .authentication_builder(&signer)
-            .credentials(credentials)
-            .authenticate()
-            .await?;
-        let tokens = MarketTokens::new(MarketId::new("fixture")?, U256::from(1), U256::from(2));
-        Ok(PolymarketExecutor::new(client, signer, tokens))
+        Ok(
+            Client::new(&format!("http://{address}"), Config::default())?
+                .authentication_builder(signer)
+                .credentials(credentials)
+                .authenticate()
+                .await?,
+        )
+    }
+
+    async fn executor_at(
+        address: std::net::SocketAddr,
+    ) -> Result<impl Executor, Box<dyn std::error::Error>> {
+        let signer = test_signer()?;
+        let client = authenticated_client(address, &signer).await?;
+        Ok(PolymarketExecutor::with_min_order_size(
+            client,
+            signer,
+            fixture_tokens()?,
+            Decimal::ONE,
+        ))
     }
 
     async fn fixture_executor(body: String) -> Result<impl Executor, Box<dyn std::error::Error>> {
@@ -348,8 +450,9 @@ mod tests {
         Some((request_line, body))
     }
 
-    /// Serves every endpoint `build_sign_and_post` touches (`version`,
-    /// `tick-size`, `neg-risk`) and captures the body posted to `/order`.
+    /// Serves every endpoint the adapter touches (`version`, `tick-size`,
+    /// `neg-risk` for `build_sign_and_post`, `book` for the minimum-size
+    /// lookup) and captures the body posted to `/order`.
     fn spawn_order_capture_server()
     -> Result<(std::net::SocketAddr, std::sync::mpsc::Receiver<String>), Box<dyn std::error::Error>>
     {
@@ -368,6 +471,8 @@ mod tests {
                     http_response(r#"{"version":2}"#)
                 } else if request_line.starts_with("GET /tick-size") {
                     http_response(r#"{"minimum_tick_size":"0.01"}"#)
+                } else if request_line.starts_with("GET /book") {
+                    http_response(BOOK_SUMMARY)
                 } else if request_line.starts_with("GET /neg-risk") {
                     http_response(r#"{"neg_risk":false}"#)
                 } else if request_line.starts_with("POST /order") {
@@ -469,10 +574,13 @@ mod tests {
     }
 
     #[test]
-    fn gtd_expiration_carries_the_millisecond_value_in_the_seconds_slot() {
+    fn gtd_expiration_carries_the_millisecond_value_in_the_seconds_slot()
+    -> Result<(), Box<dyn std::error::Error>> {
         // 2026-07-24T00:00:00Z as Unix milliseconds.
         let expire_at_ms = 1_784_851_200_000_i64;
-        let expiration = gtd_expiration(expire_at_ms).expect("in range");
+        let Some(expiration) = gtd_expiration(expire_at_ms) else {
+            return Err("expected an in-range expiration".into());
+        };
 
         // The SDK serializes `timestamp()` (whole seconds) verbatim while the
         // CLOB v2 backend reads milliseconds, so the forged datetime's seconds
@@ -484,6 +592,7 @@ mod tests {
             expiration.timestamp(),
             expire_at_ms + GTD_SECURITY_BUFFER_MS
         );
+        Ok(())
     }
 
     #[test]
@@ -565,5 +674,56 @@ mod tests {
         assert!(matches!(rejected, ExecError::Rejected { .. }));
         assert!(matches!(server, ExecError::Transport { .. }));
         assert!(matches!(timeout, ExecError::Transport { .. }));
+    }
+
+    fn sized_order(qty: Decimal) -> Result<PlaceOrder, Box<dyn std::error::Error>> {
+        Ok(PlaceOrder {
+            market: MarketId::new("fixture")?,
+            outcome: Outcome::Up,
+            side: Side::Buy,
+            price: Decimal::new(50, 2),
+            qty,
+            post_only: false,
+            tif: TimeInForce::Gtc,
+        })
+    }
+
+    #[test]
+    fn sub_minimum_order_rejected_locally_with_shares_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let order = sized_order(Decimal::from(3))?;
+        let Err(ExecError::Rejected { reason }) = ensure_min_order_size(&order, Decimal::from(5))
+        else {
+            return Err("expected a typed rejection".into());
+        };
+        assert!(reason.contains("below the venue minimum of 5 shares"));
+        Ok(())
+    }
+
+    #[test]
+    fn at_minimum_passes() -> Result<(), Box<dyn std::error::Error>> {
+        let at_minimum = sized_order(Decimal::from(5))?;
+        assert!(ensure_min_order_size(&at_minimum, Decimal::from(5)).is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolved_minimum_from_book_metadata_guards_submissions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Given a venue publishing a five-share minimum in its book summary.
+        let (address, _posted) = spawn_order_capture_server()?;
+        let signer = test_signer()?;
+        let client = authenticated_client(address, &signer).await?;
+
+        // When the executor reads its minimum at construction.
+        let executor = PolymarketExecutor::connect(client, signer, fixture_tokens()?).await?;
+
+        // Then a sub-minimum order is rejected locally, before any submission.
+        let order = sized_order(Decimal::from(3))?;
+        let Err(ExecError::Rejected { reason }) = executor.submit(&order, 0).await else {
+            return Err("expected a typed rejection".into());
+        };
+        assert!(reason.contains("below the venue minimum of 5 shares"));
+        Ok(())
     }
 }

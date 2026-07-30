@@ -134,6 +134,7 @@ pub async fn drive_with_control(
         slippage_bps: simulation.slippage_bps,
         market_impact_bps: simulation.market_impact_bps,
         fee_model: Some(simulation.resolved_fee_model()),
+        min_order_size: simulation.min_order_size,
     };
     let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
     let paper = if let Some(store) = store {
@@ -620,6 +621,7 @@ mod ledger_tests {
             slippage_bps: 0,
             market_impact_bps: 0,
             fee_model: None,
+            min_order_size: None,
         };
         let (fill_tx, _fill_rx) = mpsc::channel(32);
         let paper =
@@ -630,17 +632,13 @@ mod ledger_tests {
         paper
             .update_book(&settled_market, Outcome::Up, book(0))
             .await?;
-        paper
-            .submit(
-                &order(
-                    settled_market.clone(),
-                    Decimal::new(60, 2),
-                    Decimal::from(2),
-                    false,
-                ),
-                0,
-            )
-            .await?;
+        let settled_order = order(
+            settled_market.clone(),
+            Decimal::new(60, 2),
+            Decimal::from(2),
+            false,
+        );
+        paper.submit(&settled_order, 0).await?;
         flush(&store, &scope, &paper).await?;
         paper
             .update_book(&settled_market, Outcome::Up, book(100))
@@ -659,17 +657,13 @@ mod ledger_tests {
         paper
             .update_book(&held_market, Outcome::Up, book(200))
             .await?;
-        paper
-            .submit(
-                &order(
-                    held_market.clone(),
-                    Decimal::new(60, 2),
-                    Decimal::from(3),
-                    false,
-                ),
-                200,
-            )
-            .await?;
+        let held_order = order(
+            held_market.clone(),
+            Decimal::new(60, 2),
+            Decimal::from(3),
+            false,
+        );
+        paper.submit(&held_order, 200).await?;
         flush(&store, &scope, &paper).await?;
         paper
             .update_book(&held_market, Outcome::Up, book(300))

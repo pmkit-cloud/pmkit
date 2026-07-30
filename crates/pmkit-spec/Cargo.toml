@@ -21,6 +21,7 @@ pmkit-data = { path = "../pmkit-data" }
 pmkit-exec = { path = "../pmkit-exec" }
 pmkit-run = { path = "../pmkit-run" }
 pmkit-sim = { path = "../pmkit-sim" }
+rust_decimal = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
