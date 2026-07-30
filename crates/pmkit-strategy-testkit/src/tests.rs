@@ -1,7 +1,7 @@
 use pmkit_book::Side;
 use pmkit_core::MarketId;
 use pmkit_event::{FillIdentity, Liquidity};
-use pmkit_exec::PlaceOrder;
+use pmkit_exec::{PlaceOrder, TimeInForce};
 use pmkit_market::{Asset, Exchange, Outcome};
 use pmkit_strategy::{Actions, Strategy, StrategyContext, StrategyError};
 use rust_decimal::Decimal;
@@ -26,6 +26,7 @@ impl Strategy for AskTaker {
             price: ask,
             qty: Decimal::ONE,
             post_only: false,
+            tif: TimeInForce::Gtc,
         }))
     }
 }

@@ -4,7 +4,7 @@ use std::{path::PathBuf, sync::Arc};
 use async_trait::async_trait;
 use pmkit_book::{OrderBookL2, Side};
 use pmkit_core::{MarketId, PortfolioId, RunId};
-use pmkit_exec::{ExecError, OrderId, PlaceOrder};
+use pmkit_exec::{ExecError, OrderId, PlaceOrder, TimeInForce};
 use pmkit_market::Outcome;
 use pmkit_sim::{FeeModel, SimulationConfig};
 use pmkit_store::{
@@ -59,6 +59,7 @@ fn order() -> Result<PlaceOrder, Box<dyn std::error::Error>> {
         price: Decimal::new(42, 2),
         qty: Decimal::from(10),
         post_only: true,
+        tif: TimeInForce::Gtc,
     })
 }
 

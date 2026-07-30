@@ -1590,7 +1590,7 @@ mod rate_limit_tests {
     use pmkit_event::MarketEvent;
     use pmkit_exec::{
         ExecError, ExecutionSnapshot, Executor, OrderId, OrderStatus, OrderStatusDetails,
-        PlaceOrder,
+        PlaceOrder, TimeInForce,
     };
     use pmkit_market::Outcome;
     use pmkit_runtime::StrategyRegistration;
@@ -1691,6 +1691,7 @@ mod rate_limit_tests {
                 price: Decimal::new(50, 2),
                 qty: Decimal::from(10),
                 post_only: false,
+                tif: TimeInForce::Gtc,
             }))
         }
     }

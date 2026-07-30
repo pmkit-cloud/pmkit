@@ -123,7 +123,7 @@ mod tests {
     use super::{MarketTokens, from_venue_side, to_venue_side, venue_order_inputs};
     use pmkit_book::Side;
     use pmkit_core::{EmptyIdError, MarketId};
-    use pmkit_exec::PlaceOrder;
+    use pmkit_exec::{PlaceOrder, TimeInForce};
     use pmkit_market::Outcome;
     use polymarket_client_sdk_v2::clob::types::Side as VenueSide;
     use polymarket_client_sdk_v2::types::U256;
@@ -169,6 +169,7 @@ mod tests {
             price: Decimal::new(55, 2),
             qty: Decimal::from(20),
             post_only: true,
+            tif: TimeInForce::Gtc,
         };
         let Some(inputs) = venue_order_inputs(&order, &tokens) else {
             return Err("expected matching market tokens".into());

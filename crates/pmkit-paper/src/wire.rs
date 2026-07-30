@@ -1,5 +1,6 @@
 use pmkit_book::Side;
 use pmkit_core::{MarketId, StrategyId};
+use pmkit_exec::TimeInForce;
 use pmkit_market::Outcome;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -73,6 +74,10 @@ struct WireOrder {
     price: Decimal,
     qty: Decimal,
     post_only: bool,
+    /// GTD expiry in Unix epoch milliseconds; absent means GTC. Optional so
+    /// records written before time-in-force existed still decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expire_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -294,6 +299,10 @@ impl From<&RecordedOrder> for WireOrder {
             price: order.price,
             qty: order.qty,
             post_only: order.post_only,
+            expire_at_ms: match order.tif {
+                TimeInForce::Gtc => None,
+                TimeInForce::Gtd { expire_at_ms } => Some(expire_at_ms),
+            },
         }
     }
 }
@@ -310,6 +319,11 @@ impl TryFrom<WireOrder> for RecordedOrder {
             price: order.price,
             qty: order.qty,
             post_only: order.post_only,
+            tif: order
+                .expire_at_ms
+                .map_or(TimeInForce::Gtc, |expire_at_ms| TimeInForce::Gtd {
+                    expire_at_ms,
+                }),
         })
     }
 }

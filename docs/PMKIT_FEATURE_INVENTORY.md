@@ -167,6 +167,9 @@ repository, not the long-term target.
 
 - Unified `Executor` boundary.
 - `PlaceOrder`, `OrderId`, execution snapshots, submit/cancel/cancel-all.
+- GTC/GTD time-in-force: the simulator expires resting GTD orders at their
+  deadline before any fill check, and the Polymarket adapter maps GTD with the
+  venue one-minute security buffer and the SDK milliseconds workaround.
 - Typed rejected/transport/not-found errors.
 - Conservative simulation:
   - takers walk the book;

@@ -8,7 +8,7 @@ use pmkit_book::Side;
 use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
 use pmkit_data::{DataSourceError, LiveDataSource, SourceSignal};
 use pmkit_event::{Liquidity, MarketEvent};
-use pmkit_exec::PlaceOrder;
+use pmkit_exec::{PlaceOrder, TimeInForce};
 use pmkit_market::Outcome;
 use pmkit_money::Money;
 use pmkit_runtime::{RiskLimits, StrategyRegistration};
@@ -90,6 +90,7 @@ impl Strategy for OrderAfterLoss {
             price: Decimal::ONE,
             qty: Decimal::ONE,
             post_only: false,
+            tif: TimeInForce::Gtc,
         }))
     }
 }
@@ -159,6 +160,7 @@ fn risk_gate_rejects_a_marked_loss_at_the_limit() -> Result<(), Box<dyn std::err
         price: Decimal::ONE,
         qty: Decimal::ONE,
         post_only: false,
+        tif: TimeInForce::Gtc,
     };
 
     assert_eq!(portfolio_pnl, Some(Decimal::new(-2, 0)));
@@ -191,6 +193,7 @@ fn risk_gate_enforces_order_and_position_notional() -> Result<(), Box<dyn std::e
         price: Decimal::ONE,
         qty: Decimal::from(qty),
         post_only: false,
+        tif: TimeInForce::Gtc,
     };
     assert!(live::passes_risk(
         &order(5),
@@ -234,6 +237,7 @@ fn aggregated_risk_enforces_portfolio_market_strategy_and_daily_limits()
         price: Decimal::ONE,
         qty: Decimal::from(2),
         post_only: false,
+        tif: TimeInForce::Gtc,
     };
     let exposure = |portfolio, market, strategy, daily_pnl| live::TestRiskExposure {
         portfolio_notional: Decimal::from(portfolio),

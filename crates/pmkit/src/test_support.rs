@@ -1,5 +1,5 @@
 use pmkit_book::Side;
-use pmkit_exec::PlaceOrder;
+use pmkit_exec::{PlaceOrder, TimeInForce};
 use pmkit_market::Outcome;
 use pmkit_money::Money;
 use pmkit_runtime::{RiskLimitOverrides, RiskLimits, RuntimeConfig, ShutdownConfig};
@@ -27,6 +27,7 @@ impl Strategy for BuyOnce {
             price: Decimal::new(50, 2),
             qty: Decimal::from(10),
             post_only: false,
+            tif: TimeInForce::Gtc,
         }))
     }
 }

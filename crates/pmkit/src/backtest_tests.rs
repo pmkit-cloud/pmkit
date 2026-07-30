@@ -57,6 +57,7 @@ impl Strategy for Taker {
             price,
             qty: Decimal::ONE,
             post_only: false,
+            tif: pmkit_exec::TimeInForce::Gtc,
         }))
     }
 }
