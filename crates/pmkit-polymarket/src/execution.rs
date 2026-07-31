@@ -81,10 +81,17 @@ impl<S> PolymarketExecutor<S> {
     ///
     /// The price tick is deliberately **not** captured here: unlike the
     /// minimum, a market's tick can change over its life, so
-    /// [`Executor::submit`] reads it per submission through the SDK's cached,
-    /// invalidation-aware `tick_size` lookup instead of holding a snapshot
-    /// that could go stale in either direction (rejecting quotable prices, or
-    /// letting off-grid ones reach the venue).
+    /// [`Executor::submit`] reads it per submission through the SDK's
+    /// `tick_size` lookup. Both this guard and the SDK's own order-builder
+    /// validation then read the same value, so the two cannot disagree.
+    ///
+    /// That does **not** yet make the guard follow a mid-life tick change: the
+    /// SDK's tick cache has no expiry and is only dropped by
+    /// `invalidate_internal_caches`, which nothing calls today. A long-lived
+    /// executor therefore keeps whichever tick it first observed, and the
+    /// venue's own rejection stays the backstop. See the note in
+    /// [`Executor::submit`] for the invalidation point to wire when live
+    /// trading is.
     ///
     /// # Errors
     ///
@@ -159,10 +166,18 @@ where
 
     async fn submit(&self, order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
         // The tick is read per submission rather than held from construction:
-        // a market's tick can change over its life, and the SDK caches this
-        // lookup per token (with `invalidate_internal_caches` as the staleness
-        // hook), so the guard follows the venue at no request cost on the hot
-        // path.
+        // a market's tick can change over its life. The SDK caches this lookup
+        // per token, so it costs no request on the hot path -- but that cache
+        // has no expiry and is only cleared by `invalidate_internal_caches`,
+        // which nothing calls yet, so a long-lived executor keeps the first
+        // tick it saw. Wire an invalidation point when live trading is wired
+        // up; a connection-epoch advance is the natural one.
+        //
+        // Do not reach for `clob_market_info` to read market metadata: it
+        // populates this same cache with `min_tick_size`, the market's floor
+        // rather than its current tick, and the first insert wins. A floor
+        // cached as the current tick makes this guard too permissive and puts
+        // off-grid prices back on the wire.
         let tick_size = self
             .client
             .tick_size(self.tokens.token(order.outcome))
