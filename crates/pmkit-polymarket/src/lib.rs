@@ -16,6 +16,11 @@ mod account;
 mod execution;
 mod historical;
 mod live;
+mod public_tape;
+mod public_tape_contract;
+
+#[cfg(test)]
+mod public_tape_tests;
 
 pub use account::PolymarketUserData;
 pub use execution::PolymarketExecutor;
@@ -24,6 +29,8 @@ pub use live::{
     PolymarketFrameAdapter, PolymarketLiveData, RawFrameAdapterError, RawPolymarketFrameAdapter,
     parse_market_frame,
 };
+pub use public_tape::{PublicTapeImportError, PublicTapeImportReport, PublicTapeImporter};
+pub use public_tape_contract::{certify_v2_public_market_input, certify_v2_public_market_source};
 
 /// Maps a neutral `PMKit` [`Side`] to the Polymarket venue side.
 #[must_use]
