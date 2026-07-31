@@ -12,8 +12,13 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[[bin]]
+name = "pmkit-cloud-publish"
+path = "src/bin/pmkit_cloud_publish.rs"
+
 [dependencies]
 async-trait = { workspace = true }
+chrono = { workspace = true }
 pmkit-core = { path = "../pmkit-core" }
 reqwest = { workspace = true }
 rust_decimal = { workspace = true }
