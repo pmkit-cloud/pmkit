@@ -162,7 +162,7 @@ async fn paper_run_drives_live_feed_to_fill() -> Result<(), Box<dyn std::error::
             slippage_bps: 0,
             market_impact_bps: 0,
             fee_model: None,
-            min_order_size: None,
+            market_limits: None,
         },
     )
     .strategy(StrategyRegistration::new(
@@ -203,7 +203,7 @@ async fn paper_run_rejects_mismatched_account_owner() -> Result<(), Box<dyn std:
             slippage_bps: 0,
             market_impact_bps: 0,
             fee_model: None,
-            min_order_size: None,
+            market_limits: None,
         },
     )
     .account_data(Arc::new(MismatchedAccountSource));
@@ -246,7 +246,7 @@ async fn paper_failure_retains_restored_fill_diagnostics() -> Result<(), Box<dyn
             slippage_bps: 0,
             market_impact_bps: 0,
             fee_model: None,
-            min_order_size: None,
+            market_limits: None,
         },
     )
     .strategy(StrategyRegistration::new(
@@ -272,7 +272,7 @@ async fn paper_failure_retains_restored_fill_diagnostics() -> Result<(), Box<dyn
             slippage_bps: 0,
             market_impact_bps: 0,
             fee_model: None,
-            min_order_size: None,
+            market_limits: None,
         },
     )
     .strategy(StrategyRegistration::new(
@@ -314,7 +314,7 @@ async fn paper_run_clears_exposure_when_book_loses_its_mark()
             slippage_bps: 0,
             market_impact_bps: 0,
             fee_model: None,
-            min_order_size: None,
+            market_limits: None,
         },
     )
     .strategy(StrategyRegistration::new(
@@ -355,7 +355,7 @@ async fn default_fee_unchanged() -> Result<(), Box<dyn std::error::Error>> {
             slippage_bps: 0,
             market_impact_bps: 0,
             fee_model: None,
-            min_order_size: None,
+            market_limits: None,
         },
     )
     .strategy(StrategyRegistration::new(

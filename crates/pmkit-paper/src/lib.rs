@@ -314,7 +314,7 @@ impl PaperExecutor {
                 config,
                 last_timestamp_ms,
             } = &mut *state;
-            ensure_min_order_size(order, config)?;
+            ensure_market_limits(order, config)?;
             let (placement_id, expected_order_id) = ledger
                 .begin_order(order, Some(strategy.clone()), now_ms)
                 .map_err(|error| execution_error(&error))?;
@@ -370,19 +370,19 @@ impl PaperExecutor {
     }
 }
 
-/// Rejects an order below the venue minimum before it reaches the ledger or
-/// the book, mirroring the venue rejecting it server-side. A paper run that
-/// fills sub-minimum orders reports an edge the live venue would refuse.
-fn ensure_min_order_size(order: &PlaceOrder, config: &SimulationConfig) -> Result<(), ExecError> {
-    match config.min_order_size {
-        Some(min_order_size) if order.qty < min_order_size => Err(ExecError::Rejected {
-            reason: format!(
-                "order size {} is below the venue minimum of {min_order_size} shares",
-                order.qty
-            ),
-        }),
-        _ => Ok(()),
-    }
+/// Rejects an order that violates the venue market limits before it reaches
+/// the ledger or the book, mirroring the venue rejecting it server-side. A
+/// paper run that fills such orders reports an edge the live venue would
+/// refuse; the rule itself lives in [`pmkit_exec::MarketLimits::check`], so
+/// paper cannot drift from what live enforces.
+fn ensure_market_limits(order: &PlaceOrder, config: &SimulationConfig) -> Result<(), ExecError> {
+    config.market_limits.map_or(Ok(()), |limits| {
+        limits
+            .check(order)
+            .map_err(|violation| ExecError::Rejected {
+                reason: violation.to_string(),
+            })
+    })
 }
 
 #[async_trait]
@@ -404,7 +404,7 @@ impl Executor for PaperExecutor {
                 config,
                 last_timestamp_ms,
             } = &mut *state;
-            ensure_min_order_size(order, config)?;
+            ensure_market_limits(order, config)?;
             let (placement_id, expected_order_id) = ledger
                 .begin_order(order, None, now_ms)
                 .map_err(|error| execution_error(&error))?;
@@ -512,7 +512,7 @@ mod tests {
     use pmkit_book::{OrderBookL2, Side};
     use pmkit_core::MarketId;
     use pmkit_event::{Liquidity, MarketEvent};
-    use pmkit_exec::{ExecError, Executor, PlaceOrder, TimeInForce};
+    use pmkit_exec::{ExecError, Executor, MarketLimits, PlaceOrder, TimeInForce};
     use pmkit_market::Outcome;
     use pmkit_sim::{MarketCategory, SimulationConfig};
     use rust_decimal::Decimal;
@@ -604,7 +604,10 @@ mod tests {
             "paper",
             MarketCategory::Crypto,
             SimulationConfig {
-                min_order_size: Some(Decimal::from(5)),
+                market_limits: Some(MarketLimits {
+                    min_order_size: Decimal::from(5),
+                    tick_size: Decimal::new(1, 2),
+                }),
                 ..SimulationConfig::default()
             },
         );
@@ -642,6 +645,60 @@ mod tests {
 
         // At the minimum the order trades normally.
         order.qty = Decimal::from(5);
+        paper.submit(&order, 100).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn off_tick_price_is_rejected_before_the_ledger() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (tx, _rx) = mpsc::channel(8);
+        let paper = PaperExecutor::with_config(
+            tx,
+            "paper",
+            MarketCategory::Crypto,
+            SimulationConfig {
+                market_limits: Some(MarketLimits {
+                    min_order_size: Decimal::ONE,
+                    tick_size: Decimal::new(1, 2),
+                }),
+                ..SimulationConfig::default()
+            },
+        );
+        let market = MarketId::new("btc-5m")?;
+        paper
+            .update_book(
+                &market,
+                Outcome::Up,
+                OrderBookL2 {
+                    bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+                    asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
+                    timestamp_ms: 0,
+                    last_trade_price: None,
+                },
+            )
+            .await?;
+        paper.drain_ledger();
+
+        let mut order = PlaceOrder {
+            market,
+            outcome: Outcome::Up,
+            side: Side::Buy,
+            price: Decimal::new(505, 3),
+            qty: Decimal::from(10),
+            post_only: false,
+            tif: TimeInForce::Gtc,
+        };
+        let Err(ExecError::Rejected { reason }) = paper.submit(&order, 100).await else {
+            return Err("expected a typed rejection".into());
+        };
+        assert!(reason.contains("off the venue tick grid"));
+        // The rejection happens before the ledger: an off-grid price the
+        // venue would refuse leaves no durable trace to replay.
+        assert!(paper.pending_ledger_entry().is_none());
+
+        // On the grid the order trades normally.
+        order.price = Decimal::new(50, 2);
         paper.submit(&order, 100).await?;
         Ok(())
     }

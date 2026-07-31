@@ -1,7 +1,7 @@
 use std::time::Duration;
 
+use pmkit_exec::MarketLimits;
 use pmkit_sim::{FeeModel, MarketCategory};
-use rust_decimal::Decimal;
 
 /// Configuration for the conservative-V1 fill model.
 #[derive(Debug, Clone)]
@@ -16,10 +16,10 @@ pub struct ConservativeV1Config {
     pub market_impact_bps: u16,
     /// Optional maker/taker fee override; unset preserves legacy Crypto fees.
     pub fee_model: Option<FeeModel>,
-    /// Venue minimum order size in **shares** (Polymarket `orderMinSize`);
-    /// sub-minimum orders are rejected instead of filled. Unset skips the
-    /// check.
-    pub min_order_size: Option<Decimal>,
+    /// Venue market limits (minimum order size in shares, price tick);
+    /// orders that violate them are rejected instead of filled. Unset skips
+    /// the checks.
+    pub market_limits: Option<MarketLimits>,
 }
 
 impl ConservativeV1Config {

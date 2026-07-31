@@ -10,6 +10,7 @@ use pmkit_event::{
     CexReferenceEnvelope, CexReferenceEvent, MarketEvent, PmMarketEnvelope, SourceEnvelope,
     StreamMetadata,
 };
+use pmkit_exec::MarketLimits;
 use pmkit_market::{Asset, Exchange, Outcome};
 use pmkit_money::Money;
 use pmkit_run::{EvidenceRequirement, RetrievalWait};
@@ -236,6 +237,12 @@ impl HistoricalDataSource for ScriptedHistory {
 }
 
 fn backtest_run() -> Result<BacktestRun, Box<dyn std::error::Error>> {
+    backtest_run_with_limits(None)
+}
+
+fn backtest_run_with_limits(
+    market_limits: Option<MarketLimits>,
+) -> Result<BacktestRun, Box<dyn std::error::Error>> {
     let replay = ReplaySpec::new(
         Arc::new(ScriptedHistory { ticks: vec![1, 2] }),
         "2026-01-01T00:00:00Z".parse()?,
@@ -256,7 +263,7 @@ fn backtest_run() -> Result<BacktestRun, Box<dyn std::error::Error>> {
             slippage_bps: 0,
             market_impact_bps: 0,
             fee_model: None,
-            min_order_size: None,
+            market_limits,
         },
     )
     .strategy(StrategyRegistration::new(
@@ -319,6 +326,33 @@ async fn metrics_match_report() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
+async fn venue_limit_refusal_is_counted_not_reported_as_placed()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: a backtest whose venue minimum sits above the only order the
+    // strategy places (ten shares at 0.50, itself on the tick grid).
+    let run = backtest_run_with_limits(Some(MarketLimits {
+        min_order_size: Decimal::from(50),
+        tick_size: Decimal::new(1, 2),
+    }))?;
+    let app = Pmkit::builder(config()?).run(run).start().await?;
+    let run_id = RunId::new("bt")?;
+
+    // When: the run completes.
+    let RunReport::Backtest(report) = app.wait_for(run_id.clone()).await? else {
+        return Err("expected a backtest report".into());
+    };
+
+    // Then: the engine's refusal is counted rather than silently dropped.
+    // Counting it as placed would move the optimistic bias off the fill and
+    // onto the report: one placement, zero fills, and no reason why.
+    assert_eq!(report.metrics.rejected, 1);
+    assert_eq!(report.fills, 0);
+    let metrics = app.metrics(&run_id).ok_or("missing run metrics")?;
+    assert_eq!(metrics.rejected, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn feed_gap_counted_and_still_aborts() -> Result<(), Box<dyn std::error::Error>> {
     // Given: a replay source that fails before producing an event.
     let replay = ReplaySpec::new(
@@ -340,7 +374,7 @@ async fn feed_gap_counted_and_still_aborts() -> Result<(), Box<dyn std::error::E
             slippage_bps: 0,
             market_impact_bps: 0,
             fee_model: None,
-            min_order_size: None,
+            market_limits: None,
         },
     );
 
@@ -472,7 +506,7 @@ async fn backtest_clears_exposure_when_book_loses_its_mark()
             slippage_bps: 0,
             market_impact_bps: 0,
             fee_model: None,
-            min_order_size: None,
+            market_limits: None,
         },
     )
     .strategy(StrategyRegistration::new(
@@ -515,7 +549,7 @@ async fn two_market_positions_isolated() -> Result<(), Box<dyn std::error::Error
             slippage_bps: 0,
             market_impact_bps: 0,
             fee_model: None,
-            min_order_size: None,
+            market_limits: None,
         },
     )
     .strategy(StrategyRegistration::new(
@@ -593,7 +627,7 @@ async fn backtest_records_one_decision_per_book_event() -> Result<(), Box<dyn st
             slippage_bps: 0,
             market_impact_bps: 0,
             fee_model: None,
-            min_order_size: None,
+            market_limits: None,
         },
     )
     .strategy(StrategyRegistration::new(

@@ -96,7 +96,7 @@ fn test_manifest(provenance: &Provenance) -> Result<serde_json::Value, Box<dyn s
             slippage_bps: 0,
             market_impact_bps: 0,
             fee_model: Some(pmkit_spec::FeeModel::try_new(-100, 200)?),
-            min_order_size: None,
+            market_limits: None,
         },
     )
     .strategy(StrategyRegistration::new(

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use pmkit_exec::{
-    ExecError, ExecutionSnapshot, Executor, OrderId, OrderStatus, OrderStatusDetails, PlaceOrder,
-    TimeInForce,
+    ExecError, ExecutionSnapshot, Executor, MarketLimits, OrderId, OrderStatus, OrderStatusDetails,
+    PlaceOrder, TimeInForce,
 };
 use pmkit_market::Outcome;
 use polymarket_client_sdk_v2::auth::state::Authenticated;
@@ -79,6 +79,20 @@ impl<S> PolymarketExecutor<S> {
     /// of the Up outcome token; Polymarket publishes one minimum per market,
     /// so both outcome tokens carry the same value.
     ///
+    /// The price tick is deliberately **not** captured here: unlike the
+    /// minimum, a market's tick can change over its life, so
+    /// [`Executor::submit`] reads it per submission through the SDK's
+    /// `tick_size` lookup. Both this guard and the SDK's own order-builder
+    /// validation then read the same value, so the two cannot disagree.
+    ///
+    /// That does **not** yet make the guard follow a mid-life tick change: the
+    /// SDK's tick cache has no expiry and is only dropped by
+    /// `invalidate_internal_caches`, which nothing calls today. A long-lived
+    /// executor therefore keeps whichever tick it first observed, and the
+    /// venue's own rejection stays the backstop. See the note in
+    /// [`Executor::submit`] for the invalidation point to wire when live
+    /// trading is.
+    ///
     /// # Errors
     ///
     /// Returns the mapped [`ExecError`] when the book metadata cannot be
@@ -151,7 +165,35 @@ where
     }
 
     async fn submit(&self, order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
-        ensure_min_order_size(order, self.min_order_size)?;
+        // The tick is read per submission rather than held from construction:
+        // a market's tick can change over its life. The SDK caches this lookup
+        // per token, so it costs no request on the hot path -- but that cache
+        // has no expiry and is only cleared by `invalidate_internal_caches`,
+        // which nothing calls yet, so a long-lived executor keeps the first
+        // tick it saw. Wire an invalidation point when live trading is wired
+        // up; a connection-epoch advance is the natural one.
+        //
+        // Do not reach for `clob_market_info` to read market metadata: it
+        // populates this same cache with `min_tick_size`, the market's floor
+        // rather than its current tick, and the first insert wins. A floor
+        // cached as the current tick makes this guard too permissive and puts
+        // off-grid prices back on the wire.
+        let tick_size = self
+            .client
+            .tick_size(self.tokens.token(order.outcome))
+            .await
+            .map_err(|error| exec_error(&error))?
+            .minimum_tick_size
+            .as_decimal();
+        let limits = MarketLimits {
+            min_order_size: self.min_order_size,
+            tick_size,
+        };
+        limits
+            .check(order)
+            .map_err(|violation| ExecError::Rejected {
+                reason: violation.to_string(),
+            })?;
         let inputs =
             venue_order_inputs(order, &self.tokens).ok_or_else(|| ExecError::Rejected {
                 reason: format!(
@@ -227,20 +269,6 @@ where
             })
         }
     }
-}
-
-/// Rejects a sub-minimum order locally with a typed error carrying the
-/// shares semantics, instead of letting the venue answer with an opaque 400.
-fn ensure_min_order_size(order: &PlaceOrder, min_order_size: Decimal) -> Result<(), ExecError> {
-    if order.qty < min_order_size {
-        return Err(ExecError::Rejected {
-            reason: format!(
-                "order size {} is below the venue minimum of {min_order_size} shares",
-                order.qty
-            ),
-        });
-    }
-    Ok(())
 }
 
 fn order_status(order_id: &OrderId, order: &OpenOrderResponse) -> Result<OrderStatus, ExecError> {
@@ -320,10 +348,7 @@ mod tests {
     use polymarket_client_sdk_v2::types::U256;
     use rust_decimal::Decimal;
 
-    use super::{
-        GTD_SECURITY_BUFFER_MS, PolymarketExecutor, ensure_min_order_size, exec_error,
-        gtd_expiration,
-    };
+    use super::{GTD_SECURITY_BUFFER_MS, PolymarketExecutor, exec_error, gtd_expiration};
     use crate::MarketTokens;
 
     const PRIVATE_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -688,25 +713,6 @@ mod tests {
         })
     }
 
-    #[test]
-    fn sub_minimum_order_rejected_locally_with_shares_semantics()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let order = sized_order(Decimal::from(3))?;
-        let Err(ExecError::Rejected { reason }) = ensure_min_order_size(&order, Decimal::from(5))
-        else {
-            return Err("expected a typed rejection".into());
-        };
-        assert!(reason.contains("below the venue minimum of 5 shares"));
-        Ok(())
-    }
-
-    #[test]
-    fn at_minimum_passes() -> Result<(), Box<dyn std::error::Error>> {
-        let at_minimum = sized_order(Decimal::from(5))?;
-        assert!(ensure_min_order_size(&at_minimum, Decimal::from(5)).is_ok());
-        Ok(())
-    }
-
     #[tokio::test]
     async fn resolved_minimum_from_book_metadata_guards_submissions()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -724,6 +730,29 @@ mod tests {
             return Err("expected a typed rejection".into());
         };
         assert!(reason.contains("below the venue minimum of 5 shares"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn per_submission_tick_lookup_guards_off_grid_prices()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Given a venue publishing a one-cent tick on its tick-size endpoint —
+        // the SDK-cached lookup submit() consults per order, so a mid-life
+        // tick change reaches the guard instead of a construction snapshot.
+        let (address, _posted) = spawn_order_capture_server()?;
+        let signer = test_signer()?;
+        let client = authenticated_client(address, &signer).await?;
+        let executor = PolymarketExecutor::connect(client, signer, fixture_tokens()?).await?;
+
+        // When an off-grid price is submitted (size clears the minimum).
+        let mut order = sized_order(Decimal::from(10))?;
+        order.price = Decimal::new(455, 3);
+
+        // Then it is rejected locally, before any submission.
+        let Err(ExecError::Rejected { reason }) = executor.submit(&order, 0).await else {
+            return Err("expected a typed rejection".into());
+        };
+        assert!(reason.contains("off the venue tick grid"));
         Ok(())
     }
 }
