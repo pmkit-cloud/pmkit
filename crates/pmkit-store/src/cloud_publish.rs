@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -16,13 +16,14 @@ pub enum CloudPublishError {
     #[error("cloud HTTP client configuration failed")]
     Client(#[from] reqwest::Error),
     /// Cloud rejected the publication or artifact upload.
-    #[error("cloud request failed with status {status}: {body}")]
+    #[error("cloud request failed with status {status}")]
     Http {
         /// HTTP status returned by Cloud.
         status: StatusCode,
-        /// Response body returned by Cloud.
-        body: String,
     },
+    /// The Cloud endpoint was not HTTPS or an explicit local development endpoint.
+    #[error("cloud publisher endpoint must use HTTPS or local HTTP")]
+    InvalidEndpoint,
     /// The materialized result did not contain the fields required to publish it.
     #[error("materialized segment is missing a declaration field")]
     InvalidMaterialization,
@@ -31,14 +32,33 @@ pub enum CloudPublishError {
 #[derive(Debug, Deserialize)]
 struct PublishResponse {
     release_id: String,
+    status: PublishStatus,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PublishStatus {
+    Staging,
+    Published,
 }
 
 /// Publishes a materialized bundle and uploads its exact declared segment bodies.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CloudPublisher {
     client: reqwest::Client,
     endpoint: String,
+    debug_endpoint: String,
     storage_token: String,
+}
+
+impl fmt::Debug for CloudPublisher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CloudPublisher")
+            .field("endpoint", &self.debug_endpoint)
+            .field("storage_token", &"[redacted]")
+            .finish_non_exhaustive()
+    }
 }
 
 /// Publication progress for one materialized segment.
@@ -55,6 +75,9 @@ pub struct CloudPublishProgress {
 impl CloudPublisher {
     /// Creates a publisher with a bounded HTTP timeout.
     ///
+    /// HTTPS endpoints are accepted. Local HTTP is accepted only for the
+    /// exact development hosts `localhost`, `127.0.0.1`, and `[::1]`.
+    ///
     /// # Errors
     ///
     /// Returns an error when the HTTP client cannot be configured.
@@ -62,11 +85,30 @@ impl CloudPublisher {
         endpoint: impl Into<String>,
         storage_token: impl Into<String>,
     ) -> Result<Self, CloudPublishError> {
+        let endpoint = endpoint.into();
+        let parsed =
+            reqwest::Url::parse(endpoint.trim()).map_err(|_| CloudPublishError::InvalidEndpoint)?;
+        let local_http = parsed.scheme() == "http"
+            && parsed
+                .host_str()
+                .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "[::1]"));
+        if parsed.scheme() != "https" && !local_http
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(CloudPublishError::InvalidEndpoint);
+        }
+        let mut debug_endpoint = parsed.clone();
+        debug_endpoint.set_query(None);
+        debug_endpoint.set_fragment(None);
         Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(REQUEST_TIMEOUT)
                 .build()?,
-            endpoint: endpoint.into().trim_end_matches('/').to_owned(),
+            endpoint: parsed.as_str().trim_end_matches('/').to_owned(),
+            debug_endpoint: debug_endpoint.as_str().trim_end_matches('/').to_owned(),
             storage_token: storage_token.into(),
         })
     }
@@ -119,10 +161,18 @@ impl CloudPublisher {
             })
             .await?;
         if !status.is_success() {
-            return Err(CloudPublishError::Http { status, body });
+            return Err(CloudPublishError::Http { status });
         }
         let published: PublishResponse =
             serde_json::from_str(&body).map_err(|_| CloudPublishError::InvalidMaterialization)?;
+        if published.status == PublishStatus::Published {
+            on_progress(CloudPublishProgress {
+                release_id: published.release_id,
+                uploaded_segments: materialized.segments.len(),
+                total_segments: materialized.segments.len(),
+            });
+            return Ok(());
+        }
 
         for (uploaded_segments, segment) in materialized.segments.iter().enumerate() {
             let artifact_key = segment.declaration["artifact_key"]
@@ -138,7 +188,7 @@ impl CloudPublisher {
                     .collect::<Vec<_>>()
                     .join("/")
             );
-            let (status, body) = self
+            let (status, _) = self
                 .send_with_retry(|| {
                     self.client
                         .put(&upload_url)
@@ -148,13 +198,36 @@ impl CloudPublisher {
                 })
                 .await?;
             if !status.is_success() {
-                return Err(CloudPublishError::Http { status, body });
+                return Err(CloudPublishError::Http { status });
             }
             on_progress(CloudPublishProgress {
                 release_id: published.release_id.clone(),
                 uploaded_segments: uploaded_segments + 1,
                 total_segments: materialized.segments.len(),
             });
+        }
+
+        let finalize_url = format!(
+            "{}/internal/processor/bundles/{}/finalize",
+            self.endpoint,
+            percent_encode(bundle_id)
+        );
+        let (status, body) = self
+            .send_with_retry(|| {
+                self.client
+                    .post(&finalize_url)
+                    .bearer_auth(&self.storage_token)
+            })
+            .await?;
+        if !status.is_success() {
+            return Err(CloudPublishError::Http { status });
+        }
+        let finalized: PublishResponse =
+            serde_json::from_str(&body).map_err(|_| CloudPublishError::InvalidMaterialization)?;
+        if finalized.status != PublishStatus::Published
+            || finalized.release_id != published.release_id
+        {
+            return Err(CloudPublishError::InvalidMaterialization);
         }
         Ok(())
     }
@@ -170,8 +243,12 @@ impl CloudPublisher {
             match build().send().await {
                 Ok(response) => {
                     let status = response.status();
-                    let body = response.text().await?;
                     if !is_transient(status) || attempt == MAX_RETRIES {
+                        let body = if status.is_success() {
+                            response.text().await?
+                        } else {
+                            String::new()
+                        };
                         return Ok((status, body));
                     }
                 }
@@ -257,7 +334,7 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&requests);
         let server = tokio::spawn(async move {
-            for index in 0..2 {
+            for index in 0..3 {
                 let (mut stream, _) = listener.accept().await?;
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 1024];
@@ -283,11 +360,18 @@ mod tests {
                     }
                 }
                 seen.lock().await.push(request);
-                let response = if index == 0 {
-                    "HTTP/1.1 201 Created\r\nContent-Length: 22\r\n\r\n{\"release_id\":\"rel-1\"}"
-                } else {
-                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
-                };
+                let (status, body) = [
+                    (
+                        "201 Created",
+                        r#"{"release_id":"rel-1","status":"staging"}"#,
+                    ),
+                    ("200 OK", "{}"),
+                    ("200 OK", r#"{"release_id":"rel-1","status":"published"}"#),
+                ][index];
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
                 stream.write_all(response.as_bytes()).await?;
             }
             Ok::<_, std::io::Error>(())
@@ -317,32 +401,198 @@ mod tests {
             .await?;
         server.await??;
 
-        {
-            let captured = requests.lock().await;
-            assert_eq!(captured.len(), 2);
-            let publish = String::from_utf8_lossy(&captured[0]);
-            assert!(publish.starts_with("POST /internal/processor/bundles HTTP/1.1"));
-            assert!(publish.contains("authorization: Bearer secret"));
-            assert!(publish.contains("x-pmkit-bundle-id: bundle id"));
-            let upload = String::from_utf8_lossy(&captured[1]);
-            assert!(upload.starts_with(
-                "PUT /internal/processor/bundles/bundle%20id/artifacts/segments/token%20id/part.jsonl HTTP/1.1"
-            ));
-            assert!(captured[1].ends_with(&bytes));
-            drop(captured);
-        }
+        let captured = requests.lock().await;
+        assert_publication_requests(&captured, &bytes);
+        drop(captured);
+        let expected = CloudPublishProgress {
+            release_id: "rel-1".into(),
+            uploaded_segments: 1,
+            total_segments: 1,
+        };
         assert_eq!(
             progress
                 .lock()
                 .map_err(|_| "progress mutex poisoned")?
                 .as_slice(),
-            &[CloudPublishProgress {
-                release_id: "rel-1".into(),
-                uploaded_segments: 1,
-                total_segments: 1,
-            }]
+            &[expected]
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn succeeds_without_artifact_upload_or_finalize_when_already_published()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|position| position + 4);
+                if let Some(header_end) = header_end {
+                    let content_length = String::from_utf8_lossy(&request[..header_end])
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if request.len() >= header_end + content_length {
+                        break;
+                    }
+                }
+            }
+            let body = r#"{"release_id":"rel-1","status":"published"}"#;
+            let response = format!(
+                "HTTP/1.1 201 Created\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await?;
+            Ok::<_, std::io::Error>(request)
+        });
+
+        let bytes = b"{\"source_timestamp_ms\":1}\n".to_vec();
+        let materialized = MaterializedMarketSegments {
+            manifest: json!({"schema_version": 1, "artifact_sha256": "a"}),
+            segments: vec![MaterializedMarketSegment {
+                declaration: json!({
+                    "artifact_key": "segments/token id/part.jsonl",
+                    "bytes": 26,
+                    "sha256": "07ea46fc5ae0411a7779cde60cb1a8d0b6610b10099a43543439fbb302d4b3b0"
+                }),
+                bytes,
+            }],
+        };
+        let publisher = CloudPublisher::new(format!("http://{address}"), "secret")?;
+
+        assert_eq!(
+            publisher.publish("bundle id", &materialized).await?,
+            "rel-1"
+        );
+
+        let request = server.await??;
+        let request = String::from_utf8_lossy(&request);
+        assert!(request.starts_with("POST /internal/processor/bundles HTTP/1.1"));
+        Ok(())
+    }
+
+    #[test]
+    fn permits_only_explicit_local_http_development_hosts() {
+        // Given: HTTP endpoints for the exact local development hosts and nearby impostors.
+        for endpoint in [
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://[::1]:3000",
+        ] {
+            // When: a publisher is configured for the approved local host.
+            let result = CloudPublisher::new(endpoint, "secret");
+
+            // Then: local development is allowed only for that exact host.
+            assert!(result.is_ok(), "{endpoint}");
+        }
+        for endpoint in [
+            "http://pmkit.cloud",
+            "http://localhost.evil",
+            "http://127.0.0.2",
+            "http://[::2]",
+        ] {
+            assert!(
+                CloudPublisher::new(endpoint, "secret").is_err(),
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_endpoint_queries_and_fragments() {
+        // Given: an otherwise valid HTTPS endpoint has a query or fragment.
+        for endpoint in [
+            "https://pmkit.cloud?access_token=endpoint-secret",
+            "https://pmkit.cloud#endpoint-secret",
+        ] {
+            // When: a publisher is configured for the endpoint.
+            let result = CloudPublisher::new(endpoint, "storage-secret");
+
+            // Then: no request can be built from an ambiguous endpoint.
+            assert!(result.is_err(), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn publisher_debug_redacts_storage_tokens() -> Result<(), CloudPublishError> {
+        // Given: a storage token is configured for a valid endpoint.
+        let publisher = CloudPublisher::new("https://pmkit.cloud", "storage-secret")?;
+
+        // When: diagnostics render the publisher.
+        let debug = format!("{publisher:?}");
+
+        // Then: the storage secret is not exposed through the Debug implementation.
+        assert!(!debug.contains("storage-secret"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_cloud_responses_do_not_expose_their_bodies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let body = "upstream-secret";
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await?;
+            Ok::<_, std::io::Error>(())
+        });
+        let materialized = MaterializedMarketSegments {
+            manifest: json!({"schema_version": 1, "artifact_sha256": "a"}),
+            segments: vec![MaterializedMarketSegment {
+                declaration: json!({
+                    "artifact_key": "segments/token/part.jsonl",
+                    "bytes": 26,
+                    "sha256": "07ea46fc5ae0411a7779cde60cb1a8d0b6610b10099a43543439fbb302d4b3b0"
+                }),
+                bytes: b"{\"source_timestamp_ms\":1}\n".to_vec(),
+            }],
+        };
+        let publisher = CloudPublisher::new(format!("http://{address}"), "secret")?;
+        let error = publisher
+            .publish("bundle", &materialized)
+            .await
+            .err()
+            .ok_or_else(|| std::io::Error::other("cloud publisher unexpectedly succeeded"))?;
+        server.await??;
+
+        assert!(!error.to_string().contains("upstream-secret"));
+        assert!(!format!("{error:?}").contains("upstream-secret"));
+        Ok(())
+    }
+
+    fn assert_publication_requests(captured: &[Vec<u8>], bytes: &[u8]) {
+        assert_eq!(captured.len(), 3);
+        let publish = String::from_utf8_lossy(&captured[0]);
+        assert!(publish.starts_with("POST /internal/processor/bundles HTTP/1.1"));
+        assert!(publish.contains("authorization: Bearer secret"));
+        assert!(publish.contains("x-pmkit-bundle-id: bundle id"));
+        let upload = String::from_utf8_lossy(&captured[1]);
+        assert!(upload.starts_with(
+            "PUT /internal/processor/bundles/bundle%20id/artifacts/segments/token%20id/part.jsonl HTTP/1.1"
+        ));
+        assert!(captured[1].ends_with(bytes));
+        let finalize = String::from_utf8_lossy(&captured[2]);
+        assert!(
+            finalize.starts_with("POST /internal/processor/bundles/bundle%20id/finalize HTTP/1.1")
+        );
+        assert!(finalize.contains("authorization: Bearer secret"));
     }
 
     #[tokio::test]
