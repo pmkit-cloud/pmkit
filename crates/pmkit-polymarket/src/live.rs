@@ -115,6 +115,20 @@ impl RawPolymarketFrameAdapter {
     where
         F: FnOnce(&[u8]) -> Result<MarketEvent, DataSourceError>,
     {
+        let envelope = self.market_envelope(&frame)?;
+        self.store.store_envelope_idempotent(&envelope).await?;
+        let fact = adapt(&frame.text)?;
+        Ok(PmMarketEnvelope {
+            metadata: frame.metadata,
+            raw_frame: frame.text,
+            fact,
+        })
+    }
+
+    pub(crate) fn market_envelope(
+        &self,
+        frame: &RawPmMarketFrame,
+    ) -> Result<PmEnvelope, RawFrameAdapterError> {
         let payload: serde_json::Value = serde_json::from_slice(&frame.text)
             .map_err(|source| RawFrameAdapterError::Json { source })?;
         let normalized = serde_json::json!({
@@ -126,33 +140,25 @@ impl RawPolymarketFrameAdapter {
             "canonical_market_id": frame.market.to_string(),
             "payload": payload,
         });
-        self.store
-            .store_envelope(&PmEnvelope {
-                schema_version: PM_ENVELOPE_VERSION,
-                scope: self.scope.clone(),
-                venue_id: "polymarket".into(),
-                config_hash: self.config_hash.clone(),
-                source_id: frame.metadata.source_id.clone(),
-                connection_id: frame.metadata.connection_id.clone(),
-                source_timestamp_ms: frame.metadata.source_time_ms,
-                canonical_source_rank: frame.metadata.canonical_source_rank,
-                connection_epoch: frame.metadata.connection_epoch,
-                frame_sequence: frame.metadata.frame_sequence,
-                receipt_timestamp_ms: frame.metadata.receipt_time_ms,
-                ingest_sequence: i64::try_from(frame.metadata.ingest_sequence).map_err(|_| {
-                    StoreError::Storage {
-                        message: "PM ingest sequence exceeds storage range".into(),
-                    }
-                })?,
-                raw_frame: frame.text.clone(),
-                normalized,
-            })
-            .await?;
-        let fact = adapt(&frame.text)?;
-        Ok(PmMarketEnvelope {
-            metadata: frame.metadata,
-            raw_frame: frame.text,
-            fact,
+        Ok(PmEnvelope {
+            schema_version: PM_ENVELOPE_VERSION,
+            scope: self.scope.clone(),
+            venue_id: "polymarket".into(),
+            config_hash: self.config_hash.clone(),
+            source_id: frame.metadata.source_id.clone(),
+            connection_id: frame.metadata.connection_id.clone(),
+            source_timestamp_ms: frame.metadata.source_time_ms,
+            canonical_source_rank: frame.metadata.canonical_source_rank,
+            connection_epoch: frame.metadata.connection_epoch,
+            frame_sequence: frame.metadata.frame_sequence,
+            receipt_timestamp_ms: frame.metadata.receipt_time_ms,
+            ingest_sequence: i64::try_from(frame.metadata.ingest_sequence).map_err(|_| {
+                StoreError::Storage {
+                    message: "PM ingest sequence exceeds storage range".into(),
+                }
+            })?,
+            raw_frame: frame.text.clone(),
+            normalized,
         })
     }
 
@@ -180,7 +186,7 @@ impl RawPolymarketFrameAdapter {
             "payload": payload,
         });
         self.store
-            .store_envelope(&PmEnvelope {
+            .store_envelope_idempotent(&PmEnvelope {
                 schema_version: PM_ENVELOPE_VERSION,
                 scope: self.scope.clone(),
                 venue_id: "polymarket".into(),
@@ -208,6 +214,41 @@ impl RawPolymarketFrameAdapter {
             raw_frame: frame.text,
             fact,
         })
+    }
+
+    /// Persists raw v2 tape evidence that intentionally has no replay projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when durable evidence storage fails.
+    pub async fn store_public_tape_audit_frame(
+        &self,
+        frame: &pmkit_store::PublicTapeAuditFrame,
+    ) -> Result<(), StoreError> {
+        self.store.store_public_tape_audit_frame(frame).await
+    }
+
+    /// Persists a recorder interval before an export can materialize its evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when durable gap storage fails.
+    pub async fn store_replay_gap(
+        &self,
+        gap: &pmkit_store::ReplayGapInterval,
+    ) -> Result<(), StoreError> {
+        self.store.store_replay_gap(gap).await
+    }
+
+    pub(crate) async fn store_public_tape_import(
+        &self,
+        gaps: &[pmkit_store::ReplayGapInterval],
+        audit_frames: &[pmkit_store::PublicTapeAuditFrame],
+        envelopes: &[PmEnvelope],
+    ) -> Result<(), StoreError> {
+        self.store
+            .store_public_tape_import(gaps, audit_frames, envelopes)
+            .await
     }
 }
 
