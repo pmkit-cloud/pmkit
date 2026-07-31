@@ -1,13 +1,18 @@
 #![allow(clippy::significant_drop_tightening)]
 use std::{num::NonZeroUsize, path::PathBuf};
 
+use chrono::NaiveDate;
 use pmkit_core::{PortfolioId, RunId};
 use serde_json::json;
 
+use crate::sealed_manifest::decode_sealed_closed_day_manifest_at;
 use crate::{
-    CacheChecksum, CausalDecision, CausalIdentity, IntentOutcome, OwnerScope, PM_ENVELOPE_VERSION,
-    PmEnvelope, ReplayCursor, ReplayGapReason, ReplayItem, StoreError, TapeStore, TursoTapeStore,
-    export_market_segments, export_market_segments_with_artifacts, export_replay_bundle,
+    CacheChecksum, CausalDecision, CausalIdentity, CloudMaterializationState, IntentOutcome,
+    OwnerScope, PM_ENVELOPE_VERSION, PmEnvelope, ReplayCursor, ReplayGapInterval, ReplayGapReason,
+    ReplayItem, StoreError, TapeStore, TursoTapeStore, cloud_materialization_from_inbox,
+    decode_sealed_closed_day_manifest, export_market_segments,
+    export_market_segments_with_artifacts, export_replay_bundle, reconcile_materialization,
+    terminalize_operational_gap,
 };
 
 fn database_path(name: &str) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
@@ -37,6 +42,37 @@ fn envelope(scope: OwnerScope, ingest_sequence: i64) -> PmEnvelope {
         raw_frame: br#"{\"event_type\":\"price_change\",\"price\":\"0.42\"}"#.to_vec(),
         normalized: json!({"kind": "market_price", "price": "0.42"}),
     }
+}
+
+fn sealed_manifest(day: &str) -> Result<crate::SealedClosedDayManifest, StoreError> {
+    decode_sealed_closed_day_manifest(json!({
+        "version": 2,
+        "day": day,
+        "day_seal": "sealed",
+    }))
+}
+
+#[test]
+fn sealed_manifest_rejects_current_and_future_utc_days() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: a fixed UTC today, independent of the machine clock.
+    let today = NaiveDate::from_ymd_opt(2026, 7, 30).ok_or("fixed UTC date")?;
+    let tomorrow = today.succ_opt().ok_or("next UTC date")?;
+
+    // When: a manifest claims the current day or any later UTC day is closed.
+    for day in [today, tomorrow] {
+        let result = decode_sealed_closed_day_manifest_at(
+            json!({
+                "version": 2,
+                "day": day.format("%Y-%m-%d").to_string(),
+                "day_seal": "sealed",
+            }),
+            today,
+        );
+
+        // Then: neither claim can produce a materializable sealed manifest.
+        assert!(matches!(result, Err(StoreError::Storage { .. })));
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -502,6 +538,7 @@ async fn replay_bundle_gathers_manifest_evidence_and_decisions()
     let bundle = export_replay_bundle(&store, &scope, &manifest, &checksums).await?;
 
     assert_eq!(bundle["schema_version"], 1);
+    assert_eq!(bundle["coverage"], "observed");
     assert_eq!(bundle["manifest"], manifest);
     assert_eq!(bundle["scope"]["run"], "run");
     let evidence = bundle["pm_evidence"]
@@ -530,21 +567,20 @@ async fn market_segment_export_is_cloud_compatible() -> Result<(), Box<dyn std::
     envelope.source_timestamp_ms = 1_000;
     store.store_envelope(&envelope).await?;
 
-    let bundle = export_market_segments(
-        &store,
-        &scope,
-        &json!({
-            "mode": "backtest", "portfolio": "paper", "run": "run"
-        }),
-    )
-    .await?;
+    let bundle = export_market_segments(&store, &scope, &sealed_manifest("1970-01-01")?).await?;
 
     assert_eq!(bundle["schema_version"], 1);
-    assert_eq!(bundle["segments"][0]["token_id"], "token-1");
+    assert_eq!(bundle["segments"][0]["market_id"], "token-1");
+    assert!(bundle["segments"][0]["token_id"].is_null());
     assert_eq!(bundle["segments"][0]["from_ts_ms"], 1_000);
     assert_eq!(bundle["segments"][0]["to_ts_ms"], 1_000);
     assert_eq!(bundle["segments"][0]["rows"], 1);
     assert!(bundle["segments"][0]["sha256"].as_str().is_some());
+    assert!(
+        bundle["segments"][0]["source_manifest_sha256"]
+            .as_str()
+            .is_some()
+    );
     store.delete_database()?;
     Ok(())
 }
@@ -564,14 +600,9 @@ async fn market_segment_export_returns_uploadable_utc_day_bodies()
     store.store_envelope(&first).await?;
     store.store_envelope(&second).await?;
 
-    let output = export_market_segments_with_artifacts(
-        &store,
-        &scope,
-        &json!({
-            "mode": "backtest", "portfolio": "paper", "run": "run"
-        }),
-    )
-    .await?;
+    let output =
+        export_market_segments_with_artifacts(&store, &scope, &sealed_manifest("1970-01-02")?)
+            .await?;
 
     assert_eq!(output.segments.len(), 1);
     let segment = &output.segments[0];
@@ -581,6 +612,176 @@ async fn market_segment_export_returns_uploadable_utc_day_bodies()
     assert_eq!(segment.declaration["bytes"], segment.bytes.len());
     assert_eq!(output.manifest["segments"][0], segment.declaration);
     assert_eq!(segment.bytes.split(|byte| *byte == b'\n').count() - 1, 2);
+    store.delete_database()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn market_segment_export_rejects_a_record_outside_the_sealed_day()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: a public-market record immediately after the sealed UTC day.
+    let (_dir, path) = database_path("segment-outside-sealed-day")?;
+    let scope = owner_scope("run")?;
+    let store = TursoTapeStore::open_local(&path).await?;
+    let mut stored = envelope(scope.clone(), 1);
+    stored.normalized = json!({"canonical_market_id": "token-1", "payload": {"price": "0.42"}});
+    stored.source_timestamp_ms = 86_400_000;
+    store.store_envelope(&stored).await?;
+
+    // When: the prior day is materialized for Cloud publication.
+    let result = export_market_segments(&store, &scope, &sealed_manifest("1970-01-01")?).await;
+
+    // Then: future/out-of-day evidence fails closed instead of being omitted.
+    assert!(matches!(result, Err(StoreError::Storage { .. })));
+    store.delete_database()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn market_segment_export_rejects_intersecting_persisted_replay_gap()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: a materializable market record and a recorder gap in its interval.
+    let (_dir, path) = database_path("segment-gap")?;
+    let scope = owner_scope("run")?;
+    let store = TursoTapeStore::open_local(&path).await?;
+    let mut stored = envelope(scope.clone(), 1);
+    stored.normalized = json!({"canonical_market_id": "token-1", "payload": {"price": "0.42"}});
+    stored.source_timestamp_ms = 1_000;
+    store.store_envelope(&stored).await?;
+    store
+        .store_replay_gap(&ReplayGapInterval {
+            scope: scope.clone(),
+            partition: "token-1:0".into(),
+            start_time_ms: 999,
+            end_time_ms: Some(1_001),
+            reason: "malformed_data".into(),
+        })
+        .await?;
+
+    // When: the market segment is materialized.
+    let result = export_market_segments(&store, &scope, &sealed_manifest("1970-01-01")?).await;
+
+    // Then: a gap intersection prevents export rather than publishing partial evidence.
+    assert!(matches!(result, Err(StoreError::Storage { .. })));
+    store.delete_database()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn market_segment_export_withholds_the_full_day_for_a_late_partition_gap()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: the only observed row is early in the day, but the same partition later has a gap.
+    let (_dir, path) = database_path("segment-late-gap")?;
+    let scope = owner_scope("run")?;
+    let store = TursoTapeStore::open_local(&path).await?;
+    let mut stored = envelope(scope.clone(), 1);
+    stored.normalized = json!({"canonical_market_id": "token-1", "payload": {"price": "0.42"}});
+    stored.source_timestamp_ms = 1_000;
+    store.store_envelope(&stored).await?;
+    store
+        .store_replay_gap(&ReplayGapInterval {
+            scope: scope.clone(),
+            partition: "token-1:0".into(),
+            start_time_ms: 86_399_000,
+            end_time_ms: Some(86_399_999),
+            reason: "late_disconnect".into(),
+        })
+        .await?;
+
+    // When: the market/day partition is materialized.
+    let result = export_market_segments(&store, &scope, &sealed_manifest("1970-01-01")?).await;
+
+    // Then: it is withheld rather than publishing the early-day partial rows.
+    assert!(matches!(result, Err(StoreError::Storage { .. })));
+    store.delete_database()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn market_segment_export_ignores_overlapping_gap_in_another_partition()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: a materializable market record and a same-time gap for another market/day.
+    let (_dir, path) = database_path("segment-unrelated-gap")?;
+    let scope = owner_scope("run")?;
+    let store = TursoTapeStore::open_local(&path).await?;
+    let mut stored = envelope(scope.clone(), 1);
+    stored.normalized = json!({"canonical_market_id": "token-1", "payload": {"price": "0.42"}});
+    stored.source_timestamp_ms = 1_000;
+    store.store_envelope(&stored).await?;
+    store
+        .store_replay_gap(&ReplayGapInterval {
+            scope: scope.clone(),
+            partition: "token-2:0".into(),
+            start_time_ms: 999,
+            end_time_ms: Some(1_001),
+            reason: "malformed_data".into(),
+        })
+        .await?;
+
+    // When: the first market/day segment is materialized.
+    let result = export_market_segments(&store, &scope, &sealed_manifest("1970-01-01")?).await;
+
+    // Then: unrelated partitions do not withhold valid evidence.
+    assert!(result.is_ok());
+    store.delete_database()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cloud_materialization_reconciles_a_lost_finalize_response()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, path) = database_path("cloud-materialization")?;
+    let store = TursoTapeStore::open_local(&path).await?;
+    let inbox = json!({"version": 2, "day": "1970-01-02", "day_seal": "sealed"});
+    let materialization =
+        cloud_materialization_from_inbox(&inbox, "token-1:86400000", &"a".repeat(64))?;
+
+    let pending = reconcile_materialization(&store, &materialization, |_| async {
+        Err(StoreError::Storage {
+            message: "lost_finalize_response".into(),
+        })
+    })
+    .await?;
+    let finalized = reconcile_materialization(&store, &materialization, |_| async {
+        Ok("release-2".into())
+    })
+    .await?;
+
+    assert_eq!(pending.state, CloudMaterializationState::Pending);
+    assert_eq!(finalized.state, CloudMaterializationState::Finalized);
+    assert_eq!(finalized.release_id.as_deref(), Some("release-2"));
+    store.delete_database()?;
+    Ok(())
+}
+
+#[test]
+fn cloud_materialization_rejects_an_unsealed_closed_day_manifest() {
+    // Given: JSON can name a day without certifying that the day is closed.
+    let inbox = json!({"version": 2, "day": "1970-01-02"});
+
+    // When: it is offered to the Cloud materialization boundary.
+    let result = cloud_materialization_from_inbox(&inbox, "token-1:86400000", &"a".repeat(64));
+
+    // Then: unsealed JSON cannot create a publishable identity.
+    assert!(matches!(result, Err(StoreError::Storage { .. })));
+}
+
+#[tokio::test]
+async fn cloud_materialization_terminalizes_a_gapped_day_without_release()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, path) = database_path("cloud-materialization-gap")?;
+    let store = TursoTapeStore::open_local(&path).await?;
+    let materialization = cloud_materialization_from_inbox(
+        &json!({"version": 2, "day": "1970-01-02", "day_seal": "sealed"}),
+        "token-1:86400000",
+        &"b".repeat(64),
+    )?;
+
+    let terminal = terminalize_operational_gap(&store, &materialization).await?;
+
+    assert_eq!(terminal.state, CloudMaterializationState::Terminal);
+    assert_eq!(terminal.release_id, None);
+    assert_eq!(terminal.terminal_reason.as_deref(), Some("operational_gap"));
     store.delete_database()?;
     Ok(())
 }
