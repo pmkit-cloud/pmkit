@@ -21,7 +21,6 @@ use pmkit_core::{PortfolioId, RunId};
 use serde_json::Value;
 use thiserror::Error;
 
-mod bundle;
 mod chain;
 mod chain_store;
 mod cloud_publish;
@@ -30,10 +29,14 @@ mod finalized_store;
 mod integrity;
 mod local_files;
 mod log;
+mod market_segments;
 mod migrations;
 mod raw;
+mod release_bridge;
+mod replay_bundle;
 mod rpc;
 mod schema;
+mod sealed_manifest;
 mod source;
 mod turso_store;
 mod wallet;
@@ -51,10 +54,6 @@ mod record_version_tests;
 #[cfg(test)]
 mod chain_tests;
 
-pub use bundle::{
-    CacheChecksum, MaterializedMarketSegment, MaterializedMarketSegments, REPLAY_BUNDLE_VERSION,
-    export_market_segments, export_market_segments_with_artifacts, export_replay_bundle,
-};
 pub use chain::{Address, AddressError, ChainId, ContractRegistry, LegacyV1Contracts};
 pub use chain_store::CanonicalLogStore;
 pub use cloud_publish::{CloudPublishError, CloudPublishProgress, CloudPublisher};
@@ -64,8 +63,19 @@ pub use log::{
     CanonicalChainLog, CanonicalLogIdentity, CanonicalLogSegment, ChainCheckpoint, ChainEvent,
     OutcomeTokenAmount, TradeSide,
 };
+pub use market_segments::{
+    MaterializedMarketSegment, MaterializedMarketSegments, export_market_segments,
+    export_market_segments_with_artifacts,
+};
+pub use release_bridge::{
+    CloudMaterialization, CloudMaterializationState, cloud_materialization_from_inbox,
+    cloud_materialization_from_sealed_manifest, materialization_bundle_id,
+    reconcile_materialization, terminalize_operational_gap,
+};
+pub use replay_bundle::{CacheChecksum, REPLAY_BUNDLE_VERSION, export_replay_bundle};
 pub use rpc::{JsonRpcFinalizedProvider, RpcProviderConfig};
 pub use schema::PM_ENVELOPE_VERSION;
+pub use sealed_manifest::{SealedClosedDayManifest, decode_sealed_closed_day_manifest};
 pub use source::{
     BlockHead, CanonicalLogSource, ChainSourceError, FinalizedBlockCoverage, FinalizedBlockRange,
     FinalizedProviderHead, FinalizedRawLogBatch, FinalizedRawLogProvider,
@@ -364,6 +374,46 @@ pub struct ReplayGap {
     pub reason: ReplayGapReason,
 }
 
+/// A durable recorder gap that blocks exports intersecting its time interval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayGapInterval {
+    /// The owner scope that captured the gap.
+    pub scope: OwnerScope,
+    /// The affected `market_id:utc_day_start_ms` partition, or `all_subscribed`.
+    pub partition: String,
+    /// The inclusive interval start in source milliseconds.
+    pub start_time_ms: i64,
+    /// The inclusive interval end, or `None` when the recorder never resolved it.
+    pub end_time_ms: Option<i64>,
+    /// The recorder's durable reason.
+    pub reason: String,
+}
+
+/// Exact public-tape evidence retained without making it a replay projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicTapeAuditFrame {
+    /// The owner scope that retained the source frame.
+    pub scope: OwnerScope,
+    /// The verified immutable mapping-snapshot partition.
+    pub partition: String,
+    /// The source identity recorded by the producer.
+    pub source_id: String,
+    /// The source connection identity recorded by the producer.
+    pub connection_id: String,
+    /// The producer connection epoch.
+    pub connection_epoch: i64,
+    /// The producer frame sequence.
+    pub frame_sequence: i64,
+    /// The producer ingest sequence.
+    pub ingest_sequence: i64,
+    /// The producer's local receipt timestamp.
+    pub receipt_timestamp_ms: i64,
+    /// The producer source timestamp when present.
+    pub source_timestamp_ms: Option<i64>,
+    /// The byte-identical raw frame.
+    pub raw_frame: Vec<u8>,
+}
+
 /// One item in a scoped PM replay page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplayItem {
@@ -385,8 +435,37 @@ pub struct ReplayPage {
 /// A durable PM envelope and causal-decision store.
 #[async_trait]
 pub trait TapeStore: Send + Sync {
+    /// Stores a restart-safe pending Cloud materialization identity.
+    async fn store_cloud_materialization_pending(
+        &self,
+        _materialization: &CloudMaterialization,
+    ) -> Result<CloudMaterialization, StoreError> {
+        Err(StoreError::Storage {
+            message: "cloud materialization tracking is not configured".into(),
+        })
+    }
+
+    /// Transitions a pending Cloud materialization to its final durable state.
+    async fn transition_cloud_materialization(
+        &self,
+        _bundle_id: &str,
+        _state: CloudMaterializationState,
+        _release_id: Option<&str>,
+        _reason: Option<&str>,
+    ) -> Result<CloudMaterialization, StoreError> {
+        Err(StoreError::Storage {
+            message: "cloud materialization tracking is not configured".into(),
+        })
+    }
+
     /// Stores one lossless PM envelope or rejects a duplicate source identity.
     async fn store_envelope(&self, envelope: &PmEnvelope) -> Result<(), StoreError>;
+
+    /// Stores an envelope or confirms that the same durable identity has identical evidence.
+    async fn store_envelope_idempotent(&self, envelope: &PmEnvelope) -> Result<bool, StoreError> {
+        self.store_envelope(envelope).await?;
+        Ok(true)
+    }
 
     /// Reads one deterministic PM replay page in the supplied owner scope.
     async fn read_envelopes(
@@ -395,6 +474,55 @@ pub trait TapeStore: Send + Sync {
         after: Option<ReplayCursor>,
         limit: NonZeroUsize,
     ) -> Result<ReplayPage, StoreError>;
+
+    /// Persists one recorder interval that must block intersecting segment export.
+    async fn store_replay_gap(&self, _gap: &ReplayGapInterval) -> Result<(), StoreError> {
+        Err(StoreError::Storage {
+            message: "replay-gap persistence is not configured".into(),
+        })
+    }
+
+    /// Reads every durable recorder interval in one owner scope.
+    async fn read_replay_gaps(
+        &self,
+        _scope: &OwnerScope,
+    ) -> Result<Vec<ReplayGapInterval>, StoreError> {
+        Err(StoreError::Storage {
+            message: "replay-gap persistence is not configured".into(),
+        })
+    }
+
+    /// Persists source evidence that intentionally has no replay projection.
+    async fn store_public_tape_audit_frame(
+        &self,
+        _frame: &PublicTapeAuditFrame,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Storage {
+            message: "public-tape audit persistence is not configured".into(),
+        })
+    }
+
+    /// Atomically stores one complete public-tape import.
+    async fn store_public_tape_import(
+        &self,
+        _gaps: &[ReplayGapInterval],
+        _audit_frames: &[PublicTapeAuditFrame],
+        _envelopes: &[PmEnvelope],
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Storage {
+            message: "atomic public-tape import is not configured".into(),
+        })
+    }
+
+    /// Reads raw public-tape evidence excluded from replay projection.
+    async fn read_public_tape_audit_frames(
+        &self,
+        _scope: &OwnerScope,
+    ) -> Result<Vec<PublicTapeAuditFrame>, StoreError> {
+        Err(StoreError::Storage {
+            message: "public-tape audit persistence is not configured".into(),
+        })
+    }
 
     /// Stores one normalized causal decision exactly once.
     async fn store_decision(&self, decision: &CausalDecision) -> Result<(), StoreError>;
