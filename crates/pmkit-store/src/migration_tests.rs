@@ -79,7 +79,9 @@ async fn migration_applies_and_is_idempotent() -> Result<(), Box<dyn std::error:
             (6, sixth_applied_at),
             (7, seventh_applied_at),
             (8, eighth_applied_at),
-            (9, ninth_applied_at)
+            (9, ninth_applied_at),
+            (10, tenth_applied_at),
+            (11, eleventh_applied_at)
         ]
             if !first_applied_at.is_empty()
                 && !second_applied_at.is_empty()
@@ -90,6 +92,8 @@ async fn migration_applies_and_is_idempotent() -> Result<(), Box<dyn std::error:
                 && !seventh_applied_at.is_empty()
                 && !eighth_applied_at.is_empty()
                 && !ninth_applied_at.is_empty()
+                && !tenth_applied_at.is_empty()
+                && !eleventh_applied_at.is_empty()
     ));
     assert_eq!(reopened_rows, first_rows);
     Ok(())
@@ -104,7 +108,7 @@ async fn migration_rejects_newer_version() -> Result<(), Box<dyn std::error::Err
     let (database, connection) = open_connection(&path).await?;
     connection
         .execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (10, CURRENT_TIMESTAMP)",
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (12, CURRENT_TIMESTAMP)",
             (),
         )
         .await?;
@@ -116,8 +120,8 @@ async fn migration_rejects_newer_version() -> Result<(), Box<dyn std::error::Err
     assert!(matches!(
         TursoTapeStore::open_local(&path).await,
         Err(StoreError::DatabaseSchemaTooNew {
-            database_version: 10,
-            max_supported_version: 9,
+            database_version: 12,
+            max_supported_version: 11,
         })
     ));
     Ok(())
@@ -277,7 +281,7 @@ async fn migration_adds_stream_identity_and_limit_one_cursor()
 #[tokio::test]
 async fn migration_rolls_back_on_failure() -> Result<(), Box<dyn std::error::Error>> {
     const FAILING_MIGRATION: Migration = Migration::new(
-        10,
+        12,
         &[
             "CREATE TABLE migration_partial_change (value INTEGER NOT NULL)",
             "CREATE TABLE migration_partial_change (",
@@ -320,7 +324,9 @@ async fn migration_rolls_back_on_failure() -> Result<(), Box<dyn std::error::Err
             (6, _),
             (7, _),
             (8, _),
-            (9, _)
+            (9, _),
+            (10, _),
+            (11, _)
         ]
     ));
     assert_eq!(partial_table_count, 0);
@@ -374,7 +380,7 @@ async fn pm_account_envelope_version_migrates_old_and_reads_new_fixtures()
     store
         .connection
         .execute(
-            "DELETE FROM schema_migrations WHERE version IN (4, 5, 6, 7, 8, 9)",
+            "DELETE FROM schema_migrations WHERE version IN (4, 5, 6, 7, 8, 9, 10, 11)",
             (),
         )
         .await?;
@@ -425,7 +431,9 @@ async fn pm_account_envelope_version_migrates_old_and_reads_new_fixtures()
             (6, _),
             (7, _),
             (8, _),
-            (9, _)
+            (9, _),
+            (10, _),
+            (11, _)
         ]
     ));
     Ok(())
@@ -510,7 +518,9 @@ async fn decision_version_round_trip() -> Result<(), Box<dyn std::error::Error>>
             (6, _),
             (7, _),
             (8, _),
-            (9, _)
+            (9, _),
+            (10, _),
+            (11, _)
         ]
     ));
     assert!(killed);
@@ -548,7 +558,7 @@ async fn decision_schema_v1_migrates_and_v2_reads() -> Result<(), Box<dyn std::e
     store
         .connection
         .execute(
-            "DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9)",
+            "DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9, 10, 11)",
             (),
         )
         .await?;
@@ -604,7 +614,9 @@ async fn decision_schema_v1_migrates_and_v2_reads() -> Result<(), Box<dyn std::e
             (6, _),
             (7, _),
             (8, _),
-            (9, _)
+            (9, _),
+            (10, _),
+            (11, _)
         ]
     ));
     drop(store);
