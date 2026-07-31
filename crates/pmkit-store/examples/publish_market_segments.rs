@@ -11,7 +11,7 @@ use std::error::Error;
 use pmkit_core::{PortfolioId, RunId};
 use pmkit_store::{
     CloudPublisher, OwnerScope, PM_ENVELOPE_VERSION, PmEnvelope, TapeStore, TursoTapeStore,
-    export_market_segments_with_artifacts,
+    decode_sealed_closed_day_manifest, export_market_segments_with_artifacts,
 };
 use serde_json::json;
 
@@ -48,7 +48,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let output = export_market_segments_with_artifacts(
         &store,
         &scope,
-        &json!({"mode": "backtest", "run": "bt", "portfolio": "research"}),
+        &decode_sealed_closed_day_manifest(json!({
+            "version": 2,
+            "day": "1970-01-01",
+            "day_seal": "sealed",
+        }))?,
     )
     .await?;
     println!("{}", serde_json::to_string_pretty(&output.manifest)?);
