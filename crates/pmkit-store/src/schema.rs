@@ -2,7 +2,54 @@
 pub const PM_ENVELOPE_VERSION: u16 = 6;
 pub const CAUSAL_DECISION_SCHEMA_VERSION: i64 = 2;
 pub const DURABLE_INTENT_SCHEMA_VERSION: i64 = 1;
-pub const CURRENT_SCHEMA_VERSION: i64 = 9;
+pub const CURRENT_SCHEMA_VERSION: i64 = 11;
+
+pub const CREATE_CLOUD_MATERIALIZATIONS: &str = "
+CREATE TABLE IF NOT EXISTS pmkit_cloud_materializations (
+    bundle_id TEXT PRIMARY KEY,
+    manifest_sha256 TEXT NOT NULL,
+    partition_id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    artifact_sha256 TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'finalized', 'terminal')),
+    release_id TEXT,
+    terminal_reason TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+";
+
+pub const CREATE_PUBLIC_TAPE_EVIDENCE: &str = "
+CREATE TABLE IF NOT EXISTS pm_replay_gaps (
+    portfolio_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    partition_id TEXT NOT NULL,
+    start_time_ms INTEGER NOT NULL,
+    end_time_ms INTEGER NOT NULL,
+    unresolved INTEGER NOT NULL CHECK (unresolved IN (0, 1)),
+    reason TEXT NOT NULL,
+    PRIMARY KEY (portfolio_id, run_id, partition_id, start_time_ms, end_time_ms, unresolved, reason)
+);
+CREATE TABLE IF NOT EXISTS pm_public_tape_audit_frames (
+    portfolio_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    partition_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    connection_id TEXT NOT NULL,
+    connection_epoch INTEGER NOT NULL,
+    frame_sequence INTEGER NOT NULL,
+    ingest_sequence INTEGER NOT NULL,
+    receipt_timestamp_ms INTEGER NOT NULL,
+    source_timestamp_ms INTEGER,
+    raw_frame BLOB NOT NULL,
+    raw_sha256 TEXT NOT NULL,
+    PRIMARY KEY (portfolio_id, run_id, source_id, connection_id, connection_epoch, frame_sequence, ingest_sequence)
+);
+CREATE INDEX IF NOT EXISTS pm_replay_gaps_owner_interval
+    ON pm_replay_gaps (portfolio_id, run_id, start_time_ms, end_time_ms);
+CREATE INDEX IF NOT EXISTS pm_public_tape_audit_frames_owner_order
+    ON pm_public_tape_audit_frames (portfolio_id, run_id, ingest_sequence);
+";
 
 pub const CREATE_SCHEMA_MIGRATIONS: &str = "
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -197,6 +244,55 @@ WHERE portfolio_id = ?1 AND run_id = ?2
   AND (?3 IS NULL OR (source_timestamp_ms, canonical_source_rank, canonical_market_id, stream_id, connection_epoch, frame_sequence) > (?3, ?4, ?5, ?6, ?7, ?8))
 ORDER BY source_timestamp_ms, canonical_source_rank, canonical_market_id, stream_id, connection_epoch, frame_sequence
 LIMIT ?9";
+
+pub const READ_ENVELOPE_INTEGRITY: &str = "
+SELECT raw_sha256, normalized_sha256
+FROM pm_envelopes
+WHERE portfolio_id = ?1 AND run_id = ?2 AND source_id = ?3 AND connection_id = ?4
+  AND source_timestamp_ms = ?5 AND canonical_market_id = ?6 AND stream_id = ?7
+  AND connection_epoch = ?8 AND frame_sequence = ?9";
+
+pub const INSERT_REPLAY_GAP: &str = "
+INSERT INTO pm_replay_gaps (
+    portfolio_id, run_id, partition_id, start_time_ms, end_time_ms, unresolved, reason
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+ON CONFLICT DO NOTHING";
+
+pub const READ_REPLAY_GAPS: &str = "
+SELECT partition_id, start_time_ms, end_time_ms, unresolved, reason
+FROM pm_replay_gaps
+WHERE portfolio_id = ?1 AND run_id = ?2
+ORDER BY start_time_ms, end_time_ms, partition_id";
+
+pub const INSERT_PUBLIC_TAPE_AUDIT_FRAME: &str = "
+INSERT INTO pm_public_tape_audit_frames (
+    portfolio_id, run_id, partition_id, source_id, connection_id, connection_epoch,
+    frame_sequence, ingest_sequence, receipt_timestamp_ms, source_timestamp_ms, raw_frame, raw_sha256
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+ON CONFLICT DO NOTHING";
+
+pub const READ_PUBLIC_TAPE_AUDIT_FRAMES: &str = "
+SELECT partition_id, source_id, connection_id, connection_epoch, frame_sequence,
+       ingest_sequence, receipt_timestamp_ms, source_timestamp_ms, raw_frame, raw_sha256
+FROM pm_public_tape_audit_frames
+WHERE portfolio_id = ?1 AND run_id = ?2
+ORDER BY ingest_sequence, connection_epoch, frame_sequence";
+
+pub const INSERT_CLOUD_MATERIALIZATION: &str = "
+INSERT INTO pmkit_cloud_materializations (
+    bundle_id, manifest_sha256, partition_id, schema_version, artifact_sha256, state
+) VALUES (?1, ?2, ?3, ?4, ?5, 'pending')
+ON CONFLICT DO NOTHING";
+
+pub const READ_CLOUD_MATERIALIZATION: &str = "
+SELECT bundle_id, manifest_sha256, partition_id, schema_version, artifact_sha256,
+       state, release_id, terminal_reason
+FROM pmkit_cloud_materializations WHERE bundle_id = ?1";
+
+pub const TRANSITION_CLOUD_MATERIALIZATION: &str = "
+UPDATE pmkit_cloud_materializations
+SET state = ?1, release_id = ?2, terminal_reason = ?3, updated_at = CURRENT_TIMESTAMP
+WHERE bundle_id = ?4 AND state = 'pending'";
 
 pub const INSERT_DECISION: &str = "
 INSERT INTO causal_decisions (
