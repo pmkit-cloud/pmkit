@@ -197,22 +197,24 @@ UTC-day, market-scoped JSONL segments, then publishes the manifest and uploads
 the exact digest-checked segment bodies:
 
 ```sh
-cargo run -p pmkit-store --example publish_market_segments
+cargo run -p pmkit-store --bin pmkit-cloud-publish -- \
+  --database ./pmkit.db \
+  --manifest ./sealed-day.json \
+  --portfolio research \
+  --run bt \
+  --endpoint https://pmkit.cloud
 ```
 
-The example is a dry run unless both variables are set:
+The command accepts only a sealed public-tape day manifest:
 
 ```sh
-PMKIT_CLOUD_URL=https://pmkit.cloud \
-PMKIT_STORAGE_TOKEN=... \
-cargo run -p pmkit-store --example publish_market_segments
+{"version":2,"day":"2026-07-27","day_seal":"sealed"}
 ```
 
-Publication is idempotent by bundle ID. If a segment upload fails after the
-manifest is accepted, rerun the same command with the same bundle ID; the
-manifest is reused and deterministic segment PUTs complete the missing bodies.
-The publisher validates every segment's byte count and SHA-256 before making
-the first request.
+The bridge materializes only that UTC day. Publication is idempotent by its
+sealed-day bundle ID; a lost or failed finalize response remains pending and
+the same command reconciles it on retry. The publisher validates every segment's
+byte count and SHA-256 before making the first request.
 
 ## License
 

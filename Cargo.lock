@@ -3767,11 +3767,14 @@ dependencies = [
  "pmkit-store",
  "polymarket_client_sdk_v2",
  "rust_decimal",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
  "turso",
+ "zstd",
 ]
 
 [[package]]
@@ -3828,6 +3831,7 @@ name = "pmkit-store"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "pmkit-core",
  "reqwest",
  "rust_decimal",
