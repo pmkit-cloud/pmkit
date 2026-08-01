@@ -1,0 +1,81 @@
+{
+  "DoneClaim": {
+    "task": "Todo 1 - Publish the canonical three-repository feature and responsibility catalog (correction)",
+    "predecessor_partial_state": {
+      "inspection": "Ran GIT_MASTER=1 git status/log/diff in PMKit, Cloud, and PM-money before edits.",
+      "pmkit": "No commit or uncommitted change after 8c277a3fb.",
+      "cloud": "Exactly the supplied Todo 1 commits dc3cb85, 465c054, 3b75722, 2df1715, and b33ad54 followed 3c30c0e; docs/PRICING_DECISION.md was unrelated dirt.",
+      "pm_money": "No commit after e2d82a6; deploy/README.md and deploy/terraform/tape.tf were unrelated dirt.",
+      "preserved": "No crates/pmkit-api production file was changed."
+    },
+    "changed_files_by_repository": {
+      "cloud": [
+        "docs/REPOSITORY_RESPONSIBILITIES.md",
+        "scripts/repository-responsibilities-contract.ts",
+        "scripts/verify-repository-responsibilities.ts",
+        "scripts/verify-repository-responsibilities.test.ts"
+      ],
+      "pmkit": [
+        "README.md",
+        "docs/PMKIT_FEATURE_INVENTORY.md",
+        ".omo/evidence/task-1-pmkit-market-tape-service.txt"
+      ],
+      "pm_money": []
+    },
+    "order_route_classification": {
+      "current": {
+        "/data/orders": "PMKit ChainTruthApiV1::data_orders is an implemented typed NotReconstructibleFromChain compatibility debt route.",
+        "/data/order/{id}": "PMKit ChainTruthApiV1::data_order is an implemented typed NotReconstructibleFromChain compatibility debt route."
+      },
+      "final": "Both are absent after the Todo 29/30 WalletReadModel parity and deletion gate; neither is a final supported WalletReadModel mirror.",
+      "final_supported_partition": "exactly ten PMKit Data mirrors, two reconstructible PMKit CLOB mirrors (/data/trades and /balance-allowance), and two PM-money local-only routes (/api/pnl and /api/wallet)."
+    },
+    "red_first": {
+      "command": "cd ../cloud && bun test scripts/verify-repository-responsibilities.test.ts",
+      "result": "exit 1; 6 pass, 1 fail",
+      "observable": "missing /data/orders compatibility-debt catalog row",
+      "green": "After the catalog/validator/doc changes, the same command exited 0 with 8 pass, 0 fail."
+    },
+    "automated_commands": [
+      {
+        "command": "cd ../cloud && bun run scripts/verify-repository-responsibilities.ts --catalog docs/REPOSITORY_RESPONSIBILITIES.md --pmkit ../pmkit --pm-money ../pm-money --cloud .",
+        "result": "exit 0: Inventory: 24 PMKit, 13 PM-money, 1 Cloud packages; 24 routes; 5 runtimes; 5 planned final targets; 38 manifest entries."
+      },
+      {
+        "command": "cd ../cloud && bun test scripts/verify-repository-responsibilities.test.ts",
+        "result": "exit 0; 8 pass, 0 fail, including duplicate-owner, unsupported-route, invalid-path, invalid-planned-target, and private-path-leakage probes."
+      },
+      { "command": "cd ../cloud && bun run typecheck", "result": "exit 0; existing Effect suggestions only." },
+      { "command": "cd ../cloud && bun run lint", "result": "exit 0." },
+      { "command": "cd ../cloud && bun run validate:effect-peers", "result": "exit 0; all Effect peers resolve to 4.0.0-beta.97." },
+      { "command": "cd ../cloud && bun run build", "result": "exit 0; Vite built 513 modules." },
+      { "command": "cd ../cloud && bunx oxfmt --check docs/REPOSITORY_RESPONSIBILITIES.md scripts/repository-responsibilities-contract.ts scripts/verify-repository-responsibilities.ts scripts/verify-repository-responsibilities.test.ts", "result": "exit 0." }
+    ],
+    "adversarial_probes": {
+      "malformed_input": "The five rejection fixtures above each assert a nonzero validator exit and expected diagnostic.",
+      "stale_state": "The live CLI was rerun after fixture tests and reparsed manifests/catalog, reporting 24/13/1 packages and 38 manifest entries.",
+      "dirty_worktree": "GIT_MASTER status/diff checks confirmed only task files plus the three declared unrelated paths; no unrelated path was staged.",
+      "misleading_success_output": "The canonical test asserts exit 0 and parsed inventory output; rejection fixtures assert nonzero exits instead of trusting output text.",
+      "structural_regression": "The new test reads the implemented PMKit data_orders/data_order symbols and requires both compatibility-debt rows to target absent:Todo 29/30.",
+      "count_fixture": "The new temporary catalog fixture adds one runtime and proves the CLI reports 6 runtimes rather than a hardcoded label."
+    },
+    "known_non_task_gate": {
+      "command": "cd ../cloud && bun test",
+      "result": "exit 1 before 19 existing src test bodies: Vitest reports @effect/vitest lacks named assert. package.json and bun.lock are unchanged from b33ad54; this correction's focused suite passes."
+    },
+    "diagnostics": "TypeScript LSP is not installed for this workspace and is outside the request cwd; installation was not authorized. bun run typecheck exited 0.",
+    "cleanup": "The changed-catalog test removes its temporary directory in finally. No server, port, container, browser, or temporary repository file remains.",
+    "commits": {
+      "predecessor": ["3c30c0e", "dc3cb85", "465c054", "3b75722", "2df1715", "b33ad54", "8c277a3fb", "e2d82a6"],
+      "correction": [
+        "a1eba11 test(cloud): classify compatibility-only order debt",
+        "4e40f11d8 docs(pmkit): mark order refusals as compatibility debt"
+      ]
+    },
+    "unrelated_dirt_isolation": [
+      "cloud:docs/PRICING_DECISION.md",
+      "pm-money:deploy/README.md",
+      "pm-money:deploy/terraform/tape.tf"
+    ]
+  }
+}
