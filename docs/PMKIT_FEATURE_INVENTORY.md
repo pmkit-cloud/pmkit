@@ -337,6 +337,9 @@ Those belong in a separate reliability-focused collector/storage project.
 - Chain-truth API for positions, closed positions, trades, activity, balance, and
   pagination.
 - Typed `NotReconstructibleFromChain` responses for off-chain-only order data.
+  `/data/orders` and `/data/order/{id}` currently exist only as compatibility
+  debt; Todos 29/30 remove them after the WalletReadModel parity and deletion
+  gate, and they are not final supported wallet mirrors.
 
 **Crates:** `pmkit-store`, `pmkit-api`.
 

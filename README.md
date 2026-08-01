@@ -188,6 +188,9 @@ and activity with their documented offset limits. It does not expose live
 valuation, display metadata, user profiles, or signed-order lifecycle. CLOB
 `/data/orders` and `/data/order/{id}` return typed
 `NotReconstructibleFromChain` results rather than fabricated data.
+They currently exist only as compatibility debt and are removed after the
+Todo 29/30 WalletReadModel parity and deletion gate; neither is a final
+supported wallet mirror.
 
 ## Building
 
