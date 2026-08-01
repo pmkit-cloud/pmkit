@@ -4,7 +4,7 @@
     "predecessor_partial_state": {
       "inspection": "Ran GIT_MASTER=1 git status/log/diff in PMKit, Cloud, and PM-money before edits.",
       "pmkit": "No commit or uncommitted change after 8c277a3fb.",
-      "cloud": "Exactly the supplied Todo 1 commits dc3cb85, 465c054, 3b75722, 2df1715, and b33ad54 followed 3c30c0e; docs/PRICING_DECISION.md was unrelated dirt.",
+      "cloud": "Exactly the supplied Todo 1 commits dc3cb85, 465c054, 3b75722, 2df1715, and b33ad54 followed 3c30c0e at first inspection; concurrent valid partial work then added 033ca2d and 34b0f05. docs/PRICING_DECISION.md was unrelated dirt.",
       "pm_money": "No commit after e2d82a6; deploy/README.md and deploy/terraform/tape.tf were unrelated dirt.",
       "preserved": "No crates/pmkit-api production file was changed."
     },
@@ -13,7 +13,8 @@
         "docs/REPOSITORY_RESPONSIBILITIES.md",
         "scripts/repository-responsibilities-contract.ts",
         "scripts/verify-repository-responsibilities.ts",
-        "scripts/verify-repository-responsibilities.test.ts"
+        "scripts/verify-repository-responsibilities.test.ts",
+        "scripts/fixtures/repository-responsibilities/invalid-planned-target.md"
       ],
       "pmkit": [
         "README.md",
@@ -68,8 +69,11 @@
     "commits": {
       "predecessor": ["3c30c0e", "dc3cb85", "465c054", "3b75722", "2df1715", "b33ad54", "8c277a3fb", "e2d82a6"],
       "correction": [
+        "033ca2d docs(cloud): classify planned final targets",
+        "34b0f05 fix(cloud): derive responsibility inventory counts",
         "a1eba11 test(cloud): classify compatibility-only order debt",
-        "4e40f11d8 docs(pmkit): mark order refusals as compatibility debt"
+        "4e40f11d8 docs(pmkit): mark order refusals as compatibility debt",
+        "d75e5b68e docs(pmkit): record Todo 1 correction evidence"
       ]
     },
     "unrelated_dirt_isolation": [
