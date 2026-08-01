@@ -1,5 +1,12 @@
 # PMKit feature inventory
 
+## Public ownership boundary
+
+This public inventory covers reusable PMKit capabilities only. Hosted
+historical-data operations, credentials, billing, and archive lifecycle remain
+outside PMKit; consumers keep proprietary strategies, account selection, and
+deployment configuration.
+
 This is the review inventory for PMKit OSS. Statuses describe the current
 repository, not the long-term target.
 

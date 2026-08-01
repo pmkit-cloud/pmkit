@@ -1,5 +1,13 @@
 # PMKit
 
+## Cross-repository ownership
+
+PMKit owns reusable public strategy, tape, wallet-read, accounting, and
+read-only historical-data contracts. Cloud may implement the optional public
+historical DataSource; PMKit never owns hosted routes, credentials, billing, or
+archive infrastructure. Consumers retain their strategies, account selection,
+and deployment configuration.
+
 PMKit is an open-source **Rust SDK first** engine for building, backtesting, and
 running trading strategies on Polymarket prediction markets.
 
