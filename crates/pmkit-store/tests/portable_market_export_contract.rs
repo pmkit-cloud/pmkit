@@ -1,8 +1,8 @@
 //! Public portable market export codec tests.
 
 use pmkit_store::{
-    PortableMarketArtifact, decode_portable_market_export, encode_portable_market_export,
-    validate_portable_market_export_artifacts,
+    PortableMarketArtifact, PortableMarketExportError, decode_portable_market_export,
+    encode_portable_market_export, validate_portable_market_export_artifacts,
 };
 use serde_json::{Value, json};
 
@@ -61,7 +61,22 @@ fn portable_market_export_rejects_non_observed_coverage() -> Result<(), Box<dyn 
 fn portable_market_export_rejects_malformed_bounds() -> Result<(), Box<dyn std::error::Error>> {
     let mut invalid = fixture_value()?;
     invalid["segments"][0]["partition_end_time_ms"] = json!(999);
-    assert!(decode_portable_market_export(&serde_json::to_vec(&invalid)?).is_err());
+    assert!(matches!(
+        decode_portable_market_export(&serde_json::to_vec(&invalid)?),
+        Err(PortableMarketExportError::MalformedDeclaration)
+    ));
+    Ok(())
+}
+
+#[test]
+fn portable_market_export_rejects_invalid_declared_sha256() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut invalid = fixture_value()?;
+    invalid["segments"][0]["sha256"] = json!("not-a-sha256");
+    assert!(matches!(
+        decode_portable_market_export(&serde_json::to_vec(&invalid)?),
+        Err(PortableMarketExportError::InvalidDigest)
+    ));
     Ok(())
 }
 

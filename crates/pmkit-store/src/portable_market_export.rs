@@ -228,6 +228,9 @@ fn validate_content(export: &PortableMarketExport) -> Result<(), PortableMarketE
         if !segment_ids.insert(segment.segment_id.as_str()) {
             return Err(PortableMarketExportError::DuplicateSegmentId);
         }
+        if !is_sha256(&segment.sha256) || !is_sha256(&segment.source_manifest_sha256) {
+            return Err(PortableMarketExportError::InvalidDigest);
+        }
         if !valid_segment(segment) {
             return Err(PortableMarketExportError::MalformedDeclaration);
         }
@@ -263,8 +266,6 @@ fn valid_segment(segment: &PortableMarketSegment) -> bool {
             .outcome_tokens
             .iter()
             .all(|mapping| !mapping.outcome.is_empty() && !mapping.token_id.is_empty())
-        && is_sha256(&segment.sha256)
-        && is_sha256(&segment.source_manifest_sha256)
 }
 
 fn is_sha256(value: &str) -> bool {
