@@ -11,7 +11,6 @@ const EXPORT_PAGE_SIZE: usize = 512;
 const MAX_LOGICAL_SEGMENT_BYTES: usize = 32 * 1024 * 1024;
 const UTC_MINUTE_MS: i64 = 60_000;
 const UTC_DAY_MS: i64 = 86_400_000;
-const PORTABLE_MARKET_EXPORT_VERSION: u16 = 1;
 
 #[path = "market_segment_parts.rs"]
 mod market_segment_parts;
@@ -140,7 +139,7 @@ pub async fn export_market_segments_with_artifacts(
         }
     }
     let manifest = json!({
-        "schema_version": PORTABLE_MARKET_EXPORT_VERSION,
+        "schema_version": crate::PORTABLE_MARKET_EXPORT_VERSION,
         "coverage": "observed",
         "source_manifest_sha256": source_manifest_sha256,
         "segments": declared,
