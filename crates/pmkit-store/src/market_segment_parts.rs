@@ -26,6 +26,34 @@ pub(super) fn metadata_is_valid(metadata: &super::MarketMetadata) -> bool {
             .all(|mapping| !mapping.outcome.is_empty() && !mapping.token_id.is_empty())
 }
 
+pub(super) fn market_metadata(
+    normalized: &Value,
+    market_id: &str,
+) -> Result<(super::MarketMetadata, bool), StoreError> {
+    normalized.get("portable_market").map_or_else(
+        || {
+            Ok((
+                super::MarketMetadata {
+                    series_id: market_id.into(),
+                    asset: None,
+                    duration_seconds: None,
+                    market_id: market_id.into(),
+                    condition_id: market_id.into(),
+                    outcome_tokens: Vec::new(),
+                    open_time_ms: 0,
+                    close_time_ms: i64::MAX,
+                },
+                true,
+            ))
+        },
+        |value| {
+            serde_json::from_value(value.clone())
+                .map(|metadata| (metadata, false))
+                .map_err(|_| super::storage_error("portable market metadata is malformed"))
+        },
+    )
+}
+
 pub(super) fn roll_rows(rows: &[Value], byte_limit: usize) -> Result<Vec<Vec<Value>>, StoreError> {
     let mut parts = Vec::new();
     let mut part = Vec::new();

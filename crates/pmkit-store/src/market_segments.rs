@@ -16,7 +16,9 @@ const PORTABLE_MARKET_EXPORT_VERSION: u16 = 1;
 #[path = "market_segment_parts.rs"]
 mod market_segment_parts;
 
-use market_segment_parts::{SegmentIdInput, encode_rows, metadata_is_valid, roll_rows, segment_id};
+use market_segment_parts::{
+    SegmentIdInput, encode_rows, market_metadata, metadata_is_valid, roll_rows, segment_id,
+};
 
 /// One immutable portable segment declaration and its exact NDJSON bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,34 +187,6 @@ fn materialize_envelope(
         .rows
         .push(row);
     Ok(())
-}
-
-fn market_metadata(
-    normalized: &Value,
-    market_id: &str,
-) -> Result<(MarketMetadata, bool), StoreError> {
-    normalized.get("portable_market").map_or_else(
-        || {
-            Ok((
-                MarketMetadata {
-                    series_id: market_id.into(),
-                    asset: None,
-                    duration_seconds: None,
-                    market_id: market_id.into(),
-                    condition_id: market_id.into(),
-                    outcome_tokens: Vec::new(),
-                    open_time_ms: 0,
-                    close_time_ms: i64::MAX,
-                },
-                true,
-            ))
-        },
-        |value| {
-            serde_json::from_value(value.clone())
-                .map(|metadata| (metadata, false))
-                .map_err(|_| storage_error("portable market metadata is malformed"))
-        },
-    )
 }
 
 async fn ensure_gap_free_segments(
