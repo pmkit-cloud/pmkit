@@ -31,6 +31,7 @@ mod local_files;
 mod log;
 mod market_segments;
 mod migrations;
+mod portable_market_export;
 mod raw;
 mod release_bridge;
 mod replay_bundle;
@@ -66,6 +67,12 @@ pub use log::{
 pub use market_segments::{
     MaterializedMarketSegment, MaterializedMarketSegments, export_market_segments,
     export_market_segments_with_artifacts,
+};
+pub use portable_market_export::{
+    PORTABLE_MARKET_EXPORT_VERSION, PortableAsset, PortableDurationSeconds, PortableMarketArtifact,
+    PortableMarketCoverage, PortableMarketExport, PortableMarketExportError, PortableMarketSegment,
+    PortableOutcomeToken, decode_portable_market_export, encode_portable_market_export,
+    validate_portable_market_export_artifacts,
 };
 pub use release_bridge::{
     CloudMaterialization, CloudMaterializationState, cloud_materialization_from_inbox,
