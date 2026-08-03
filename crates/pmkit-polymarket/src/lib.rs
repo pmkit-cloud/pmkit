@@ -18,6 +18,7 @@ mod execution;
 mod gamma_discovery;
 mod historical;
 mod live;
+mod public_protocol;
 mod public_tape;
 mod public_tape_contract;
 mod subscription;
@@ -26,6 +27,8 @@ mod subscription;
 mod discovery_subscription_tests;
 #[cfg(test)]
 mod gamma_discovery_tests;
+#[cfg(test)]
+mod public_event_surface_tests;
 
 #[cfg(test)]
 mod public_tape_tests;
@@ -38,6 +41,10 @@ pub use historical::PolymarketHistoricalData;
 pub use live::{
     PolymarketFrameAdapter, PolymarketLiveData, RawFrameAdapterError, RawPolymarketFrameAdapter,
     parse_market_frame,
+};
+pub use public_protocol::{
+    PublicInboundFrame, PublicMarketEvent, PublicOutboundFrame, PublicProtocolError,
+    decode_public_inbound, encode_public_outbound,
 };
 pub use public_tape::{PublicTapeImportError, PublicTapeImportReport, PublicTapeImporter};
 pub use public_tape_contract::{certify_v2_public_market_input, certify_v2_public_market_source};
