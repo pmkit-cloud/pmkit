@@ -14,11 +14,28 @@ use pmkit_event::{
 use serde_json::json;
 
 mod raw;
+mod spool;
+mod spool_closed;
+mod spool_fs;
+mod spool_record;
+mod spool_recovery;
+
+#[cfg(test)]
+mod spool_manual_tests;
+#[cfg(test)]
+mod spool_tests;
 
 pub use raw::{
     RAW_TAPE_SCHEMA_VERSION, RawJsonLinesTape, RawTapeError, RawTapeRecord, RawTapeSink,
     decode_raw_record, recoverable_raw_tape_prefix,
 };
+pub use spool::{
+    RAW_SPOOL_SCHEMA_VERSION, RecoveryUncertainty, SpoolCheckpoint, SpoolChunk, SpoolError,
+    SpoolFrame, TailRecovery,
+};
+pub use spool_closed::{VerifiedSpoolChunk, enumerate_closed_chunks};
+pub use spool_fs::RawSpoolWriter;
+pub use spool_recovery::recover_open_chunk;
 
 /// A sink that records market events to a durable local tape.
 pub trait UserTapeSink {
