@@ -20,6 +20,7 @@ path = "src/bin/pmkit_cloud_publish.rs"
 async-trait = { workspace = true }
 chrono = { workspace = true }
 pmkit-core = { path = "../pmkit-core" }
+pmkit-tape = { path = "../pmkit-tape" }
 reqwest = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
