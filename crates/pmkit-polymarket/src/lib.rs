@@ -29,6 +29,8 @@ mod discovery_subscription_tests;
 mod gamma_discovery_tests;
 #[cfg(test)]
 mod public_event_surface_tests;
+#[cfg(test)]
+mod public_protocol_validation_tests;
 
 #[cfg(test)]
 mod public_tape_tests;
