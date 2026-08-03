@@ -114,11 +114,13 @@ pub enum GammaError {
     },
 }
 
+/// Errors returned while requesting or validating an active Gamma market page.
 #[derive(Debug, Error)]
 pub enum DiscoveryError {
     /// The Gamma API returned a transport or request failure.
     #[error("gamma market listing failed: {source}")]
     Listing {
+        /// SDK request or response failure.
         #[source]
         source: SdkError,
     },
@@ -126,9 +128,60 @@ pub enum DiscoveryError {
     /// A discovered market contained an empty or whitespace-only identifier.
     #[error("gamma market identifier was invalid: {source}")]
     InvalidMarketId {
+        /// Rejection produced by the `PMKit` market identifier constructor.
         #[source]
         source: EmptyIdError,
     },
+
+    /// A requested Gamma page cannot be represented by the upstream API.
+    #[error("gamma page request is invalid: {reason}")]
+    InvalidPageRequest {
+        /// Stable reason class for the invalid pagination input.
+        reason: &'static str,
+    },
+}
+
+/// A validated fixed-offset Gamma market request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GammaPageRequest {
+    limit: i32,
+    offset: i32,
+}
+
+impl GammaPageRequest {
+    /// Creates a nonempty Gamma page request with a nonnegative offset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiscoveryError::InvalidPageRequest`] when either coordinate exceeds Gamma's
+    /// signed range or the requested page is empty.
+    pub fn new(limit: u32, offset: u32) -> Result<Self, DiscoveryError> {
+        if limit == 0 {
+            return Err(DiscoveryError::InvalidPageRequest {
+                reason: "limit must be positive",
+            });
+        }
+        Ok(Self {
+            limit: i32::try_from(limit).map_err(|_| DiscoveryError::InvalidPageRequest {
+                reason: "limit exceeds Gamma range",
+            })?,
+            offset: i32::try_from(offset).map_err(|_| DiscoveryError::InvalidPageRequest {
+                reason: "offset exceeds Gamma range",
+            })?,
+        })
+    }
+
+    /// Returns the fixed maximum row count requested from Gamma.
+    #[must_use]
+    pub const fn limit(&self) -> i32 {
+        self.limit
+    }
+
+    /// Returns the zero-based Gamma row offset.
+    #[must_use]
+    pub const fn offset(&self) -> i32 {
+        self.offset
+    }
 }
 
 /// A Gamma client using the official Polymarket SDK.
@@ -152,14 +205,21 @@ impl GammaClient {
         }
     }
 
-    /// Lists active Gamma markets.
+    /// Lists one explicitly requested page of active Gamma markets.
     ///
     /// # Errors
     ///
     /// Returns a transport error if the SDK request fails, a malformed payload error if Gamma
     /// returns invalid market data, or an invalid market id error if a market id is empty.
-    pub async fn list_active_markets(&self) -> Result<Vec<MarketId>, DiscoveryError> {
-        let request = MarketsRequest::builder().closed(false).build();
+    pub async fn list_active_market_page(
+        &self,
+        page: GammaPageRequest,
+    ) -> Result<Vec<MarketId>, DiscoveryError> {
+        let request = MarketsRequest::builder()
+            .closed(false)
+            .limit(page.limit())
+            .offset(page.offset())
+            .build();
         let markets = self
             .client
             .markets(&request)

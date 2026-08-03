@@ -1,16 +1,27 @@
-use super::{DiscoveryError, GammaClient, GammaError, GammaMarket};
+use super::{DiscoveryError, GammaClient, GammaError, GammaMarket, GammaPageRequest};
 use pmkit_core::MarketId;
 use polymarket_client_sdk_v2::gamma::Client as SdkGammaClient;
 use rust_decimal::Decimal;
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
 use std::str::FromStr as _;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
+type RequestLog = Arc<Mutex<Vec<String>>>;
+
 fn fixture_client(body: &'static str) -> Result<GammaClient, Box<dyn std::error::Error>> {
+    Ok(fixture_client_with_requests(body)?.0)
+}
+
+fn fixture_client_with_requests(
+    body: &'static str,
+) -> Result<(GammaClient, RequestLog), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
     let response = body.to_owned();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
 
     thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
@@ -21,6 +32,9 @@ fn fixture_client(body: &'static str) -> Result<GammaClient, Box<dyn std::error:
             let request = String::from_utf8_lossy(&request[..read]);
             if !request.starts_with("GET /markets?") {
                 return;
+            }
+            if let Ok(mut requests) = captured.lock() {
+                requests.push(request.into_owned());
             }
 
             let content_length = response.len();
@@ -37,9 +51,12 @@ connection: close
         }
     });
 
-    Ok(GammaClient {
-        client: SdkGammaClient::new(&format!("http://{address}"))?,
-    })
+    Ok((
+        GammaClient {
+            client: SdkGammaClient::new(&format!("http://{address}"))?,
+        },
+        requests,
+    ))
 }
 
 #[test]
@@ -139,7 +156,7 @@ async fn gamma_malformed_price_fails_closed() -> Result<(), Box<dyn std::error::
 }
 
 #[tokio::test]
-async fn discovery_lists_markets() -> Result<(), Box<dyn std::error::Error>> {
+async fn discovery_lists_market_page() -> Result<(), Box<dyn std::error::Error>> {
     // Given an SDK-backed Gamma client pointed at a deterministic local fixture.
     let client = fixture_client(
         r#"[
@@ -149,7 +166,9 @@ async fn discovery_lists_markets() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     // When active market discovery is exercised through the public seam.
-    let result: Result<Vec<MarketId>, DiscoveryError> = client.list_active_markets().await;
+    let result: Result<Vec<MarketId>, DiscoveryError> = client
+        .list_active_market_page(GammaPageRequest::new(100, 0)?)
+        .await;
 
     // Then the returned market identifiers are exact and typed.
     let expected = vec![MarketId::new("market-1")?, MarketId::new("market-2")?];
@@ -172,7 +191,9 @@ async fn discovery_malformed_fails_closed() -> Result<(), Box<dyn std::error::Er
     )?;
 
     // When discovery encounters a malformed market entry.
-    let result: Result<Vec<MarketId>, DiscoveryError> = client.list_active_markets().await;
+    let result: Result<Vec<MarketId>, DiscoveryError> = client
+        .list_active_market_page(GammaPageRequest::new(100, 0)?)
+        .await;
 
     // Then it fails closed instead of exposing a partial list.
     match result {
@@ -181,5 +202,29 @@ async fn discovery_malformed_fails_closed() -> Result<(), Box<dyn std::error::Er
         Err(err) => return Err(format!("expected listing error, got {err:?}").into()),
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn discovery_page_uses_fixed_limit_and_offset() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: a public Gamma client backed by a request-capturing fixture.
+    let (client, requests) = fixture_client_with_requests(r#"[{"id":"market-5"}]"#)?;
+
+    // When: one typed page is fetched at a nonzero offset.
+    let page = client
+        .list_active_market_page(GammaPageRequest::new(2, 4)?)
+        .await?;
+
+    // Then: the actual Gamma request and typed response preserve both pagination coordinates.
+    assert_eq!(page, vec![MarketId::new("market-5")?]);
+    {
+        let guard = requests.lock().map_err(|_| "request capture poisoned")?;
+        let Some(request) = guard.first() else {
+            return Err("expected a Gamma request".into());
+        };
+        assert!(request.contains("limit=2"));
+        assert!(request.contains("offset=4"));
+        drop(guard);
+    }
     Ok(())
 }

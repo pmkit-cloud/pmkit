@@ -5,7 +5,9 @@ mod gamma;
 mod types;
 
 pub use api::ChainTruthApiV1;
-pub use gamma::{GammaClient, GammaMarket};
+pub use gamma::{
+    DiscoveryError as GammaDiscoveryError, GammaClient, GammaMarket, GammaPageRequest,
+};
 pub use types::{
     ActivityQuery, ChainTruthActivity, ChainTruthBalance, ChainTruthClosedPosition,
     ChainTruthPosition, ChainTruthTrade, ClosedPositionsQuery, DataOrderQuery, DataOrdersQuery,
