@@ -15,6 +15,7 @@ use rust_decimal::Decimal;
 mod account;
 mod discovery;
 mod execution;
+mod gamma_discovery;
 mod historical;
 mod live;
 mod public_tape;
@@ -23,6 +24,8 @@ mod subscription;
 
 #[cfg(test)]
 mod discovery_subscription_tests;
+#[cfg(test)]
+mod gamma_discovery_tests;
 
 #[cfg(test)]
 mod public_tape_tests;
@@ -30,6 +33,7 @@ mod public_tape_tests;
 pub use account::PolymarketUserData;
 pub use discovery::{DiscoveryError, GammaPageRequest, discover_subscription_snapshot};
 pub use execution::PolymarketExecutor;
+pub use gamma_discovery::GammaDiscovery;
 pub use historical::PolymarketHistoricalData;
 pub use live::{
     PolymarketFrameAdapter, PolymarketLiveData, RawFrameAdapterError, RawPolymarketFrameAdapter,
