@@ -13,16 +13,22 @@ use polymarket_client_sdk_v2::types::U256;
 use rust_decimal::Decimal;
 
 mod account;
+mod discovery;
 mod execution;
 mod historical;
 mod live;
 mod public_tape;
 mod public_tape_contract;
+mod subscription;
+
+#[cfg(test)]
+mod discovery_subscription_tests;
 
 #[cfg(test)]
 mod public_tape_tests;
 
 pub use account::PolymarketUserData;
+pub use discovery::{DiscoveryError, GammaPageRequest, discover_subscription_snapshot};
 pub use execution::PolymarketExecutor;
 pub use historical::PolymarketHistoricalData;
 pub use live::{
@@ -31,6 +37,10 @@ pub use live::{
 };
 pub use public_tape::{PublicTapeImportError, PublicTapeImportReport, PublicTapeImporter};
 pub use public_tape_contract::{certify_v2_public_market_input, certify_v2_public_market_source};
+pub use subscription::{
+    DiscoverySnapshot, GammaMarket, GammaOutcome, RecurringFamily, ReplicaSubscriptionPlan,
+    SubscriptionShard,
+};
 
 /// Maps a neutral `PMKit` [`Side`] to the Polymarket venue side.
 #[must_use]
