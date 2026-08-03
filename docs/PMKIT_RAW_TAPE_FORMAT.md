@@ -28,6 +28,47 @@ tail without a newline is incomplete and must be discarded before appending.
 A malformed newline-terminated record or unsupported schema version is a
 fail-closed corruption error, not a skippable frame.
 
+## Redundant raw spool v1
+
+The existing v1 raw-line format remains compatible with `RawTapeSink`. The
+additive raw-spool format stores independently captured binary frames before
+adaptation. Callers choose a portable filesystem root; PMKit does not prescribe
+an absolute path or a deployment-specific directory.
+
+Each frame line includes `schema_version: 1`, `replica_id`, `shard_id`,
+`minute_start_ms`, `connection_epoch`, `frame_sequence`, `receipt_time_ms`, a
+lowercase `discovery_snapshot_sha256`, and `raw_bytes`. `raw_bytes` is a JSON
+byte array so arbitrary original bytes round-trip without UTF-8 conversion.
+`minute_start_ms` is an exact Unix UTC-minute boundary.
+
+The chunk layout is:
+
+```text
+<root>/<replica_id>/<shard_id>/minute-<utc-minute-ms>.open
+<root>/<replica_id>/<shard_id>/minute-<utc-minute-ms>.jsonl
+<root>/<replica_id>/<shard_id>/minute-<utc-minute-ms>.jsonl.sha256
+```
+
+Replica and shard IDs are restricted to portable alphanumeric, `_`, and `-`
+components. A writer accepts only frames whose receipt time falls within its
+minute. A reconnect increments `connection_epoch`; `frame_sequence` may restart
+for the new epoch. Repeated byte-identical frames are retained as distinct
+records.
+
+On opening an existing `.open` chunk, recovery validates each complete line and
+truncates only an unterminated final line, returning typed uncertainty with its
+discarded byte count. A malformed newline-terminated line is fail-closed. The
+validated prefix is never rewritten.
+
+Close flushes and fsyncs the `.open` file, then atomically publishes it as a
+new `.jsonl` name without replacing a pre-existing closed chunk, and writes a
+checksum sidecar. The sidecar SHA-256 is the digest of the exact `.jsonl`
+bytes; its separate identity fields bind that digest to the chunk. Consumers
+enumerate only `.jsonl` chunks with a matching sidecar and fully valid lines. A
+checkpoint identity is constructed only from such a verified closed chunk.
+Attempting to open or close over an already closed chunk fails rather than
+rewriting its evidence.
+
 ## Compatibility and migration
 
 The pre-v1 development format used `received_ms` and had no `schema_version`.
