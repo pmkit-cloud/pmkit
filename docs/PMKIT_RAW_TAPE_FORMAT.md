@@ -61,13 +61,13 @@ discarded byte count. A malformed newline-terminated line is fail-closed. The
 validated prefix is never rewritten.
 
 Close flushes and fsyncs the `.open` file, then atomically publishes it as a
-new `.jsonl` name without replacing a pre-existing closed chunk, and writes a
-checksum sidecar. The sidecar SHA-256 is the digest of the exact `.jsonl`
-bytes; its separate identity fields bind that digest to the chunk. Consumers
-enumerate only `.jsonl` chunks with a matching sidecar and fully valid lines. A
-checkpoint identity is constructed only from such a verified closed chunk.
-Attempting to open or close over an already closed chunk fails rather than
-rewriting its evidence.
+new `.jsonl` name without replacing a pre-existing closed chunk, writes a
+checksum sidecar, and fsyncs the shard directory. The sidecar SHA-256 is the
+digest of the exact `.jsonl` bytes; its separate identity fields bind that
+digest to the chunk. Consumers enumerate only `.jsonl` chunks with a matching
+sidecar and fully valid lines. A checkpoint identity is constructed only from
+such a verified closed chunk. Attempting to open or close over an already
+closed chunk fails rather than rewriting its evidence.
 
 ## Compatibility and migration
 

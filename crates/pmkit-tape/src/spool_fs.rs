@@ -3,7 +3,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::spool_closed::{
-    publish_without_replacing, remove_if_present, temporary_checksum_path, write_checksum_sidecar,
+    publish_without_replacing, remove_if_present, sync_parent_directory, temporary_checksum_path,
+    write_checksum_sidecar,
 };
 use crate::spool_record::encode_record;
 use crate::{SpoolChunk, SpoolError, SpoolFrame, recover_open_chunk};
@@ -86,6 +87,6 @@ impl RawSpoolWriter {
         let bytes = fs::read(&self.open_path)?;
         write_checksum_sidecar(&self.checksum_path, &self.chunk, &bytes)?;
         publish_without_replacing(&self.open_path, &self.closed_path)?;
-        Ok(())
+        sync_parent_directory(&self.closed_path)
     }
 }
