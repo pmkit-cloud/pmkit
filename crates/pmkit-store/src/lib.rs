@@ -33,6 +33,7 @@ mod market_segments;
 mod migrations;
 mod portable_market_export;
 mod raw;
+mod reconciliation;
 mod release_bridge;
 mod replay_bundle;
 mod rpc;
@@ -55,6 +56,12 @@ mod record_version_tests;
 #[cfg(test)]
 mod chain_tests;
 
+#[cfg(test)]
+mod reconciliation_tests;
+
+#[cfg(test)]
+mod reconciliation_snapshot_tests;
+
 pub use chain::{Address, AddressError, ChainId, ContractRegistry, LegacyV1Contracts};
 pub use chain_store::CanonicalLogStore;
 pub use cloud_publish::{CloudPublishError, CloudPublishProgress, CloudPublisher};
@@ -73,6 +80,11 @@ pub use portable_market_export::{
     PortableMarketCoverage, PortableMarketExport, PortableMarketExportError, PortableMarketSegment,
     PortableOutcomeToken, decode_portable_market_export, encode_portable_market_export,
     validate_portable_market_export_artifacts,
+};
+pub use reconciliation::{
+    CanonicalOccurrence, RawMarketLaneRecord, ReconciliationError, ReconciliationFailure,
+    ReconciliationFailureReason, ReconciliationRequest, ReconciliationResult,
+    reconcile_and_store_redundant_market_evidence, reconcile_redundant_market_evidence,
 };
 pub use release_bridge::{
     CloudMaterialization, CloudMaterializationState, cloud_materialization_from_inbox,
