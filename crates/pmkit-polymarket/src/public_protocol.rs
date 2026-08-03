@@ -1,29 +1,33 @@
+use polymarket_client_sdk_v2::clob::ws::{
+    BestBidAsk, BookUpdate, LastTradePrice, MarketResolved, NewMarket, PriceChange, TickSizeChange,
+};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::subscription::PublicSubscription;
 
 /// A public market event whose raw bytes remain independently auditable.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum PublicMarketEvent {
     /// Full orderbook snapshot or delta.
-    OrderbookSnapshot,
+    OrderbookSnapshot(Box<BookUpdate>),
     /// Price change batch.
-    PriceChange,
+    PriceChange(Box<PriceChange>),
     /// Last-trade-price update.
-    LastTradePrice,
+    LastTradePrice(Box<LastTradePrice>),
     /// Tick-size change.
-    TickSizeChange,
+    TickSizeChange(Box<TickSizeChange>),
     /// Best bid/ask update.
-    BestBidAsk,
+    BestBidAsk(Box<BestBidAsk>),
     /// Newly announced market.
-    NewMarket,
+    NewMarket(Box<NewMarket>),
     /// Resolved market.
-    MarketResolved,
+    MarketResolved(Box<MarketResolved>),
 }
 
 /// A complete unauthenticated inbound public WebSocket frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum PublicInboundFrame {
     /// Server subscription acknowledgement/update.
     SubscriptionUpdate {
@@ -132,26 +136,59 @@ pub fn decode_public_inbound(raw: &[u8]) -> Result<PublicInboundFrame, PublicPro
     })?;
     let event_type = value
         .get("event_type")
-        .and_then(Value::as_str)
         .ok_or_else(|| PublicProtocolError::Malformed {
             detail: "missing event_type",
             raw: raw.to_vec(),
-        })?;
+        })?
+        .as_str()
+        .ok_or_else(|| PublicProtocolError::Malformed {
+            detail: "event_type is invalid",
+            raw: raw.to_vec(),
+        })?
+        .to_owned();
     let raw = raw.to_vec();
-    match event_type {
+    match event_type.as_str() {
         "subscription_update" => Ok(PublicInboundFrame::SubscriptionUpdate {
             subscription: subscription(&value, raw.clone())?,
             raw,
         }),
         "ping" => Ok(PublicInboundFrame::Ping { raw }),
         "pong" => Ok(PublicInboundFrame::Pong { raw }),
-        "book" => market(PublicMarketEvent::OrderbookSnapshot, &value, raw),
-        "price_change" => market(PublicMarketEvent::PriceChange, &value, raw),
-        "last_trade_price" => market(PublicMarketEvent::LastTradePrice, &value, raw),
-        "tick_size_change" => market(PublicMarketEvent::TickSizeChange, &value, raw),
-        "best_bid_ask" => market(PublicMarketEvent::BestBidAsk, &value, raw),
-        "new_market" => market(PublicMarketEvent::NewMarket, &value, raw),
-        "market_resolved" => market(PublicMarketEvent::MarketResolved, &value, raw),
+        "book" => market(
+            |payload| PublicMarketEvent::OrderbookSnapshot(Box::new(payload)),
+            value,
+            raw,
+        ),
+        "price_change" => market(
+            |payload| PublicMarketEvent::PriceChange(Box::new(payload)),
+            value,
+            raw,
+        ),
+        "last_trade_price" => market(
+            |payload| PublicMarketEvent::LastTradePrice(Box::new(payload)),
+            value,
+            raw,
+        ),
+        "tick_size_change" => market(
+            |payload| PublicMarketEvent::TickSizeChange(Box::new(payload)),
+            value,
+            raw,
+        ),
+        "best_bid_ask" => market(
+            |payload| PublicMarketEvent::BestBidAsk(Box::new(payload)),
+            value,
+            raw,
+        ),
+        "new_market" => market(
+            |payload| PublicMarketEvent::NewMarket(Box::new(payload)),
+            value,
+            raw,
+        ),
+        "market_resolved" => market(
+            |payload| PublicMarketEvent::MarketResolved(Box::new(payload)),
+            value,
+            raw,
+        ),
         event_type if market_bearing(&value) => Err(PublicProtocolError::UnsupportedMarketEvent {
             event_type: event_type.to_owned(),
             raw,
@@ -206,18 +243,29 @@ fn subscription(value: &Value, raw: Vec<u8>) -> Result<PublicSubscription, Publi
     ))
 }
 
-fn market(
-    event: PublicMarketEvent,
-    value: &Value,
+fn market<T>(
+    to_event: impl FnOnce(T) -> PublicMarketEvent,
+    value: Value,
     raw: Vec<u8>,
-) -> Result<PublicInboundFrame, PublicProtocolError> {
+) -> Result<PublicInboundFrame, PublicProtocolError>
+where
+    T: DeserializeOwned,
+{
     if value.get("market").and_then(Value::as_str).is_none() {
         return Err(PublicProtocolError::Malformed {
             detail: "market event lacks market identity",
             raw,
         });
     }
-    Ok(PublicInboundFrame::Market { event, raw })
+    let payload =
+        serde_json::from_value::<T>(value).map_err(|_| PublicProtocolError::Malformed {
+            detail: "market event payload is invalid",
+            raw: raw.clone(),
+        })?;
+    Ok(PublicInboundFrame::Market {
+        event: to_event(payload),
+        raw,
+    })
 }
 
 fn market_bearing(value: &Value) -> bool {
