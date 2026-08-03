@@ -24,6 +24,14 @@ impl VerifiedSpoolChunk {
     /// Returns [`SpoolError`] when the file changed after verification or a record is invalid.
     pub fn records(&self) -> Result<Vec<SpoolFrame>, SpoolError> {
         let bytes = fs::read(&self.path)?;
+        let byte_length = u64::try_from(bytes.len()).map_err(|_| SpoolError::ChecksumMismatch {
+            path: self.path.clone(),
+        })?;
+        if byte_length != self.byte_length || checksum_hex(&bytes) != self.sha256_hex {
+            return Err(SpoolError::ChecksumMismatch {
+                path: self.path.clone(),
+            });
+        }
         let mut records = Vec::new();
         for line in bytes.split_inclusive(|byte| *byte == b'\n') {
             if !line.ends_with(b"\n") {
@@ -185,6 +193,14 @@ pub fn publish_without_replacing(source: &Path, destination: &Path) -> Result<()
         }
         Err(error) => Err(SpoolError::Io(error)),
     }
+}
+
+pub fn sync_parent_directory(path: &Path) -> Result<(), SpoolError> {
+    let parent = path.parent().ok_or_else(|| SpoolError::MalformedRecord {
+        message: "spool path has no parent directory".to_owned(),
+    })?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 pub fn temporary_checksum_path(path: &Path) -> PathBuf {

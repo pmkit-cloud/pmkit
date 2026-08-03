@@ -21,6 +21,8 @@ mod spool_record;
 mod spool_recovery;
 
 #[cfg(test)]
+mod spool_closed_tests;
+#[cfg(test)]
 mod spool_manual_tests;
 #[cfg(test)]
 mod spool_tests;
