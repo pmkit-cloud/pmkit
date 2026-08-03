@@ -210,21 +210,21 @@ fn gap_from_failure(
             lane_id: failure.lane_id.clone(),
         });
     }
-    Ok(partition_gap(
-        scope,
-        &failure.market_id,
-        failure.minute_start_ms,
-        failure.reason.label(),
-    ))
+    let partition = Partition {
+        snapshot: failure.discovery_snapshot_sha256.clone(),
+        market_id: failure.market_id.clone(),
+        minute_start_ms: failure.minute_start_ms,
+    };
+    Ok(partition_gap(scope, &partition, failure.reason.label()))
 }
 
 fn malformed_gap(scope: &OwnerScope, raw: &RawMarketLaneRecord) -> ReplayGapInterval {
-    partition_gap(
-        scope,
-        &raw.market_id,
-        raw.chunk.minute_start_ms(),
-        "malformed_record",
-    )
+    let partition = Partition {
+        snapshot: raw.frame.discovery_snapshot_sha256.clone(),
+        market_id: raw.market_id.clone(),
+        minute_start_ms: raw.chunk.minute_start_ms(),
+    };
+    partition_gap(scope, &partition, "malformed_record")
 }
 
 fn disagreement_gap(
@@ -237,25 +237,15 @@ fn disagreement_gap(
         .map(|(lane_id, records)| format!("{lane_id}={}", records.len()))
         .collect::<Vec<_>>()
         .join(",");
-    partition_gap(
-        scope,
-        &partition.market_id,
-        partition.minute_start_ms,
-        &format!("lane_disagreement:{counts}"),
-    )
+    partition_gap(scope, partition, &format!("lane_disagreement:{counts}"))
 }
 
-fn partition_gap(
-    scope: &OwnerScope,
-    market_id: &str,
-    minute_start_ms: i64,
-    reason: &str,
-) -> ReplayGapInterval {
+fn partition_gap(scope: &OwnerScope, partition: &Partition, reason: &str) -> ReplayGapInterval {
     ReplayGapInterval {
         scope: scope.clone(),
-        partition: format!("{market_id}:{minute_start_ms}"),
-        start_time_ms: minute_start_ms,
-        end_time_ms: minute_start_ms.checked_add(UTC_MINUTE_MS - 1),
+        partition: format!("{}:{}", partition.market_id, partition.minute_start_ms),
+        start_time_ms: partition.minute_start_ms,
+        end_time_ms: partition.minute_start_ms.checked_add(UTC_MINUTE_MS - 1),
         reason: reason.to_owned(),
     }
 }
