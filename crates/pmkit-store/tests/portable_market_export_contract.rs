@@ -1,8 +1,9 @@
 //! Public portable market export codec tests.
 
 use pmkit_store::{
-    PortableMarketArtifact, PortableMarketExportError, decode_portable_market_export,
-    encode_portable_market_export, validate_portable_market_export_artifacts,
+    PORTABLE_MARKET_EXPORT_VERSION, PortableMarketArtifact, PortableMarketExportError,
+    decode_portable_market_export, encode_portable_market_export,
+    validate_portable_market_export_artifacts,
 };
 use serde_json::{Value, json};
 
@@ -41,10 +42,20 @@ fn fixture_value() -> Result<Value, Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn portable_market_export_rejects_unsupported_version() -> Result<(), Box<dyn std::error::Error>> {
-    let mut invalid = fixture_value()?;
-    invalid["schema_version"] = json!(2);
-    assert!(decode_portable_market_export(&serde_json::to_vec(&invalid)?).is_err());
+fn portable_market_export_rejects_future_version() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: a canonical export changed to the next unsupported version.
+    let mut future = fixture_value()?;
+    future["schema_version"] = json!(PORTABLE_MARKET_EXPORT_VERSION + 1);
+
+    // When: a consumer decodes it.
+    let result = decode_portable_market_export(&serde_json::to_vec(&future)?);
+
+    // Then: it fails closed with the version supplied by the untrusted manifest.
+    assert!(matches!(
+        result,
+        Err(PortableMarketExportError::UnsupportedSchemaVersion { schema_version })
+            if schema_version == PORTABLE_MARKET_EXPORT_VERSION + 1
+    ));
     Ok(())
 }
 
