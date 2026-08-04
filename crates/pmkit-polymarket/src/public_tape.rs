@@ -285,6 +285,7 @@ impl PublicTapeImporter {
                         .as_str()
                         .ok_or_else(|| invalid("recorder gap scope is not a partition"))?
                         .to_owned(),
+                    discovery_snapshot_sha256: None,
                     start_time_ms: gap.start_time_ms,
                     end_time_ms: gap.end_time_ms,
                     reason: gap.reason,

@@ -400,6 +400,8 @@ pub struct ReplayGapInterval {
     pub scope: OwnerScope,
     /// The affected `market_id:utc_day_start_ms` partition, or `all_subscribed`.
     pub partition: String,
+    /// The verified discovery snapshot that scoped the gap, when the producer provides one.
+    pub discovery_snapshot_sha256: Option<String>,
     /// The inclusive interval start in source milliseconds.
     pub start_time_ms: i64,
     /// The inclusive interval end, or `None` when the recorder never resolved it.

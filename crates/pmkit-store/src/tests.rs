@@ -652,6 +652,7 @@ async fn market_segment_export_rejects_intersecting_persisted_replay_gap()
         .store_replay_gap(&ReplayGapInterval {
             scope: scope.clone(),
             partition: "token-1:0".into(),
+            discovery_snapshot_sha256: None,
             start_time_ms: 999,
             end_time_ms: Some(1_001),
             reason: "malformed_data".into(),
@@ -682,6 +683,7 @@ async fn market_segment_export_withholds_the_full_day_for_a_late_partition_gap()
         .store_replay_gap(&ReplayGapInterval {
             scope: scope.clone(),
             partition: "token-1:0".into(),
+            discovery_snapshot_sha256: None,
             start_time_ms: 86_399_000,
             end_time_ms: Some(86_399_999),
             reason: "late_disconnect".into(),
@@ -712,6 +714,7 @@ async fn market_segment_export_ignores_overlapping_gap_in_another_partition()
         .store_replay_gap(&ReplayGapInterval {
             scope: scope.clone(),
             partition: "token-2:0".into(),
+            discovery_snapshot_sha256: None,
             start_time_ms: 999,
             end_time_ms: Some(1_001),
             reason: "malformed_data".into(),
