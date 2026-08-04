@@ -64,6 +64,22 @@ struct SegmentRows {
     rows: Vec<Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SegmentPartition {
+    market_id: String,
+    minute_start_ms: i64,
+    discovery_snapshot_sha256: Option<String>,
+}
+
+enum ReplayGapPartition<'a> {
+    AllSubscribed,
+    MarketMinute {
+        market_id: &'a str,
+        minute_start_ms: i64,
+    },
+    Unknown,
+}
+
 /// Exports one sealed day as a portable market export manifest.
 ///
 /// # Errors
@@ -119,7 +135,7 @@ pub async fn export_market_segments_with_artifacts(
     let source_manifest_sha256 = digest_json(manifest.document())?;
     let mut declared = Vec::new();
     let mut materialized = Vec::new();
-    for ((market_id, minute_start), segment) in segments {
+    for (partition, segment) in segments {
         for (subpart, rows) in roll_rows(&segment.rows, MAX_LOGICAL_SEGMENT_BYTES)?
             .into_iter()
             .enumerate()
@@ -127,8 +143,7 @@ pub async fn export_market_segments_with_artifacts(
             let subpart_ordinal = u64::try_from(subpart)
                 .map_err(|_| storage_error("portable segment subpart ordinal is invalid"))?;
             let (declaration, bytes) = materialize_segment(
-                &market_id,
-                minute_start,
+                &partition,
                 &source_manifest_sha256,
                 &segment,
                 &rows,
@@ -152,7 +167,7 @@ pub async fn export_market_segments_with_artifacts(
 
 fn materialize_envelope(
     manifest: &SealedClosedDayManifest,
-    segments: &mut BTreeMap<(String, i64), SegmentRows>,
+    segments: &mut BTreeMap<SegmentPartition, SegmentRows>,
     envelope: &crate::PmEnvelope,
 ) -> Result<(), StoreError> {
     if !manifest.contains(envelope.source_timestamp_ms) || envelope.source_timestamp_ms < 0 {
@@ -177,7 +192,11 @@ fn materialize_envelope(
         "payload": envelope.normalized.get("payload").cloned().unwrap_or(Value::Null),
     });
     segments
-        .entry((metadata.market_id.clone(), minute_start))
+        .entry(SegmentPartition {
+            market_id: metadata.market_id.clone(),
+            minute_start_ms: minute_start,
+            discovery_snapshot_sha256: envelope_discovery_snapshot(envelope),
+        })
         .or_insert_with(|| SegmentRows {
             metadata,
             legacy_coverage,
@@ -188,22 +207,27 @@ fn materialize_envelope(
     Ok(())
 }
 
+fn envelope_discovery_snapshot(envelope: &crate::PmEnvelope) -> Option<String> {
+    let frame = serde_json::from_slice::<Value>(&envelope.raw_frame).ok()?;
+    let snapshot = frame.get("discovery_snapshot_sha256")?.as_str()?;
+    crate::portable_market_export::is_sha256(snapshot).then(|| snapshot.to_owned())
+}
+
 async fn ensure_gap_free_segments(
     store: &dyn TapeStore,
     scope: &OwnerScope,
-    segments: &BTreeMap<(String, i64), SegmentRows>,
+    segments: &BTreeMap<SegmentPartition, SegmentRows>,
 ) -> Result<(), StoreError> {
     let gaps = store.read_replay_gaps(scope).await?;
-    for ((market_id, minute_start), segment) in segments {
+    for (partition, segment) in segments {
         let end = if segment.legacy_coverage {
-            minute_start / UTC_DAY_MS * UTC_DAY_MS + UTC_DAY_MS - 1
+            partition.minute_start_ms / UTC_DAY_MS * UTC_DAY_MS + UTC_DAY_MS - 1
         } else {
-            minute_start + UTC_MINUTE_MS - 1
+            partition.minute_start_ms + UTC_MINUTE_MS - 1
         };
-        let partition = format!("{market_id}:{minute_start}");
         if gaps.iter().any(|gap| {
-            (gap.partition == "all_subscribed" || gap.partition == partition)
-                && intervals_intersect(*minute_start, end, gap)
+            gap_matches_segment(gap, partition)
+                && intervals_intersect(partition.minute_start_ms, end, gap)
         }) {
             return Err(storage_error(
                 "portable market export intersects a replay gap",
@@ -213,13 +237,47 @@ async fn ensure_gap_free_segments(
     Ok(())
 }
 
+fn gap_matches_segment(gap: &ReplayGapInterval, segment: &SegmentPartition) -> bool {
+    let partition_matches = match replay_gap_partition(&gap.partition) {
+        ReplayGapPartition::AllSubscribed => true,
+        ReplayGapPartition::MarketMinute {
+            market_id,
+            minute_start_ms,
+        } => market_id == segment.market_id && minute_start_ms == segment.minute_start_ms,
+        ReplayGapPartition::Unknown => false,
+    };
+    partition_matches
+        && match (
+            &gap.discovery_snapshot_sha256,
+            &segment.discovery_snapshot_sha256,
+        ) {
+            (Some(gap_snapshot), Some(segment_snapshot)) => gap_snapshot == segment_snapshot,
+            _ => true,
+        }
+}
+
+fn replay_gap_partition(value: &str) -> ReplayGapPartition<'_> {
+    if value == "all_subscribed" {
+        return ReplayGapPartition::AllSubscribed;
+    }
+    let Some((market_id, minute_start_ms)) = value.rsplit_once(':') else {
+        return ReplayGapPartition::Unknown;
+    };
+    let Ok(minute_start_ms) = minute_start_ms.parse() else {
+        return ReplayGapPartition::Unknown;
+    };
+    ReplayGapPartition::MarketMinute {
+        market_id,
+        minute_start_ms,
+    }
+}
+
 fn intervals_intersect(start: i64, end: i64, gap: &ReplayGapInterval) -> bool {
     gap.start_time_ms <= end && gap.end_time_ms.unwrap_or(i64::MAX) >= start
 }
 
 fn materialize_segment(
-    market_id: &str,
-    minute_start: i64,
+    partition: &SegmentPartition,
     source_manifest_sha256: &str,
     segment: &SegmentRows,
     rows: &[Value],
@@ -240,22 +298,23 @@ fn materialize_segment(
     let segment_id = segment_id(SegmentIdInput {
         source_manifest_sha256,
         series_id: &segment.metadata.series_id,
-        market_id,
-        minute_start,
+        market_id: &partition.market_id,
+        discovery_snapshot_sha256: partition.discovery_snapshot_sha256.as_deref(),
+        minute_start: partition.minute_start_ms,
         subpart_ordinal,
     });
-    let declaration = json!({
+    let mut declaration = json!({
         "segment_id": segment_id,
         "series_id": segment.metadata.series_id,
         "asset": segment.metadata.asset,
         "duration_seconds": segment.metadata.duration_seconds,
-        "market_id": market_id,
+        "market_id": partition.market_id,
         "condition_id": segment.metadata.condition_id,
         "outcome_tokens": segment.metadata.outcome_tokens.iter().map(|mapping| json!({"outcome": mapping.outcome, "token_id": mapping.token_id})).collect::<Vec<_>>(),
         "market_open_time_ms": segment.metadata.open_time_ms,
         "market_close_time_ms": segment.metadata.close_time_ms,
-        "partition_start_time_ms": minute_start,
-        "partition_end_time_ms": minute_start + UTC_MINUTE_MS - 1,
+        "partition_start_time_ms": partition.minute_start_ms,
+        "partition_end_time_ms": partition.minute_start_ms + UTC_MINUTE_MS - 1,
         "subpart_ordinal": subpart_ordinal,
         "from_time_ms": from_time_ms,
         "to_time_ms": to_time_ms,
@@ -267,6 +326,15 @@ fn materialize_segment(
         "source_manifest_sha256": source_manifest_sha256,
         "artifact_key": format!("portable-market-export-v1/{segment_id}.jsonl"),
     });
+    if let Some(snapshot) = &partition.discovery_snapshot_sha256 {
+        declaration
+            .as_object_mut()
+            .ok_or_else(|| storage_error("portable market declaration is not an object"))?
+            .insert(
+                "discovery_snapshot_sha256".into(),
+                Value::String(snapshot.clone()),
+            );
+    }
     Ok((declaration, content))
 }
 

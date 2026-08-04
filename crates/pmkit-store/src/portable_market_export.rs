@@ -54,6 +54,9 @@ pub struct PortableMarketSegment {
     pub duration_seconds: Option<PortableDurationSeconds>,
     /// Concrete market instance identity.
     pub market_id: String,
+    /// Optional discovery snapshot that scoped this market-minute evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_snapshot_sha256: Option<String>,
     /// Concrete condition identity.
     pub condition_id: String,
     /// Ordered outcome-to-token mappings.
@@ -251,6 +254,10 @@ fn valid_segment(segment: &PortableMarketSegment) -> bool {
         && segment
             .duration_seconds
             .is_none_or(|duration| duration.0 > 0)
+        && segment
+            .discovery_snapshot_sha256
+            .as_deref()
+            .is_none_or(is_sha256)
         && segment.market_open_time_ms <= segment.market_close_time_ms
         && segment.partition_start_time_ms <= segment.partition_end_time_ms
         && segment.from_time_ms <= segment.to_time_ms
@@ -268,7 +275,7 @@ fn valid_segment(segment: &PortableMarketSegment) -> bool {
             .all(|mapping| !mapping.outcome.is_empty() && !mapping.token_id.is_empty())
 }
 
-fn is_sha256(value: &str) -> bool {
+pub fn is_sha256(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()

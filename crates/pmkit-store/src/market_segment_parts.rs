@@ -7,6 +7,7 @@ pub(super) struct SegmentIdInput<'a> {
     pub(super) source_manifest_sha256: &'a str,
     pub(super) series_id: &'a str,
     pub(super) market_id: &'a str,
+    pub(super) discovery_snapshot_sha256: Option<&'a str>,
     pub(super) minute_start: i64,
     pub(super) subpart_ordinal: u64,
 }
@@ -100,15 +101,17 @@ pub(super) fn encode_rows(rows: &[Value]) -> Result<Vec<u8>, StoreError> {
 }
 
 pub(super) fn segment_id(input: SegmentIdInput<'_>) -> String {
-    crate::integrity::sha256_hex(
-        format!(
-            "{}\n{}\n{}\n{}\n{}",
-            input.source_manifest_sha256,
-            input.series_id,
-            input.market_id,
-            input.minute_start,
-            input.subpart_ordinal,
-        )
-        .as_bytes(),
-    )
+    let mut identity = format!(
+        "{}\n{}\n{}\n{}\n{}",
+        input.source_manifest_sha256,
+        input.series_id,
+        input.market_id,
+        input.minute_start,
+        input.subpart_ordinal,
+    );
+    if let Some(snapshot) = input.discovery_snapshot_sha256 {
+        identity.push('\n');
+        identity.push_str(snapshot);
+    }
+    crate::integrity::sha256_hex(identity.as_bytes())
 }
