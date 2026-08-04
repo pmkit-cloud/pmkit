@@ -55,6 +55,21 @@ minute. A reconnect increments `connection_epoch`; `frame_sequence` may restart
 for the new epoch. Repeated byte-identical frames are retained as distinct
 records.
 
+### Checked-in raw-spool compatibility fixture
+
+`crates/pmkit-tape/tests/fixtures/raw-spool-v1.jsonl` is the portable v1
+fixture. It contains a byte-preserving frame with lane, shard, UTC-minute,
+connection epoch, sequence, receipt time, and discovery-snapshot provenance.
+The contract test decodes the fixture, re-encodes it, and rejects version `2`
+with `SpoolError::UnsupportedSchemaVersion`; consumers must retain that
+fail-closed behavior.
+
+Raw-spool v1 has no implicit migration. A record with an absent, older, or
+future schema version is not interpreted as v1. Upgrade by writing new complete
+v1 chunks while preserving prior chunks as immutable evidence; rollback means
+using a reader that supports the retained chunk version rather than rewriting
+those chunks in place.
+
 On opening an existing `.open` chunk, recovery validates each complete line and
 truncates only an unterminated final line, returning typed uncertainty with its
 discarded byte count. A malformed newline-terminated line is fail-closed. The

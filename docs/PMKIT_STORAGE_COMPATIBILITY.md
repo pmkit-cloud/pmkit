@@ -40,6 +40,26 @@ durable intents remain version `1`. Writers persist each version explicitly,
 and readers return a typed `StoreError::UnsupportedRecordSchemaVersion` instead
 of skipping a row whose version they cannot decode.
 
+## Portable market export v1
+
+`pmkit-store::PORTABLE_MARKET_EXPORT_VERSION` is `1`. A portable export has
+only observed coverage and declares its source-manifest digest, ordered segment
+metadata, logical artifact lengths and digests, and its own canonical
+`artifact_sha256`. It contains no raw evidence, provider route, credential,
+entitlement, billing, or publication-retry state.
+
+`crates/pmkit-store/tests/fixtures/portable-market-export-v1.json` is the
+checked-in v1 fixture. The contract test decodes and canonically re-encodes it;
+a version `2` manifest returns
+`PortableMarketExportError::UnsupportedSchemaVersion` instead of being guessed
+or defaulted. New writers emit v1 only. Future readers may add a new version,
+but v1 readers must continue to fail closed.
+
+The raw-spool v1 fixture lives at
+`crates/pmkit-tape/tests/fixtures/raw-spool-v1.jsonl`; its compatibility rules
+are defined in `PMKIT_RAW_TAPE_FORMAT.md`. These source fixtures, rather than a
+generated release artifact, are the consumer compatibility inputs.
+
 ## Database schema migrations
 
 `TursoTapeStore::open_local` reads `schema_migrations`, whose rows contain a
@@ -107,13 +127,33 @@ and the version-4 payload carrying stable settlement identity. Missing identity
 in a version-4 settlement fails closed; older payloads use only durable
 transport coordinates as their migration fallback.
 
+Database migration version `10` adds durable public-tape audit frames and
+replay-gap intervals. Audit frames retain raw bytes plus their digest and
+transport coordinates; replay gaps retain the exact affected partition and
+interval. They are evidence records, not an observed-data fallback.
+
+Database migration version `11` adds the existing compatibility materialization
+ledger. Its pending, finalized, and terminal entries bind immutable manifest,
+partition, schema-version, and artifact-digest identities. It stores no hosted
+route, credential, or consumer-selected storage coordinate. The related
+Cloud-specific module remains in this revision for compatibility and is not
+relocated or removed here.
+
+Database migration version `12` adds `discovery_snapshot_sha256` to durable
+replay-gap identity. Existing gaps retain their interval and reason and migrate
+with an empty stored snapshot, which replays as an explicit absent snapshot;
+new gaps remain scoped to the immutable discovery snapshot that produced them.
+`migration_tests::replay_gap_snapshot_migration_preserves_legacy_gap` locks this
+forward migration.
+
 Opening fails with a typed `StoreError` when the newest on-disk version exceeds
 the binary's maximum supported version. PMKit never auto-downgrades a database.
 
 Rollback is operational: stop the process and restore the prior database file
 from backup, then run the prior binary. In-process migrations are forward-only;
 there is no reverse-migration or automatic downgrade path. A pre-v9 binary
-rejects a v9 database as too new, so rollback requires the pre-v9 backup.
+rejects a v9 database as too new, and a pre-v12 binary rejects a v12 database
+as too new, so rollback requires the matching pre-migration backup.
 
 ## Change policy
 
