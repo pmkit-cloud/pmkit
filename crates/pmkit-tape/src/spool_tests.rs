@@ -3,13 +3,15 @@ use std::io::Write;
 
 use sha2::{Digest, Sha256};
 
+use crate::spool_record::{decode_record, encode_record};
 use crate::{
-    RawSpoolWriter, RecoveryUncertainty, SpoolChunk, SpoolError, SpoolFrame,
-    enumerate_closed_chunks, recover_open_chunk,
+    RAW_SPOOL_SCHEMA_VERSION, RawSpoolWriter, RecoveryUncertainty, SpoolChunk, SpoolError,
+    SpoolFrame, enumerate_closed_chunks, recover_open_chunk,
 };
 
 const MINUTE_MS: i64 = 1_700_000_040_000;
 const DISCOVERY_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const RAW_SPOOL_V1: &[u8] = include_bytes!("../tests/fixtures/raw-spool-v1.jsonl");
 
 fn chunk(replica: &str, shard: &str) -> Result<SpoolChunk, SpoolError> {
     SpoolChunk::new(replica, shard, MINUTE_MS)
@@ -23,6 +25,30 @@ fn frame(epoch: u64, sequence: u64, raw_bytes: &[u8]) -> SpoolFrame {
         DISCOVERY_DIGEST,
         raw_bytes.to_vec(),
     )
+}
+
+#[test]
+fn raw_spool_v1_fixture_round_trips_and_rejects_future_version()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: a checked-in portable v1 raw-spool record.
+    let (chunk, frame) = decode_record(RAW_SPOOL_V1)?;
+
+    // When: a consumer re-encodes it and receives a newer record version.
+    let mut encoded = encode_record(&chunk, &frame)?;
+    encoded.push(b'\n');
+    let mut future: serde_json::Value = serde_json::from_slice(RAW_SPOOL_V1)?;
+    future["schema_version"] = serde_json::json!(RAW_SPOOL_SCHEMA_VERSION + 1);
+    let mut future = serde_json::to_vec(&future)?;
+    future.push(b'\n');
+
+    // Then: v1 remains canonical and v2 is rejected rather than guessed.
+    assert_eq!(decode_record(&encoded)?, (chunk, frame));
+    assert!(matches!(
+        decode_record(&future),
+        Err(SpoolError::UnsupportedSchemaVersion { found })
+            if found == RAW_SPOOL_SCHEMA_VERSION + 1
+    ));
+    Ok(())
 }
 
 #[test]

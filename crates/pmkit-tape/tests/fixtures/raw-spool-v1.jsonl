@@ -1,0 +1,1 @@
+{"schema_version":1,"replica_id":"lane-a","shard_id":"shard-0","minute_start_ms":1700000040000,"connection_epoch":0,"frame_sequence":7,"receipt_time_ms":1700000040042,"discovery_snapshot_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","raw_bytes":[0,115,97,109,101,255]}
