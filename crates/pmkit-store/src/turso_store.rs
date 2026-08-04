@@ -288,6 +288,7 @@ impl TapeStore for TursoTapeStore {
                     gap.scope.portfolio_id.to_string(),
                     gap.scope.run_id.to_string(),
                     gap.partition.as_str(),
+                    gap.discovery_snapshot_sha256.as_deref().unwrap_or(""),
                     gap.start_time_ms,
                     gap.end_time_ms.unwrap_or(i64::MAX),
                     i64::from(gap.end_time_ms.is_none()),
@@ -311,13 +312,16 @@ impl TapeStore for TursoTapeStore {
             .await?;
         let mut gaps = Vec::new();
         while let Some(row) = rows.next().await? {
-            let unresolved: i64 = row.get(3)?;
+            let discovery_snapshot_sha256: String = row.get(1)?;
+            let unresolved: i64 = row.get(4)?;
             gaps.push(ReplayGapInterval {
                 scope: scope.clone(),
                 partition: row.get(0)?,
-                start_time_ms: row.get(1)?,
-                end_time_ms: (unresolved == 0).then(|| row.get(2)).transpose()?,
-                reason: row.get(4)?,
+                discovery_snapshot_sha256: (!discovery_snapshot_sha256.is_empty())
+                    .then_some(discovery_snapshot_sha256),
+                start_time_ms: row.get(2)?,
+                end_time_ms: (unresolved == 0).then(|| row.get(3)).transpose()?,
+                reason: row.get(5)?,
             });
         }
         Ok(gaps)
@@ -365,6 +369,7 @@ impl TapeStore for TursoTapeStore {
                             gap.scope.portfolio_id.to_string(),
                             gap.scope.run_id.to_string(),
                             gap.partition.as_str(),
+                            gap.discovery_snapshot_sha256.as_deref().unwrap_or(""),
                             gap.start_time_ms,
                             gap.end_time_ms.unwrap_or(i64::MAX),
                             i64::from(gap.end_time_ms.is_none()),

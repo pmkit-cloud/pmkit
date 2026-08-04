@@ -4,9 +4,11 @@ use pmkit_core::{PortfolioId, RunId};
 use serde_json::json;
 
 use crate::{
-    OwnerScope, PM_ENVELOPE_VERSION, PmEnvelope, ReplayItem, StoreError, TapeStore, TursoTapeStore,
+    OwnerScope, PM_ENVELOPE_VERSION, PmEnvelope, ReplayGapInterval, ReplayItem, StoreError,
+    TapeStore, TursoTapeStore,
     integrity::sha256_hex,
     migrations::{MIGRATIONS, Migration, apply},
+    schema::CREATE_PUBLIC_TAPE_EVIDENCE,
 };
 
 const PM_ACCOUNT_ENVELOPE_V1: &str = include_str!("../tests/fixtures/pm-account-envelope-v1.json");
@@ -81,7 +83,8 @@ async fn migration_applies_and_is_idempotent() -> Result<(), Box<dyn std::error:
             (8, eighth_applied_at),
             (9, ninth_applied_at),
             (10, tenth_applied_at),
-            (11, eleventh_applied_at)
+            (11, eleventh_applied_at),
+            (12, twelfth_applied_at)
         ]
             if !first_applied_at.is_empty()
                 && !second_applied_at.is_empty()
@@ -94,6 +97,7 @@ async fn migration_applies_and_is_idempotent() -> Result<(), Box<dyn std::error:
                 && !ninth_applied_at.is_empty()
                 && !tenth_applied_at.is_empty()
                 && !eleventh_applied_at.is_empty()
+                && !twelfth_applied_at.is_empty()
     ));
     assert_eq!(reopened_rows, first_rows);
     Ok(())
@@ -108,7 +112,7 @@ async fn migration_rejects_newer_version() -> Result<(), Box<dyn std::error::Err
     let (database, connection) = open_connection(&path).await?;
     connection
         .execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (12, CURRENT_TIMESTAMP)",
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (13, CURRENT_TIMESTAMP)",
             (),
         )
         .await?;
@@ -120,10 +124,60 @@ async fn migration_rejects_newer_version() -> Result<(), Box<dyn std::error::Err
     assert!(matches!(
         TursoTapeStore::open_local(&path).await,
         Err(StoreError::DatabaseSchemaTooNew {
-            database_version: 12,
-            max_supported_version: 11,
+            database_version: 13,
+            max_supported_version: 12,
         })
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn replay_gap_snapshot_migration_preserves_legacy_gap()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: a v11 replay-gap row without a discovery snapshot column.
+    let (_dir, path) = database_path("replay-gap-snapshot")?;
+    let scope = OwnerScope::new(PortfolioId::new("paper")?, RunId::new("run")?);
+    let (database, connection) = open_connection(&path).await?;
+    apply(&connection, &MIGRATIONS[..9]).await?;
+    connection
+        .execute_batch(CREATE_PUBLIC_TAPE_EVIDENCE)
+        .await?;
+    connection
+        .execute("INSERT INTO schema_migrations (version) VALUES (10)", ())
+        .await?;
+    apply(&connection, &MIGRATIONS[10..11]).await?;
+    connection
+        .execute(
+            "INSERT INTO pm_replay_gaps (
+                portfolio_id, run_id, partition_id, start_time_ms, end_time_ms, unresolved, reason
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (
+                "paper", "run", "btc-5m:0", 0_i64, 59_999_i64, 0_i64, "legacy",
+            ),
+        )
+        .await?;
+    // When: the current store applies the replay-gap snapshot migration.
+    apply(&connection, MIGRATIONS).await?;
+    drop(connection);
+    drop(database);
+    {
+        let store = TursoTapeStore::open_local(&path).await?;
+        let gaps = store.read_replay_gaps(&scope).await?;
+
+        // Then: the legacy gap survives with an explicit absent snapshot identity.
+        assert_eq!(
+            gaps,
+            vec![ReplayGapInterval {
+                scope,
+                partition: "btc-5m:0".into(),
+                discovery_snapshot_sha256: None,
+                start_time_ms: 0,
+                end_time_ms: Some(59_999),
+                reason: "legacy".into(),
+            }]
+        );
+        store.delete_database()?;
+    }
     Ok(())
 }
 
@@ -281,7 +335,7 @@ async fn migration_adds_stream_identity_and_limit_one_cursor()
 #[tokio::test]
 async fn migration_rolls_back_on_failure() -> Result<(), Box<dyn std::error::Error>> {
     const FAILING_MIGRATION: Migration = Migration::new(
-        12,
+        13,
         &[
             "CREATE TABLE migration_partial_change (value INTEGER NOT NULL)",
             "CREATE TABLE migration_partial_change (",
@@ -326,7 +380,8 @@ async fn migration_rolls_back_on_failure() -> Result<(), Box<dyn std::error::Err
             (8, _),
             (9, _),
             (10, _),
-            (11, _)
+            (11, _),
+            (12, _)
         ]
     ));
     assert_eq!(partial_table_count, 0);
@@ -380,7 +435,7 @@ async fn pm_account_envelope_version_migrates_old_and_reads_new_fixtures()
     store
         .connection
         .execute(
-            "DELETE FROM schema_migrations WHERE version IN (4, 5, 6, 7, 8, 9, 10, 11)",
+            "DELETE FROM schema_migrations WHERE version IN (4, 5, 6, 7, 8, 9, 10, 11, 12)",
             (),
         )
         .await?;
@@ -433,7 +488,8 @@ async fn pm_account_envelope_version_migrates_old_and_reads_new_fixtures()
             (8, _),
             (9, _),
             (10, _),
-            (11, _)
+            (11, _),
+            (12, _)
         ]
     ));
     Ok(())
@@ -520,7 +576,8 @@ async fn decision_version_round_trip() -> Result<(), Box<dyn std::error::Error>>
             (8, _),
             (9, _),
             (10, _),
-            (11, _)
+            (11, _),
+            (12, _)
         ]
     ));
     assert!(killed);
@@ -558,7 +615,7 @@ async fn decision_schema_v1_migrates_and_v2_reads() -> Result<(), Box<dyn std::e
     store
         .connection
         .execute(
-            "DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9, 10, 11)",
+            "DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9, 10, 11, 12)",
             (),
         )
         .await?;
@@ -616,7 +673,8 @@ async fn decision_schema_v1_migrates_and_v2_reads() -> Result<(), Box<dyn std::e
             (8, _),
             (9, _),
             (10, _),
-            (11, _)
+            (11, _),
+            (12, _)
         ]
     ));
     drop(store);

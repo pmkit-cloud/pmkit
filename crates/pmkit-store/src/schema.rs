@@ -2,7 +2,7 @@
 pub const PM_ENVELOPE_VERSION: u16 = 6;
 pub const CAUSAL_DECISION_SCHEMA_VERSION: i64 = 2;
 pub const DURABLE_INTENT_SCHEMA_VERSION: i64 = 1;
-pub const CURRENT_SCHEMA_VERSION: i64 = 11;
+pub const CURRENT_SCHEMA_VERSION: i64 = 12;
 
 pub const CREATE_CLOUD_MATERIALIZATIONS: &str = "
 CREATE TABLE IF NOT EXISTS pmkit_cloud_materializations (
@@ -79,6 +79,37 @@ UPDATE pm_envelopes SET schema_version = 6 WHERE schema_version = 5";
 
 pub const MIGRATE_CAUSAL_DECISIONS_V1_TO_V2: &str = "
 UPDATE causal_decisions SET schema_version = 2 WHERE schema_version = 1";
+
+pub const MIGRATE_REPLAY_GAPS_V1_TO_V2: &[&str] = &[
+    "DROP INDEX pm_replay_gaps_owner_interval",
+    "ALTER TABLE pm_replay_gaps RENAME TO pm_replay_gaps_v1",
+    "
+CREATE TABLE pm_replay_gaps (
+    portfolio_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    partition_id TEXT NOT NULL,
+    discovery_snapshot_sha256 TEXT NOT NULL,
+    start_time_ms INTEGER NOT NULL,
+    end_time_ms INTEGER NOT NULL,
+    unresolved INTEGER NOT NULL CHECK (unresolved IN (0, 1)),
+    reason TEXT NOT NULL,
+    PRIMARY KEY (
+        portfolio_id, run_id, partition_id, discovery_snapshot_sha256,
+        start_time_ms, end_time_ms, unresolved, reason
+    )
+)",
+    "
+INSERT INTO pm_replay_gaps (
+    portfolio_id, run_id, partition_id, discovery_snapshot_sha256,
+    start_time_ms, end_time_ms, unresolved, reason
+)
+SELECT portfolio_id, run_id, partition_id, '', start_time_ms, end_time_ms, unresolved, reason
+FROM pm_replay_gaps_v1",
+    "DROP TABLE pm_replay_gaps_v1",
+    "
+CREATE INDEX pm_replay_gaps_owner_interval
+    ON pm_replay_gaps (portfolio_id, run_id, start_time_ms, end_time_ms)",
+];
 
 pub const MIGRATE_PM_ENVELOPES_V2_TO_V3: &[&str] = &[
     "ALTER TABLE pm_envelopes RENAME TO pm_envelopes_v2",
@@ -254,15 +285,16 @@ WHERE portfolio_id = ?1 AND run_id = ?2 AND source_id = ?3 AND connection_id = ?
 
 pub const INSERT_REPLAY_GAP: &str = "
 INSERT INTO pm_replay_gaps (
-    portfolio_id, run_id, partition_id, start_time_ms, end_time_ms, unresolved, reason
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+    portfolio_id, run_id, partition_id, discovery_snapshot_sha256,
+    start_time_ms, end_time_ms, unresolved, reason
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
 ON CONFLICT DO NOTHING";
 
 pub const READ_REPLAY_GAPS: &str = "
-SELECT partition_id, start_time_ms, end_time_ms, unresolved, reason
+SELECT partition_id, discovery_snapshot_sha256, start_time_ms, end_time_ms, unresolved, reason
 FROM pm_replay_gaps
 WHERE portfolio_id = ?1 AND run_id = ?2
-ORDER BY start_time_ms, end_time_ms, partition_id";
+ORDER BY start_time_ms, end_time_ms, partition_id, discovery_snapshot_sha256";
 
 pub const INSERT_PUBLIC_TAPE_AUDIT_FRAME: &str = "
 INSERT INTO pm_public_tape_audit_frames (
