@@ -156,7 +156,7 @@ fn valid_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn next_rank(
@@ -244,6 +244,8 @@ fn partition_gap(scope: &OwnerScope, partition: &Partition, reason: &str) -> Rep
     ReplayGapInterval {
         scope: scope.clone(),
         partition: format!("{}:{}", partition.market_id, partition.minute_start_ms),
+        discovery_snapshot_sha256: valid_digest(&partition.snapshot)
+            .then(|| partition.snapshot.clone()),
         start_time_ms: partition.minute_start_ms,
         end_time_ms: partition.minute_start_ms.checked_add(UTC_MINUTE_MS - 1),
         reason: reason.to_owned(),
