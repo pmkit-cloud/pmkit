@@ -8,7 +8,7 @@
 use std::sync::{Mutex, PoisonError};
 
 use async_trait::async_trait;
-use pmkit_book::{OrderBookL2, Position};
+use pmkit_book::{OrderBookL2, Position, Side};
 use pmkit_core::{MarketId, StrategyId};
 use pmkit_event::MarketEvent;
 use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
@@ -315,6 +315,7 @@ impl PaperExecutor {
                 last_timestamp_ms,
             } = &mut *state;
             ensure_market_limits(order, config)?;
+            ensure_sufficient_cash(order, ledger)?;
             let (placement_id, expected_order_id) = ledger
                 .begin_order(order, Some(strategy.clone()), now_ms)
                 .map_err(|error| execution_error(&error))?;
@@ -385,6 +386,34 @@ fn ensure_market_limits(order: &PlaceOrder, config: &SimulationConfig) -> Result
     })
 }
 
+/// Rejects a buy the account cannot pay for, before it reaches the ledger or
+/// the book.
+///
+/// The venue holds collateral against a resting bid and refuses an order that
+/// exceeds the free balance. Without this, a paper run buys with money it
+/// never had and reports a return on capital that never existed — the same
+/// optimistic bias as filling below the venue minimum, on the account side.
+/// Open buys hold their notional, so the same dollar cannot back two orders
+/// and a resting order that later fills is already paid for.
+///
+/// A run created without cash is an unfunded simulation — fills only, no
+/// balance to respect — and stays unconstrained.
+fn ensure_sufficient_cash(order: &PlaceOrder, ledger: &PaperLedger) -> Result<(), ExecError> {
+    if order.side != Side::Buy {
+        return Ok(());
+    }
+    let Some(available) = ledger.available_cash() else {
+        return Ok(());
+    };
+    let cost = Money::from_decimal(order.price * order.qty);
+    if cost > available {
+        return Err(ExecError::Rejected {
+            reason: format!("buy of {cost} exceeds the available paper balance of {available}"),
+        });
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Executor for PaperExecutor {
     async fn preflight(&self) -> Result<ExecutionSnapshot, ExecError> {
@@ -405,6 +434,7 @@ impl Executor for PaperExecutor {
                 last_timestamp_ms,
             } = &mut *state;
             ensure_market_limits(order, config)?;
+            ensure_sufficient_cash(order, ledger)?;
             let (placement_id, expected_order_id) = ledger
                 .begin_order(order, None, now_ms)
                 .map_err(|error| execution_error(&error))?;
@@ -514,6 +544,7 @@ mod tests {
     use pmkit_event::{Liquidity, MarketEvent};
     use pmkit_exec::{ExecError, Executor, MarketLimits, PlaceOrder, TimeInForce};
     use pmkit_market::Outcome;
+    use pmkit_money::Money;
     use pmkit_sim::{MarketCategory, SimulationConfig};
     use rust_decimal::Decimal;
     use tokio::sync::mpsc;
@@ -700,6 +731,135 @@ mod tests {
         // On the grid the order trades normally.
         order.price = Decimal::new(50, 2);
         paper.submit(&order, 100).await?;
+        Ok(())
+    }
+
+    /// A funded executor with a book quoting 0.44 / 0.46.
+    async fn funded_paper(
+        cash: Money,
+    ) -> Result<(PaperExecutor, mpsc::Receiver<MarketEvent>, MarketId), Box<dyn std::error::Error>>
+    {
+        let (tx, rx) = mpsc::channel(8);
+        let paper = PaperExecutor::with_account_config(
+            tx,
+            "paper",
+            MarketCategory::Crypto,
+            SimulationConfig::default(),
+            cash,
+        );
+        let market = MarketId::new("btc-5m")?;
+        paper
+            .update_book(
+                &market,
+                Outcome::Up,
+                OrderBookL2 {
+                    bids: vec![(Decimal::new(44, 2), Decimal::from(500))],
+                    asks: vec![(Decimal::new(46, 2), Decimal::from(500))],
+                    timestamp_ms: 0,
+                    last_trade_price: None,
+                },
+            )
+            .await?;
+        paper.drain_ledger();
+        Ok((paper, rx, market))
+    }
+
+    fn buy(market: &MarketId, price: Decimal, qty: Decimal, post_only: bool) -> PlaceOrder {
+        PlaceOrder {
+            market: market.clone(),
+            outcome: Outcome::Up,
+            side: Side::Buy,
+            price,
+            qty,
+            post_only,
+            tif: TimeInForce::Gtc,
+        }
+    }
+
+    #[tokio::test]
+    async fn unaffordable_buy_is_rejected_before_the_ledger()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (paper, _fills, market) = funded_paper(Money::usdc(10)).await?;
+
+        // 30 shares at 0.50 costs 15, above the 10 on the account.
+        let order = buy(&market, Decimal::new(50, 2), Decimal::from(30), false);
+        let Err(ExecError::Rejected { reason }) = paper.submit(&order, 100).await else {
+            return Err("expected a typed rejection".into());
+        };
+        assert!(reason.contains("exceeds the available paper balance"));
+        // The rejection happens before the ledger: an order the venue would
+        // refuse for lack of collateral leaves no durable trace to replay.
+        assert!(paper.pending_ledger_entry().is_none());
+
+        // Within the balance the same order trades normally.
+        let affordable = buy(&market, Decimal::new(50, 2), Decimal::from(10), false);
+        paper.submit(&affordable, 100).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn open_buys_hold_their_notional_against_later_orders()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (paper, _fills, market) = funded_paper(Money::usdc(10)).await?;
+
+        // A resting bid for 8 of the 10 available.
+        let resting = buy(&market, Decimal::new(40, 2), Decimal::from(20), true);
+        paper.submit(&resting, 100).await?;
+
+        // A second order for 5 more fits the raw balance but not the free one:
+        // the same dollar cannot back two orders.
+        let second = buy(&market, Decimal::new(40, 2), Decimal::from(12), true);
+        let Err(ExecError::Rejected { reason }) = paper.submit(&second, 100).await else {
+            return Err("expected a typed rejection".into());
+        };
+        assert!(reason.contains("exceeds the available paper balance"));
+
+        // What the reservation leaves free still trades.
+        let within_free = buy(&market, Decimal::new(40, 2), Decimal::from(5), true);
+        paper.submit(&within_free, 100).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sells_and_unfunded_runs_stay_unconstrained() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // An unfunded run is a fills-only simulation: no balance to respect.
+        let (tx, _rx) = mpsc::channel(8);
+        let paper = PaperExecutor::new(tx, "paper", MarketCategory::Crypto);
+        let market = MarketId::new("btc-5m")?;
+        paper
+            .update_book(
+                &market,
+                Outcome::Up,
+                OrderBookL2 {
+                    bids: vec![(Decimal::new(44, 2), Decimal::from(500))],
+                    asks: vec![(Decimal::new(46, 2), Decimal::from(500))],
+                    timestamp_ms: 0,
+                    last_trade_price: None,
+                },
+            )
+            .await?;
+        paper
+            .submit(
+                &buy(&market, Decimal::new(50, 2), Decimal::from(100), false),
+                100,
+            )
+            .await?;
+
+        // A sell raises cash rather than spending it, so it rests whatever the
+        // balance is; holdings are the accounting ledger's business, not this
+        // guard's. Priced above the book so it rests instead of crossing.
+        let (funded, _funded_fills, funded_market) = funded_paper(Money::usdc(10)).await?;
+        let sell = PlaceOrder {
+            side: Side::Sell,
+            ..buy(
+                &funded_market,
+                Decimal::new(60, 2),
+                Decimal::from(100),
+                true,
+            )
+        };
+        funded.submit(&sell, 100).await?;
         Ok(())
     }
 }
