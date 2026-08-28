@@ -9,7 +9,8 @@ use std::io::{self, Write};
 use pmkit_book::Side;
 use pmkit_event::{
     CexReferenceEnvelope, CexReferenceEvent, FillIdentity, Liquidity, MarketEvent,
-    PmAccountEnvelope, PmAccountEvent, PmMarketEnvelope, SettlementIdentity, StreamMetadata,
+    PmAccountEnvelope, PmAccountEvent, PmMarketEnvelope, PolymarketReferenceEnvelope,
+    SettlementIdentity, StreamMetadata,
 };
 use serde_json::json;
 
@@ -365,6 +366,25 @@ pub fn reference_envelope_json(envelope: &CexReferenceEnvelope) -> serde_json::V
             "is_buyer_maker": is_buyer_maker,
         }),
     };
+    envelope_json(&envelope.metadata, &payload)
+}
+
+/// Serializes a Polymarket RTDS envelope while preserving its transport metadata.
+#[must_use]
+pub fn polymarket_reference_envelope_json(
+    envelope: &PolymarketReferenceEnvelope,
+) -> serde_json::Value {
+    let fact = &envelope.fact;
+    let payload = json!({
+        "kind": "polymarket_twap",
+        "ts": fact.timestamp_ms,
+        "provider_timestamp_ms": fact.provider_timestamp_ms,
+        "asset": fact.asset.to_string(),
+        "symbol": fact.symbol,
+        "window_s": fact.window_s,
+        "value": fact.value,
+        "full_accuracy_value": fact.full_accuracy_value,
+    });
     envelope_json(&envelope.metadata, &payload)
 }
 

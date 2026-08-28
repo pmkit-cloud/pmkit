@@ -141,6 +141,7 @@ pub const fn fact_timestamp(fact: &StrategyFact) -> i64 {
             | PmAccountEvent::Settlement { timestamp_ms, .. },
         )
         | StrategyFact::Reference(CexReferenceEvent::Trade { timestamp_ms, .. }) => *timestamp_ms,
+        StrategyFact::PolymarketReference(event) => event.timestamp_ms(),
     }
 }
 
