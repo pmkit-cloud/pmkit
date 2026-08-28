@@ -318,6 +318,71 @@ pub enum CexReferenceEvent {
     },
 }
 
+/// The exact Chainlink TWAP update published by Polymarket RTDS.
+///
+/// `value` is the display-oriented JSON number. `full_accuracy_value` is the
+/// verbatim signed E18 fixed-point integer supplied by the provider and is the
+/// value to use for settlement-sensitive comparisons.
+#[derive(Debug, Clone)]
+pub struct PolymarketTwapEvent {
+    /// Reference asset selected by the source subscription.
+    pub asset: Asset,
+    /// Provider symbol, for example `btc/usd`.
+    pub symbol: String,
+    /// Chainlink observation timestamp from `payload.timestamp`.
+    pub timestamp_ms: i64,
+    /// Provider publication timestamp from the outer `timestamp` field.
+    pub provider_timestamp_ms: i64,
+    /// Display-oriented numeric TWAP value.
+    pub value: f64,
+    /// Verbatim signed E18 fixed-point TWAP representation.
+    pub full_accuracy_value: String,
+    /// Lookback window in seconds. RTDS settlement updates use `60`.
+    pub window_s: u64,
+}
+
+impl PartialEq for PolymarketTwapEvent {
+    fn eq(&self, other: &Self) -> bool {
+        self.asset == other.asset
+            && self.symbol == other.symbol
+            && self.timestamp_ms == other.timestamp_ms
+            && self.provider_timestamp_ms == other.provider_timestamp_ms
+            && self.value.to_bits() == other.value.to_bits()
+            && self.full_accuracy_value == other.full_accuracy_value
+            && self.window_s == other.window_s
+    }
+}
+
+impl Eq for PolymarketTwapEvent {}
+
+impl PolymarketTwapEvent {
+    /// Returns the Chainlink observation timestamp in milliseconds.
+    #[must_use]
+    pub const fn timestamp_ms(&self) -> i64 {
+        self.timestamp_ms
+    }
+}
+
+/// Alias emphasizing that this is a Polymarket-owned reference fact.
+pub type PolymarketReferenceEvent = PolymarketTwapEvent;
+
+/// Alias emphasizing the RTDS transport that supplied the TWAP fact.
+pub type PolymarketRtdsTwap = PolymarketTwapEvent;
+
+/// A Polymarket RTDS reference frame with transport metadata and raw bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolymarketReferenceEnvelope {
+    /// Preserved transport metadata.
+    pub metadata: StreamMetadata,
+    /// Exact UTF-8 frame received from RTDS.
+    pub raw_frame: Vec<u8>,
+    /// Normalized Polymarket reference fact.
+    pub fact: PolymarketTwapEvent,
+}
+
+/// Alias for the RTDS-specific envelope name.
+pub type PolymarketRtdsEnvelope = PolymarketReferenceEnvelope;
+
 /// Metadata retained for every received stream frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamMetadata {
@@ -383,6 +448,8 @@ pub enum StrategyFact {
     Account(PmAccountEvent),
     /// CEX reference fact.
     Reference(CexReferenceEvent),
+    /// Polymarket-owned RTDS reference fact.
+    PolymarketReference(PolymarketTwapEvent),
 }
 
 /// A fact accepted by strategy-facing APIs.

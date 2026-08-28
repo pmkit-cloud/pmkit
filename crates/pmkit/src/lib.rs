@@ -656,13 +656,19 @@ pub(crate) fn observe_reconnect(
     source: &SourceEnvelope,
     connection_epochs: &mut HashMap<String, i64>,
 ) -> bool {
-    let CanonicalSourceKey::Pm {
-        stream_id,
-        connection_epoch,
-        ..
-    } = source.canonical_key()
-    else {
-        return false;
+    let key = source.canonical_key();
+    let (stream_id, connection_epoch) = match key {
+        CanonicalSourceKey::Pm {
+            stream_id,
+            connection_epoch,
+            ..
+        }
+        | CanonicalSourceKey::Polymarket {
+            stream_id,
+            connection_epoch,
+            ..
+        } => (stream_id, connection_epoch),
+        CanonicalSourceKey::Cex { .. } => return false,
     };
     match connection_epochs.entry(stream_id) {
         std::collections::hash_map::Entry::Vacant(entry) => {
@@ -730,7 +736,9 @@ async fn store_signal(
                 raw_frame: envelope.raw_frame.clone(),
                 normalized: pmkit_tape::account_envelope_json(envelope),
             },
-            SourceEnvelope::CexReference(_) => return Ok(()),
+            SourceEnvelope::CexReference(_) | SourceEnvelope::PolymarketReference(_) => {
+                return Ok(());
+            }
         },
         SourceSignal::Watermark(_) | SourceSignal::Eof => return Ok(()),
     };

@@ -21,6 +21,7 @@ mod live;
 mod public_protocol;
 mod public_tape;
 mod public_tape_contract;
+mod rtds;
 mod subscription;
 
 #[cfg(test)]
@@ -50,6 +51,11 @@ pub use public_protocol::{
 };
 pub use public_tape::{PublicTapeImportError, PublicTapeImportReport, PublicTapeImporter};
 pub use public_tape_contract::{certify_v2_public_market_input, certify_v2_public_market_source};
+pub use rtds::{
+    POLYMARKET_RTDS_ENDPOINT, POLYMARKET_RTDS_HEARTBEAT_INTERVAL, POLYMARKET_RTDS_SOURCE_ID,
+    POLYMARKET_RTDS_TOPIC, PolymarketRtdsLive, PolymarketRtdsParseError,
+    parse_polymarket_rtds_twap, parse_polymarket_rtds_twap_bytes, polymarket_rtds_subscription,
+};
 pub use subscription::{
     DiscoverySnapshot, GammaMarket, GammaOutcome, RecurringFamily, ReplicaSubscriptionPlan,
     SubscriptionShard,

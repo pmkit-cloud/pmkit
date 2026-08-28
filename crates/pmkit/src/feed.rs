@@ -423,7 +423,9 @@ fn merged_fact(envelope: SourceEnvelope) -> MergedFact {
     let metadata = envelope.metadata().clone();
     let account_portfolio = match &envelope {
         SourceEnvelope::PmAccount(account) => Some(account.portfolio.clone()),
-        SourceEnvelope::PmMarket(_) | SourceEnvelope::CexReference(_) => None,
+        SourceEnvelope::PmMarket(_)
+        | SourceEnvelope::CexReference(_)
+        | SourceEnvelope::PolymarketReference(_) => None,
     };
     let fact = envelope.clone().into_strategy_fact();
     MergedFact {
@@ -609,16 +611,27 @@ fn compare_pm_envelopes(left: &SourceEnvelope, right: &SourceEnvelope) -> Orderi
                 account_event_detail_key(&left.fact).cmp(&account_event_detail_key(&right.fact))
             }),
         (SourceEnvelope::CexReference(_), SourceEnvelope::CexReference(_)) => Ordering::Equal,
-        (
-            SourceEnvelope::PmMarket(_),
-            SourceEnvelope::PmAccount(_) | SourceEnvelope::CexReference(_),
-        )
-        | (SourceEnvelope::PmAccount(_), SourceEnvelope::CexReference(_)) => Ordering::Less,
-        (
-            SourceEnvelope::PmAccount(_) | SourceEnvelope::CexReference(_),
-            SourceEnvelope::PmMarket(_),
-        )
-        | (SourceEnvelope::CexReference(_), SourceEnvelope::PmAccount(_)) => Ordering::Greater,
+        (SourceEnvelope::PolymarketReference(left), SourceEnvelope::PolymarketReference(right)) => {
+            left.fact
+                .timestamp_ms
+                .cmp(&right.fact.timestamp_ms)
+                .then_with(|| left.fact.symbol.cmp(&right.fact.symbol))
+                .then_with(|| {
+                    left.fact
+                        .provider_timestamp_ms
+                        .cmp(&right.fact.provider_timestamp_ms)
+                })
+        }
+        (left, right) => envelope_kind_rank(left).cmp(&envelope_kind_rank(right)),
+    }
+}
+
+const fn envelope_kind_rank(envelope: &SourceEnvelope) -> u8 {
+    match envelope {
+        SourceEnvelope::PmMarket(_) => 0,
+        SourceEnvelope::PmAccount(_) => 1,
+        SourceEnvelope::CexReference(_) => 2,
+        SourceEnvelope::PolymarketReference(_) => 3,
     }
 }
 

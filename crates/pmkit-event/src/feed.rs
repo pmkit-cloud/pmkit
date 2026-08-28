@@ -1,6 +1,6 @@
 use crate::{
-    CexReferenceEnvelope, CexReferenceEvent, PmAccountEnvelope, PmMarketEnvelope, StrategyFact,
-    StreamMetadata,
+    CexReferenceEnvelope, CexReferenceEvent, PmAccountEnvelope, PmMarketEnvelope,
+    PolymarketReferenceEnvelope, StrategyFact, StreamMetadata,
 };
 
 /// A canonical ordering key derived from envelope metadata only.
@@ -27,6 +27,19 @@ pub enum CanonicalSourceKey {
         canonical_source_rank: i64,
         /// Exchange aggregate-trade identity.
         aggregate_trade_id: u64,
+    },
+    /// Polymarket RTDS reference ordering identity.
+    Polymarket {
+        /// Provider observation timestamp in milliseconds.
+        source_timestamp_ms: i64,
+        /// Configured deterministic rank.
+        canonical_source_rank: i64,
+        /// Stable RTDS symbol/window stream identity.
+        stream_id: String,
+        /// Connection generation.
+        connection_epoch: i64,
+        /// Frame position in the connection generation.
+        frame_sequence: i64,
     },
 }
 
@@ -76,8 +89,31 @@ impl Ord for CanonicalSourceKey {
                     ..
                 },
             ) => left_id.cmp(right_id),
-            (Self::Pm { .. }, Self::Cex { .. }) => std::cmp::Ordering::Less,
-            (Self::Cex { .. }, Self::Pm { .. }) => std::cmp::Ordering::Greater,
+            (
+                Self::Polymarket {
+                    stream_id: left_stream,
+                    connection_epoch: left_epoch,
+                    frame_sequence: left_frame,
+                    ..
+                },
+                Self::Polymarket {
+                    stream_id: right_stream,
+                    connection_epoch: right_epoch,
+                    frame_sequence: right_frame,
+                    ..
+                },
+            ) => left_stream
+                .cmp(right_stream)
+                .then_with(|| left_epoch.cmp(right_epoch))
+                .then_with(|| left_frame.cmp(right_frame)),
+            (Self::Pm { .. }, Self::Polymarket { .. } | Self::Cex { .. }) => {
+                std::cmp::Ordering::Less
+            }
+            (Self::Polymarket { .. }, Self::Cex { .. }) => std::cmp::Ordering::Less,
+            (Self::Cex { .. }, Self::Polymarket { .. } | Self::Pm { .. }) => {
+                std::cmp::Ordering::Greater
+            }
+            (Self::Polymarket { .. }, Self::Pm { .. }) => std::cmp::Ordering::Greater,
         }
     }
 }
@@ -94,6 +130,10 @@ impl CanonicalSourceKey {
             | Self::Cex {
                 source_timestamp_ms,
                 ..
+            }
+            | Self::Polymarket {
+                source_timestamp_ms,
+                ..
             } => *source_timestamp_ms,
         }
     }
@@ -105,6 +145,10 @@ impl CanonicalSourceKey {
                 ..
             }
             | Self::Cex {
+                canonical_source_rank,
+                ..
+            }
+            | Self::Polymarket {
                 canonical_source_rank,
                 ..
             } => *canonical_source_rank,
@@ -121,6 +165,8 @@ pub enum SourceEnvelope {
     PmAccount(PmAccountEnvelope),
     /// A CEX reference trade with raw transport identity.
     CexReference(CexReferenceEnvelope),
+    /// A Polymarket-owned RTDS reference fact with raw transport identity.
+    PolymarketReference(PolymarketReferenceEnvelope),
 }
 
 impl SourceEnvelope {
@@ -131,6 +177,7 @@ impl SourceEnvelope {
             Self::PmMarket(envelope) => &envelope.metadata,
             Self::PmAccount(envelope) => &envelope.metadata,
             Self::CexReference(envelope) => &envelope.metadata,
+            Self::PolymarketReference(envelope) => &envelope.metadata,
         }
     }
 
@@ -164,6 +211,16 @@ impl SourceEnvelope {
                 canonical_source_rank: metadata.canonical_source_rank,
                 aggregate_trade_id: *aggregate_trade_id,
             },
+            Self::PolymarketReference(envelope) => CanonicalSourceKey::Polymarket {
+                source_timestamp_ms: metadata.source_time_ms,
+                canonical_source_rank: metadata.canonical_source_rank,
+                stream_id: format!(
+                    "polymarket:rtds:{}:{}",
+                    envelope.fact.symbol, envelope.fact.window_s
+                ),
+                connection_epoch: metadata.connection_epoch,
+                frame_sequence: metadata.frame_sequence,
+            },
         }
     }
 
@@ -174,6 +231,7 @@ impl SourceEnvelope {
             Self::PmMarket(envelope) => StrategyFact::Market(envelope.fact),
             Self::PmAccount(envelope) => StrategyFact::Account(envelope.fact),
             Self::CexReference(envelope) => StrategyFact::Reference(envelope.fact),
+            Self::PolymarketReference(envelope) => StrategyFact::PolymarketReference(envelope.fact),
         }
     }
 }
