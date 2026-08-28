@@ -43,22 +43,15 @@ pub async fn drive_with_control(
         evidence: run.replay().evidence(),
         retrieval_wait: run.replay().retrieval_wait(),
     };
+    let primary_query = query.clone();
     let mut sources = vec![SourceTaskDefinition::new("pm", move |sink| async move {
-        source.replay(query, sink).await
+        source.replay(primary_query, sink).await
     })];
-    if let Some(reference) = run.replay().reference_source_ref() {
+    for (name, reference) in run.replay().reference_source_refs() {
+        let name = name.clone();
         let reference = reference.clone();
-        let reference_query = ReplayQuery {
-            markets: strategies
-                .iter()
-                .map(|instance| instance.market.clone())
-                .collect(),
-            from: run.replay().from(),
-            to: run.replay().to(),
-            evidence: run.replay().evidence(),
-            retrieval_wait: run.replay().retrieval_wait(),
-        };
-        sources.push(SourceTaskDefinition::new("cex", move |sink| async move {
+        let reference_query = query.clone();
+        sources.push(SourceTaskDefinition::new(name, move |sink| async move {
             reference.replay(reference_query, sink).await
         }));
     }

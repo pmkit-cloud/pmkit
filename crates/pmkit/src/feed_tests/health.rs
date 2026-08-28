@@ -130,6 +130,30 @@ async fn duplicate_source_names_fail_before_tasks_start() -> Result<(), Box<dyn 
 }
 
 #[tokio::test]
+async fn blank_source_names_fail_before_tasks_start() -> Result<(), Box<dyn std::error::Error>> {
+    // Given: a task definition with no usable source identity.
+    let started = Arc::new(AtomicUsize::new(0));
+    let task_started = Arc::clone(&started);
+    let result = MergedFeed::from_tasks(
+        FeedMode::Paper,
+        vec![SourceTaskDefinition::new(" \t", move |_sink| {
+            task_started.fetch_add(1, Ordering::Relaxed);
+            async { Ok(()) }
+        })],
+        None,
+    )
+    .collect()
+    .await;
+
+    // When: the merge validates source names.
+    assert!(matches!(result, Err(DataSourceError::ReplayGap { .. })));
+
+    // Then: invalid topology never starts a source task.
+    assert_eq!(started.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn source_task_panic_counts_its_named_gap() -> Result<(), Box<dyn std::error::Error>> {
     // Given: one source task panics before emitting a lifecycle signal.
     let metrics = metrics("health-panic")?;

@@ -14,7 +14,7 @@ pub struct LiveRun {
     executor: Arc<dyn Executor>,
     market_data: Arc<dyn LiveDataSource>,
     account_data: Option<Arc<dyn LiveAccountDataSource>>,
-    reference_data: Option<Arc<dyn LiveCexDataSource>>,
+    reference_data: Vec<(String, Arc<dyn LiveCexDataSource>)>,
     risk: RiskLimits,
     tape_policy: Option<TapePolicy>,
     strategies: Vec<StrategyRegistration>,
@@ -36,17 +36,28 @@ impl LiveRun {
             executor,
             market_data,
             account_data: None,
-            reference_data: None,
+            reference_data: Vec::new(),
             risk,
             tape_policy: None,
             strategies: Vec::new(),
         }
     }
 
-    /// Adds an optional live CEX reference source for parity-aware runs.
+    /// Adds a live CEX reference source for parity-aware runs.
     #[must_use]
-    pub fn reference_data(mut self, source: Arc<dyn LiveCexDataSource>) -> Self {
-        self.reference_data = Some(source);
+    pub fn reference_data(self, source: Arc<dyn LiveCexDataSource>) -> Self {
+        let name = format!("cex-{}", self.reference_data.len());
+        self.reference_data_named(name, source)
+    }
+
+    /// Adds a named live CEX reference source.
+    #[must_use]
+    pub fn reference_data_named(
+        mut self,
+        name: impl Into<String>,
+        source: Arc<dyn LiveCexDataSource>,
+    ) -> Self {
+        self.reference_data.push((name.into(), source));
         self
     }
 
@@ -95,10 +106,19 @@ impl LiveRun {
         &self.market_data
     }
 
-    /// Returns the optional live CEX reference source.
+    /// Returns the first live CEX reference source for compatibility.
     #[must_use]
     pub const fn reference_data_ref(&self) -> Option<&Arc<dyn LiveCexDataSource>> {
-        self.reference_data.as_ref()
+        match self.reference_data.as_slice() {
+            [] => None,
+            [(_, source), ..] => Some(source),
+        }
+    }
+
+    /// Returns all named live CEX reference sources in registration order.
+    #[must_use]
+    pub fn reference_data_refs(&self) -> &[(String, Arc<dyn LiveCexDataSource>)] {
+        &self.reference_data
     }
 
     /// Returns the optional authenticated PM account source.
@@ -136,7 +156,11 @@ impl fmt::Debug for LiveRun {
             .field("tape_policy", &self.tape_policy)
             .field(
                 "reference_data",
-                &self.reference_data.as_ref().map(|_| "configured"),
+                &self
+                    .reference_data
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
             )
             .field(
                 "account_data",
@@ -150,10 +174,33 @@ impl fmt::Debug for LiveRun {
 #[cfg(test)]
 mod tests {
     use super::LiveRun;
-    use crate::test_support::{NoExec, NoLive, risk};
+    use crate::test_support::{NoCex, NoExec, NoLive, risk};
     use pmkit_core::{PortfolioId, RunId};
     use std::sync::Arc;
 
+    #[test]
+    fn reference_data_registrations_append_with_stable_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let run = LiveRun::new(
+            RunId::new("live-references")?,
+            PortfolioId::new("alice")?,
+            Arc::new(NoExec),
+            Arc::new(NoLive),
+            risk()?,
+        )
+        .reference_data(Arc::new(NoCex))
+        .reference_data(Arc::new(NoCex))
+        .reference_data_named("twap", Arc::new(NoCex));
+
+        let names = run
+            .reference_data_refs()
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["cex-0", "cex-1", "twap"]);
+        assert!(run.reference_data_ref().is_some());
+        Ok(())
+    }
     #[test]
     fn live_run_converts_into_run_spec() -> Result<(), Box<dyn std::error::Error>> {
         let live = LiveRun::new(

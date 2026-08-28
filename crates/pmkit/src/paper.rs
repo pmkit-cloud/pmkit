@@ -188,9 +188,10 @@ pub async fn drive_with_control(
             }));
         }
     }
-    if let Some(reference) = run.reference_data_ref() {
+    for (name, reference) in run.reference_data_refs() {
+        let name = name.clone();
         let reference = reference.clone();
-        sources.push(SourceTaskDefinition::new("cex", move |sink| async move {
+        sources.push(SourceTaskDefinition::new(name, move |sink| async move {
             reference.subscribe_reference(sink).await
         }));
     }

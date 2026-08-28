@@ -108,6 +108,7 @@ impl Ord for QueuedFact {
         self.key
             .cmp(&other.key)
             .then_with(|| compare_pm_envelopes(&self.fact.source, &other.fact.source))
+            .then_with(|| self.source.cmp(&other.source))
     }
 }
 
@@ -204,22 +205,12 @@ impl MergedFeed {
         match &sources {
             Sources::Fixtures(definitions) => {
                 for definition in definitions {
-                    if !source_names.insert(&definition.name) {
-                        return Err(replay_gap(&format!(
-                            "duplicate source name: {}",
-                            definition.name
-                        )));
-                    }
+                    validate_source_name(&definition.name, &mut source_names)?;
                 }
             }
             Sources::Tasks(definitions) => {
                 for definition in definitions {
-                    if !source_names.insert(&definition.name) {
-                        return Err(replay_gap(&format!(
-                            "duplicate source name: {}",
-                            definition.name
-                        )));
-                    }
+                    validate_source_name(&definition.name, &mut source_names)?;
                 }
             }
         }
@@ -571,6 +562,19 @@ fn report_health(metrics: Option<&RunMetrics>, states: &HashMap<String, SourceSt
     metrics.set_feed_health(health.into_values().collect());
 }
 
+fn validate_source_name(
+    name: &str,
+    source_names: &mut BTreeSet<String>,
+) -> Result<(), DataSourceError> {
+    if name.trim().is_empty() {
+        return Err(replay_gap("source name cannot be blank"));
+    }
+    if !source_names.insert(name.to_owned()) {
+        return Err(replay_gap(&format!("duplicate source name: {name}")));
+    }
+    Ok(())
+}
+
 fn replay_gap(message: &str) -> DataSourceError {
     DataSourceError::ReplayGap {
         message: message.to_owned(),
@@ -769,8 +773,11 @@ fn account_event_detail_key(event: &pmkit_event::PmAccountEvent) -> String {
 mod tests {
     use super::{QueuedFact, merged_fact};
     use pmkit_core::MarketId;
-    use pmkit_event::{MarketEvent, PmMarketEnvelope, SourceEnvelope, StreamMetadata};
-    use pmkit_market::Outcome;
+    use pmkit_event::{
+        CexReferenceEnvelope, CexReferenceEvent, MarketEvent, PmMarketEnvelope, SourceEnvelope,
+        StreamMetadata,
+    };
+    use pmkit_market::{Asset, Exchange, Outcome};
     use rust_decimal::Decimal;
     use std::cmp::Ordering;
 
@@ -852,6 +859,75 @@ mod tests {
         // Then: distinct book content cannot collapse to equal ordering identities.
         assert_ne!(ordering, Ordering::Equal);
         assert_ne!(left, right);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn equal_key_cex_order_is_independent_of_producer_delay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        fn cex_envelope(source_id: &str) -> SourceEnvelope {
+            let mut metadata = metadata();
+            metadata.source_id = source_id.to_owned();
+            SourceEnvelope::CexReference(CexReferenceEnvelope {
+                metadata,
+                fact: CexReferenceEvent::Trade {
+                    asset: Asset::Btc,
+                    exchange: Exchange::Binance,
+                    aggregate_trade_id: 7,
+                    price: Decimal::ONE,
+                    qty: Decimal::ONE,
+                    is_buyer_maker: false,
+                    timestamp_ms: 10,
+                },
+            })
+        }
+        let run = |first_delay: u64| async move {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let feed = super::MergedFeed::from_tasks(
+                super::FeedMode::Paper,
+                vec![
+                    super::SourceTaskDefinition::new("alpha", move |sink| async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(first_delay)).await;
+                        sink.send(pmkit_data::SourceSignal::Data(Box::new(cex_envelope(
+                            "alpha",
+                        ))))
+                        .await
+                        .map_err(|_| pmkit_data::DataSourceError::SinkClosed)?;
+                        sink.send(pmkit_data::SourceSignal::Watermark(i64::MAX))
+                            .await
+                            .map_err(|_| pmkit_data::DataSourceError::SinkClosed)?;
+                        sink.send(pmkit_data::SourceSignal::Eof)
+                            .await
+                            .map_err(|_| pmkit_data::DataSourceError::SinkClosed)
+                    }),
+                    super::SourceTaskDefinition::new("beta", move |sink| async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(10 - first_delay))
+                            .await;
+                        sink.send(pmkit_data::SourceSignal::Data(Box::new(cex_envelope(
+                            "beta",
+                        ))))
+                        .await
+                        .map_err(|_| pmkit_data::DataSourceError::SinkClosed)?;
+                        sink.send(pmkit_data::SourceSignal::Watermark(i64::MAX))
+                            .await
+                            .map_err(|_| pmkit_data::DataSourceError::SinkClosed)?;
+                        sink.send(pmkit_data::SourceSignal::Eof)
+                            .await
+                            .map_err(|_| pmkit_data::DataSourceError::SinkClosed)
+                    }),
+                ],
+                None,
+            );
+            let task = tokio::spawn(feed.forward(tx));
+            let mut ids = Vec::new();
+            while let Some(fact) = rx.recv().await {
+                ids.push(fact.source.metadata().source_id.clone());
+            }
+            task.await??;
+            Ok::<_, Box<dyn std::error::Error>>(ids)
+        };
+        let expected = vec!["alpha".to_owned(), "beta".to_owned()];
+        assert_eq!(run(0).await?, expected);
+        assert_eq!(run(10).await?, vec!["alpha".to_owned(), "beta".to_owned()]);
         Ok(())
     }
 }
