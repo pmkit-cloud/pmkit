@@ -122,7 +122,7 @@ impl DecisionSnapshot {
 /// The risk verdict for one strategy action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RiskVerdict {
-    /// The action passed the risk gate.
+    /// The action passed the risk gate; this is risk-only and does not imply venue placement.
     Accepted,
     /// The action did not reach the venue because risk rejected it.
     Rejected {
@@ -398,7 +398,7 @@ impl<'a, S: TapeStore + ?Sized> CausalRecorder<'a, S> {
 }
 
 /// Records one causal decision for a book event, with empty CEX metrics when no
-/// reference source is configured. Placed actions become accepted risk verdicts.
+/// reference source is configured. Accepted values are risk-only verdicts, not placement receipts.
 pub(crate) async fn record_book_decision(
     store: &dyn TapeStore,
     identity: &CausalIdentity,
@@ -407,18 +407,36 @@ pub(crate) async fn record_book_decision(
     actions_placed: u32,
     simulation: Option<SimulationConfig>,
 ) -> Result<(), StoreError> {
+    record_book_decision_with_verdicts(
+        store,
+        identity,
+        book,
+        cex_trade,
+        (0..actions_placed)
+            .map(ActionRiskVerdict::accepted)
+            .collect(),
+        simulation,
+    )
+    .await
+}
+
+/// Records one book decision with the risk verdicts produced by each strategy action.
+pub(crate) async fn record_book_decision_with_verdicts(
+    store: &dyn TapeStore,
+    identity: &CausalIdentity,
+    book: &OrderBookL2,
+    cex_trade: CexTradeMetrics,
+    verdicts: Vec<ActionRiskVerdict>,
+    simulation: Option<SimulationConfig>,
+) -> Result<(), StoreError> {
     let mut snapshot = DecisionSnapshot::from_book(book, cex_trade);
     if let Some(simulation) = simulation {
         snapshot = snapshot.with_simulation(simulation);
     }
-    let decision = if actions_placed == 0 {
+    let decision = if verdicts.is_empty() {
         DecisionKind::NoAction
     } else {
-        DecisionKind::Actions(
-            (0..actions_placed)
-                .map(ActionRiskVerdict::accepted)
-                .collect(),
-        )
+        DecisionKind::Actions(verdicts)
     };
     CausalRecorder::new(store)
         .record_evaluation(identity, &snapshot, decision)

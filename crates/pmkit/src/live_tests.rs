@@ -53,6 +53,9 @@ struct ReferenceFactory {
     nonempty_books: Arc<AtomicUsize>,
 }
 
+struct MismatchedMarketStrategy;
+struct MismatchedMarketFactory;
+
 #[derive(Default)]
 struct RejectedExec {
     submissions: AtomicUsize,
@@ -139,6 +142,28 @@ impl StrategyFactory for ReferenceFactory {
             calls: Arc::clone(&self.calls),
             nonempty_books: Arc::clone(&self.nonempty_books),
         }))
+    }
+}
+
+impl Strategy for MismatchedMarketStrategy {
+    fn on_event(&mut self, _context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        Ok(Actions::place(PlaceOrder {
+            market: MarketId::new("other-market").map_err(|error| StrategyError {
+                message: error.to_string(),
+            })?,
+            outcome: Outcome::Up,
+            side: Side::Buy,
+            price: Decimal::new(46, 2),
+            qty: Decimal::ONE,
+            post_only: false,
+            tif: pmkit_exec::TimeInForce::Gtc,
+        }))
+    }
+}
+
+impl StrategyFactory for MismatchedMarketFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(MismatchedMarketStrategy))
     }
 }
 
@@ -563,6 +588,27 @@ async fn live_run_routes_orders_and_counts_fills() -> Result<(), Box<dyn std::er
     assert_eq!(report.fills, 1);
     assert_eq!(report.rejected, 0);
     assert!(report.exposure.portfolio_notional > Decimal::ZERO);
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_rejects_market_mismatch_before_executor() -> Result<(), Box<dyn std::error::Error>> {
+    let executor = Arc::new(ReferenceExec::default());
+    let run = LiveRun::new(
+        RunId::new("live-market-mismatch")?,
+        PortfolioId::new("alice")?,
+        executor.clone(),
+        Arc::new(LiveWithBook),
+        risk()?,
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("mismatch")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(MismatchedMarketFactory),
+    ));
+    let report = live::drive(&run, &config()?).await?;
+    assert_eq!(report.rejected, 1);
+    assert_eq!(executor.submissions.load(Ordering::Relaxed), 0);
     Ok(())
 }
 

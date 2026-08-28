@@ -823,6 +823,17 @@ fn instantiate_strategies(
     registrations: &[StrategyRegistration],
     run: &RunId,
 ) -> Result<Vec<StrategyInstance>, StartError> {
+    let mut strategy_ids = HashSet::new();
+    for registration in registrations {
+        if !strategy_ids.insert(registration.id().clone()) {
+            return Err(StartError::StrategyInit {
+                run: run.clone(),
+                source: pmkit_strategy::StrategyInitError {
+                    message: format!("duplicate strategy id {}", registration.id()),
+                },
+            });
+        }
+    }
     let mut strategies = Vec::new();
     for registration in registrations {
         let strategy =

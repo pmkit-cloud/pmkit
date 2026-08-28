@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 #[must_use]
-pub fn passes_risk(
+pub(crate) fn passes_risk(
     order: &PlaceOrder,
     limits: &RiskLimits,
     positions: &[Position],
@@ -40,21 +40,21 @@ pub fn passes_risk(
 
 /// Aggregated exposure checked before one live venue submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PortfolioRiskExposure {
+pub(crate) struct PortfolioRiskExposure {
     /// Current marked position and reserved-order notional.
-    pub portfolio_notional: Decimal,
+    pub(crate) portfolio_notional: Decimal,
     /// Current marked position and reserved-order notional for the order market.
-    pub market_notional: Decimal,
+    pub(crate) market_notional: Decimal,
     /// Current reserved notional attributable to the strategy.
-    pub strategy_notional: Decimal,
+    pub(crate) strategy_notional: Decimal,
     /// Current daily portfolio profit and loss.
-    pub daily_pnl: Decimal,
+    pub(crate) daily_pnl: Decimal,
     /// Current open order count.
-    pub open_orders: usize,
+    pub(crate) open_orders: usize,
 }
 
 #[must_use]
-pub fn passes_aggregated_risk(
+pub(crate) fn passes_aggregated_risk(
     order: &PlaceOrder,
     limits: &RiskLimits,
     positions: &[Position],
@@ -72,7 +72,7 @@ pub fn passes_aggregated_risk(
 }
 
 #[must_use]
-pub fn mark_positions(
+pub(crate) fn mark_positions(
     positions_by_market: &mut HashMap<MarketId, Vec<Position>>,
     marks: &HashMap<(MarketId, Outcome), Decimal>,
 ) -> Option<Decimal> {
@@ -89,6 +89,47 @@ pub fn mark_positions(
         }
     }
     Some(portfolio_unrealized_pnl)
+}
+
+/// Returns the marked gross notional for positions in one market.
+#[must_use]
+pub(crate) fn marked_position_notional(
+    market: &MarketId,
+    positions: &[Position],
+    marks: &HashMap<(MarketId, Outcome), Decimal>,
+) -> Decimal {
+    positions
+        .iter()
+        .map(|position| {
+            marks
+                .get(&(market.clone(), position.outcome))
+                .map_or(Decimal::ZERO, |mark| position.qty.abs() * *mark)
+        })
+        .sum()
+}
+
+/// Returns marked gross notional across all positions.
+#[must_use]
+pub(crate) fn portfolio_marked_notional(
+    positions_by_market: &HashMap<MarketId, Vec<Position>>,
+    marks: &HashMap<(MarketId, Outcome), Decimal>,
+) -> Decimal {
+    positions_by_market
+        .iter()
+        .map(|(market, positions)| marked_position_notional(market, positions, marks))
+        .sum()
+}
+
+/// Returns realized plus marked unrealized `PnL` when every position has a mark.
+#[must_use]
+pub(crate) fn marked_daily_pnl(
+    positions_by_market: &mut HashMap<MarketId, Vec<Position>>,
+    marks: &HashMap<(MarketId, Outcome), Decimal>,
+    realized_pnl: Decimal,
+    fees: Decimal,
+) -> Option<Decimal> {
+    mark_positions(positions_by_market, marks)
+        .map(|unrealized_pnl| realized_pnl - fees + unrealized_pnl)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -746,33 +787,24 @@ impl LiveRiskState {
     }
 
     pub(super) fn daily_pnl(&self) -> Option<Decimal> {
-        let mut unrealized_pnl = Decimal::ZERO;
-        for (market, positions) in &self.positions_by_market {
-            for position in positions {
-                if position.qty.is_zero() {
-                    continue;
-                }
-                if !self.marks.contains_key(&(market.clone(), position.outcome)) {
-                    return None;
-                }
-                unrealized_pnl += position.unrealized_pnl;
-            }
-        }
-        Some(self.realized_pnl - self.fees + unrealized_pnl)
+        let mut positions_by_market = self.positions_by_market.clone();
+        marked_daily_pnl(
+            &mut positions_by_market,
+            &self.marks,
+            self.realized_pnl,
+            self.fees,
+        )
     }
 
     pub(super) fn portfolio_notional(&self) -> Decimal {
-        self.positions_by_market
-            .iter()
-            .map(|(market, positions)| self.marked_notional(market, positions))
-            .sum()
+        portfolio_marked_notional(&self.positions_by_market, &self.marks)
     }
 
     pub(super) fn market_notional(&self, market: &MarketId) -> Decimal {
         self.positions_by_market
             .get(market)
             .map_or(Decimal::ZERO, |positions| {
-                self.marked_notional(market, positions)
+                marked_position_notional(market, positions, &self.marks)
             })
     }
 
@@ -781,25 +813,18 @@ impl LiveRiskState {
             .iter()
             .map(|(market, positions)| PositionExposure {
                 market: market.clone(),
-                notional: self.marked_notional(market, positions),
+                notional: marked_position_notional(market, positions, &self.marks),
             })
             .collect()
     }
 
-    fn marked_notional(&self, market: &MarketId, positions: &[Position]) -> Decimal {
-        positions
-            .iter()
-            .map(|position| {
-                self.marks
-                    .get(&(market.clone(), position.outcome))
-                    .map_or(Decimal::ZERO, |mark| position.qty.abs() * *mark)
-            })
-            .sum()
-    }
-
     fn refresh_marks(&mut self, limits: &RiskLimits) -> Option<Decimal> {
-        let daily_pnl = mark_positions(&mut self.positions_by_market, &self.marks)
-            .map(|unrealized_pnl| self.realized_pnl - self.fees + unrealized_pnl);
+        let daily_pnl = marked_daily_pnl(
+            &mut self.positions_by_market,
+            &self.marks,
+            self.realized_pnl,
+            self.fees,
+        );
         if daily_pnl.is_some_and(|pnl| pnl <= -limits.max_loss.as_decimal()) {
             self.loss_breached = true;
         }

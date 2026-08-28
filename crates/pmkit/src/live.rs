@@ -37,23 +37,16 @@ impl DurableFillAuthority {
 #[path = "live_recovery.rs"]
 mod live_recovery;
 #[path = "live_risk.rs"]
-mod live_risk;
+/// Shared pure risk calculations used by live and paper drivers.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) mod live_risk;
 #[path = "live_tape.rs"]
 mod live_tape;
 #[cfg(test)]
 use live_recovery::{DurableOrder, apply_status_fill};
 use live_recovery::{accepted_submissions, corrupt_order, reconstruct_accepted_orders};
-#[cfg(test)]
-pub use live_risk::mark_positions;
-use live_risk::{
-    LiveRiskState, OrderRateLimits, OrderRateState, PortfolioRiskExposure, RiskStateError,
-    passes_aggregated_risk,
-};
-#[cfg(test)]
-pub use live_risk::{
-    PortfolioRiskExposure as TestRiskExposure,
-    passes_aggregated_risk as test_passes_aggregated_risk, passes_risk,
-};
+use live_risk::{LiveRiskState, OrderRateLimits, OrderRateState, RiskStateError};
+use live_risk::{PortfolioRiskExposure, passes_aggregated_risk};
 use live_tape::LiveTape;
 
 async fn initial_open_orders(
@@ -613,6 +606,22 @@ async fn dispatch_live_pipeline(
                     continue;
                 };
                 let action_index = u32::try_from(action_index).unwrap_or(u32::MAX);
+                if order.market != instance.market {
+                    verdicts.push(crate::causal::ActionRiskVerdict::rejected(
+                        action_index,
+                        "market mismatch",
+                    ));
+                    metrics.reject();
+                    continue;
+                }
+                if daily_pnl.is_none() {
+                    verdicts.push(crate::causal::ActionRiskVerdict::rejected(
+                        action_index,
+                        "risk data unavailable",
+                    ));
+                    metrics.reject();
+                    continue;
+                }
                 if open_orders.len() >= max_open_orders {
                     *open_orders = reconcile_open_orders(run, runtime).await?;
                 }
@@ -730,7 +739,8 @@ async fn dispatch_live_pipeline(
     clippy::too_many_arguments,
     reason = "durable event identity includes strategy, market, source, stream, and transport coordinates"
 )]
-fn strategy_event_correlation_id(
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn strategy_event_correlation_id(
     strategy: &pmkit_core::StrategyId,
     market: &pmkit_core::MarketId,
     timestamp_ms: i64,

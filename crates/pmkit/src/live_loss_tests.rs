@@ -152,7 +152,7 @@ fn risk_gate_rejects_a_marked_loss_at_the_limit() -> Result<(), Box<dyn std::err
         }],
     )]);
     let marks = HashMap::from([((market.clone(), Outcome::Up), Decimal::new(40, 2))]);
-    let portfolio_pnl = live::mark_positions(&mut positions, &marks);
+    let portfolio_pnl = live::live_risk::mark_positions(&mut positions, &marks);
     let order = PlaceOrder {
         market: market.clone(),
         outcome: Outcome::Up,
@@ -164,7 +164,7 @@ fn risk_gate_rejects_a_marked_loss_at_the_limit() -> Result<(), Box<dyn std::err
     };
 
     assert_eq!(portfolio_pnl, Some(Decimal::new(-2, 0)));
-    assert!(!live::passes_risk(
+    assert!(!live::live_risk::passes_risk(
         &order,
         &limits,
         positions.get(&market).ok_or("market positions")?,
@@ -195,13 +195,13 @@ fn risk_gate_enforces_order_and_position_notional() -> Result<(), Box<dyn std::e
         post_only: false,
         tif: TimeInForce::Gtc,
     };
-    assert!(live::passes_risk(
+    assert!(live::live_risk::passes_risk(
         &order(5),
         &limits,
         &[],
         Some(Decimal::ZERO),
     ));
-    assert!(!live::passes_risk(
+    assert!(!live::live_risk::passes_risk(
         &order(15),
         &limits,
         &[],
@@ -213,7 +213,7 @@ fn risk_gate_enforces_order_and_position_notional() -> Result<(), Box<dyn std::e
         avg_entry: Decimal::ONE,
         unrealized_pnl: Decimal::ZERO,
     }];
-    assert!(!live::passes_risk(
+    assert!(!live::live_risk::passes_risk(
         &order(5),
         &limits,
         &held,
@@ -239,39 +239,40 @@ fn aggregated_risk_enforces_portfolio_market_strategy_and_daily_limits()
         post_only: false,
         tif: TimeInForce::Gtc,
     };
-    let exposure = |portfolio, market, strategy, daily_pnl| live::TestRiskExposure {
-        portfolio_notional: Decimal::from(portfolio),
-        market_notional: Decimal::from(market),
-        strategy_notional: Decimal::from(strategy),
-        daily_pnl: Decimal::from(daily_pnl),
-        open_orders: 0,
-    };
+    let exposure =
+        |portfolio, market, strategy, daily_pnl| live::live_risk::PortfolioRiskExposure {
+            portfolio_notional: Decimal::from(portfolio),
+            market_notional: Decimal::from(market),
+            strategy_notional: Decimal::from(strategy),
+            daily_pnl: Decimal::from(daily_pnl),
+            open_orders: 0,
+        };
 
-    assert!(live::test_passes_aggregated_risk(
+    assert!(live::live_risk::passes_aggregated_risk(
         &order,
         &limits,
         &[],
         exposure(7, 5, 3, 0),
     ));
-    assert!(!live::test_passes_aggregated_risk(
+    assert!(!live::live_risk::passes_aggregated_risk(
         &order,
         &limits,
         &[],
         exposure(9, 5, 3, 0),
     ));
-    assert!(!live::test_passes_aggregated_risk(
+    assert!(!live::live_risk::passes_aggregated_risk(
         &order,
         &limits,
         &[],
         exposure(7, 7, 3, 0),
     ));
-    assert!(!live::test_passes_aggregated_risk(
+    assert!(!live::live_risk::passes_aggregated_risk(
         &order,
         &limits,
         &[],
         exposure(7, 5, 5, 0),
     ));
-    assert!(!live::test_passes_aggregated_risk(
+    assert!(!live::live_risk::passes_aggregated_risk(
         &order,
         &limits,
         &[],

@@ -1,5 +1,5 @@
 use crate::{
-    Cancellation, Pmkit, RunControl, RunLifecycleEvent, RunReport,
+    Cancellation, Pmkit, RunControl, RunLifecycleEvent, RunReport, StartError,
     test_support::{BuyFactory, config, risk},
 };
 use async_trait::async_trait;
@@ -55,6 +55,13 @@ struct RecordingFactory {
 struct FailingStrategy(Arc<AtomicUsize>);
 
 struct FailingFactory(Arc<AtomicUsize>);
+
+struct RepeatBuy;
+
+struct RepeatBuyFactory;
+
+struct MismatchedMarket;
+struct MismatchedMarketFactory;
 
 fn record_fact(facts: &Mutex<Vec<StrategyFact>>, fact: &StrategyFact) {
     match facts.lock() {
@@ -148,6 +155,48 @@ impl Strategy for FailingStrategy {
 impl StrategyFactory for FailingFactory {
     fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
         Ok(Box::new(FailingStrategy(Arc::clone(&self.0))))
+    }
+}
+
+impl Strategy for RepeatBuy {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        Ok(Actions::place(pmkit_exec::PlaceOrder {
+            market: context.market.clone(),
+            outcome: Outcome::Up,
+            side: pmkit_book::Side::Buy,
+            price: Decimal::new(50, 2),
+            qty: Decimal::from(10),
+            post_only: false,
+            tif: pmkit_exec::TimeInForce::Gtc,
+        }))
+    }
+}
+
+impl StrategyFactory for RepeatBuyFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(RepeatBuy))
+    }
+}
+
+impl Strategy for MismatchedMarket {
+    fn on_event(&mut self, _context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        Ok(Actions::place(pmkit_exec::PlaceOrder {
+            market: MarketId::new("other-market").map_err(|error| StrategyError {
+                message: error.to_string(),
+            })?,
+            outcome: Outcome::Up,
+            side: pmkit_book::Side::Buy,
+            price: Decimal::new(50, 2),
+            qty: Decimal::ONE,
+            post_only: false,
+            tif: pmkit_exec::TimeInForce::Gtc,
+        }))
+    }
+}
+
+impl StrategyFactory for MismatchedMarketFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(MismatchedMarket))
     }
 }
 
@@ -287,6 +336,81 @@ impl LiveDataSource for FailingLive {
 }
 
 #[tokio::test]
+async fn duplicate_strategy_ids_fail_before_factory_or_feed_start()
+-> Result<(), Box<dyn std::error::Error>> {
+    let market = MarketId::new("btc-5m")?;
+    let run = PaperRun::new(
+        RunId::new("paper-duplicate-strategy")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        risk()?,
+        Arc::new(ScriptedLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("duplicate")?,
+        market.clone(),
+        Arc::new(BuyFactory),
+    ))
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("duplicate")?,
+        market,
+        Arc::new(BuyFactory),
+    ));
+
+    let Err(error) = Pmkit::builder(config()?).run(run).start().await else {
+        return Err("duplicate id should fail".into());
+    };
+    assert!(matches!(
+        error,
+        StartError::RunFailed { source, .. }
+            if matches!(source.as_ref(), StartError::StrategyInit { source, .. } if source.message.contains("duplicate strategy id"))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn paper_rejects_market_mismatch_without_fill() -> Result<(), Box<dyn std::error::Error>> {
+    let run = PaperRun::new(
+        RunId::new("paper-market-mismatch")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        risk()?,
+        Arc::new(ScriptedLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("mismatch")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(MismatchedMarketFactory),
+    ));
+    let app = Pmkit::builder(config()?).run(run).start().await?;
+    let RunReport::Paper(report) = app
+        .report(&RunId::new("paper-market-mismatch")?)
+        .ok_or("missing report")?
+    else {
+        return Err("expected paper report".into());
+    };
+    assert_eq!(report.metrics.rejected, 1);
+    assert_eq!(report.fills, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn paper_run_drives_live_feed_to_fill() -> Result<(), Box<dyn std::error::Error>> {
     let run = PaperRun::new(
         RunId::new("paper")?,
@@ -409,6 +533,70 @@ async fn paper_run_delivers_reference_facts_once_in_causal_order()
 }
 
 #[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
+async fn paper_reference_rejection_is_durable_and_risk_only()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(TursoTapeStore::open_local(directory.path().join("reference.db")).await?);
+    let mut limits = risk()?;
+    limits.max_order_notional = Money::usdc(0);
+    let run = PaperRun::new(
+        RunId::new("paper-reference-rejection")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        limits,
+        Arc::new(ScriptedLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .reference_data(Arc::new(FiniteReferenceSource {
+        events: vec![reference_trade(1, 2, 101)],
+    }))
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("reference")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(RepeatBuyFactory),
+    ));
+    let app = Pmkit::builder(config()?)
+        .storage(store.clone())
+        .run(run)
+        .start()
+        .await?;
+    let report = app
+        .report(&RunId::new("paper-reference-rejection")?)
+        .ok_or("missing report")?;
+    let RunReport::Paper(report) = report else {
+        return Err("expected paper report".into());
+    };
+    assert_eq!(report.fills, 0);
+    assert_eq!(report.metrics.rejected, 2);
+    let scope = OwnerScope::new(
+        PortfolioId::new("alice")?,
+        RunId::new("paper-reference-rejection")?,
+    );
+    let decisions = store.read_decisions(&scope).await?;
+    let reference = decisions
+        .iter()
+        .find(|decision| decision.identity.correlation_id.contains(":cex-trade:"))
+        .ok_or("missing durable CEX decision")?;
+    assert_eq!(
+        reference.payload["decision"]["risk"][0]["verdict"]["kind"],
+        "rejected"
+    );
+    assert_eq!(
+        reference.payload["decision"]["risk"][0]["verdict"]["reason"],
+        "risk gate"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn paper_run_rejects_mismatched_account_owner() -> Result<(), Box<dyn std::error::Error>> {
     // Given: a store-backed paper run receives another portfolio's account envelope.
     let directory = tempfile::tempdir()?;
@@ -522,6 +710,7 @@ async fn paper_failure_retains_restored_fill_diagnostics() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
 async fn paper_run_clears_exposure_when_book_loses_its_mark()
 -> Result<(), Box<dyn std::error::Error>> {
     // Given: a filled paper position followed by an unmarkable book for the same outcome.
@@ -543,11 +732,18 @@ async fn paper_run_clears_exposure_when_book_loses_its_mark()
     .strategy(StrategyRegistration::new(
         StrategyId::new("buyer")?,
         MarketId::new("btc-5m")?,
-        Arc::new(BuyFactory),
+        Arc::new(RepeatBuyFactory),
     ));
 
     // When: the live feed completes.
-    let app = Pmkit::builder(config()?).run(run).start().await?;
+    let directory = tempfile::tempdir()?;
+    let store =
+        Arc::new(TursoTapeStore::open_local(directory.path().join("missing-mark.db")).await?);
+    let app = Pmkit::builder(config()?)
+        .storage(store.clone())
+        .run(run)
+        .start()
+        .await?;
     let RunReport::Paper(report) = app
         .report(&RunId::new("paper-stale-mark")?)
         .ok_or("missing report")?
@@ -555,8 +751,19 @@ async fn paper_run_clears_exposure_when_book_loses_its_mark()
         return Err("expected a paper report".into());
     };
 
-    // Then: the obsolete mid-price cannot survive in reported exposure.
+    // Then: the obsolete mid-price cannot survive in reported exposure, and the second action is rejected once.
     assert_eq!(report.exposure.portfolio_notional, Decimal::ZERO);
+    assert_eq!(report.metrics.rejected, 1);
+    let scope = OwnerScope::new(PortfolioId::new("alice")?, RunId::new("paper-stale-mark")?);
+    let decisions = store.read_decisions(&scope).await?;
+    let missing_mark = decisions
+        .iter()
+        .find(|decision| decision.payload["snapshot"]["timing"]["observation_ms"] == 2)
+        .ok_or("missing-mark decision was not recorded")?;
+    assert_eq!(
+        missing_mark.payload["decision"]["risk"][0]["verdict"]["reason"],
+        "risk data unavailable"
+    );
     Ok(())
 }
 
