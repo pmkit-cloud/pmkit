@@ -359,8 +359,11 @@ impl LiveDataSource for PolymarketLiveData {
         }
         let mut connection_epoch = next_connection_epoch(&self.connection_epoch)?;
         let token = self.tokens.token(outcome);
-        let mut subscription = MarketSubscriptionLease::reserve(self.client.clone(), token);
-        let events = match self.client.subscribe_market_events(vec![token]) {
+        // ponytail: isolate outcome sockets until the SDK can atomically register every
+        // consumer before one multi-token subscription sends its initial snapshots.
+        let client = self.client.isolated().map_err(|error| data_error(&error))?;
+        let mut subscription = MarketSubscriptionLease::reserve(client.clone(), token);
+        let events = match client.subscribe_market_events(vec![token]) {
             Ok(events) => {
                 subscription.mark_subscribed();
                 events
@@ -373,7 +376,7 @@ impl LiveDataSource for PolymarketLiveData {
         let mut events = Box::pin(events);
         let mut book = TokenBook::default();
         let mut sequence = 0_u64;
-        let mut connection_since = connected_since(&self.client);
+        let mut connection_since = connected_since(&client);
         let mut heartbeat =
             tokio::time::interval(std::time::Duration::from_millis(LIVE_HEARTBEAT_INTERVAL_MS));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -383,7 +386,7 @@ impl LiveDataSource for PolymarketLiveData {
             tokio::select! {
                 _ = heartbeat.tick() => {
                     if book.initialized
-                        && self.client.connection_state(ChannelType::Market).is_connected()
+                        && client.connection_state(ChannelType::Market).is_connected()
                         && sink.send(SourceSignal::Watermark(live_watermark_now())).await.is_err()
                     {
                         break Err(DataSourceError::SinkClosed);
@@ -392,7 +395,7 @@ impl LiveDataSource for PolymarketLiveData {
                 update = events.next() => match update {
                     Some(Ok(update)) => {
                         if let Err(error) = observe_connection_state(
-                            &self.client,
+                            &client,
                             &mut connection_since,
                             &mut connection_epoch,
                             &mut sequence,
