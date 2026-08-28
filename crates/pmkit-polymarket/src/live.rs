@@ -20,6 +20,7 @@ use pmkit_market::Outcome;
 use pmkit_store::{OwnerScope, PM_ENVELOPE_VERSION, PmEnvelope, StoreError, TapeStore};
 use polymarket_client_sdk_v2::clob::ws::{BookUpdate, Client, LastTradePrice};
 use polymarket_client_sdk_v2::error::Error as SdkError;
+use polymarket_client_sdk_v2::types::U256;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 
@@ -273,6 +274,48 @@ impl PolymarketLiveData {
     }
 }
 
+struct MarketSubscriptions {
+    client: Client,
+    token: U256,
+    count: u8,
+}
+
+impl MarketSubscriptions {
+    const fn new(client: Client, token: U256) -> Self {
+        Self {
+            client,
+            token,
+            count: 0,
+        }
+    }
+
+    const fn add(&mut self) {
+        self.count = self.count.saturating_add(1);
+    }
+
+    fn close(mut self) -> Result<(), DataSourceError> {
+        let mut first_error = None;
+        while self.count > 0 {
+            self.count -= 1;
+            if let Err(error) = self.client.unsubscribe_orderbook(&[self.token])
+                && first_error.is_none()
+            {
+                first_error = Some(data_error(&error));
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for MarketSubscriptions {
+    fn drop(&mut self) {
+        while self.count > 0 {
+            self.count -= 1;
+            let _ = self.client.unsubscribe_orderbook(&[self.token]);
+        }
+    }
+}
+
 impl fmt::Debug for PolymarketLiveData {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -295,19 +338,17 @@ impl LiveDataSource for PolymarketLiveData {
         }
         let connection_epoch = next_connection_epoch(&self.connection_epoch)?;
         let token = self.tokens.token(outcome);
+        let mut subscriptions = MarketSubscriptions::new(self.client.clone(), token);
         let books = self
             .client
             .subscribe_orderbook(vec![token])
             .map_err(|error| data_error(&error))?;
-        let trades = match self.client.subscribe_last_trade_price(vec![token]) {
-            Ok(trades) => trades,
-            Err(error) => {
-                self.client
-                    .unsubscribe_orderbook(&[token])
-                    .map_err(|error| data_error(&error))?;
-                return Err(data_error(&error));
-            }
-        };
+        subscriptions.add();
+        let trades = self
+            .client
+            .subscribe_last_trade_price(vec![token])
+            .map_err(|error| data_error(&error))?;
+        subscriptions.add();
         let mut books = Box::pin(books);
         let mut trades = Box::pin(trades);
         let mut sequence = 0;
@@ -365,11 +406,9 @@ impl LiveDataSource for PolymarketLiveData {
 
         drop(books);
         drop(trades);
-        let book_cleanup = self.client.unsubscribe_orderbook(&[token]);
-        let trade_cleanup = self.client.unsubscribe_prices(&[token]);
+        let cleanup = subscriptions.close();
         result?;
-        book_cleanup.map_err(|error| data_error(&error))?;
-        trade_cleanup.map_err(|error| data_error(&error))
+        cleanup
     }
 }
 

@@ -376,7 +376,7 @@ impl MergedFeed {
                                             Ok(())
                                         }
                                         .await;
-                                        break pending.and(result);
+                                        break result.and(pending);
                                     }
                                 }
                             };
