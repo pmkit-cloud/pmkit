@@ -22,6 +22,7 @@ mod public_protocol;
 mod public_tape;
 mod public_tape_contract;
 mod rtds;
+mod rtds_historical;
 mod subscription;
 
 #[cfg(test)]
@@ -55,6 +56,7 @@ pub use rtds::{
     POLYMARKET_RTDS_ENDPOINT, POLYMARKET_RTDS_SOURCE_ID, POLYMARKET_RTDS_TOPIC, PolymarketRtdsLive,
     PolymarketRtdsParseError, parse_polymarket_rtds_twap, parse_polymarket_rtds_twap_bytes,
 };
+pub use rtds_historical::PolymarketRtdsHistorical;
 pub use subscription::{
     DiscoverySnapshot, GammaMarket, GammaOutcome, RecurringFamily, ReplicaSubscriptionPlan,
     SubscriptionShard,

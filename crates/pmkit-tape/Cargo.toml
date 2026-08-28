@@ -19,11 +19,11 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 pmkit-book = { path = "../pmkit-book" }
 pmkit-event = { path = "../pmkit-event" }
+pmkit-market = { path = "../pmkit-market" }
 rust_decimal = { workspace = true }
 
 [dev-dependencies]
 pmkit-core = { path = "../pmkit-core" }
-pmkit-market = { path = "../pmkit-market" }
 tempfile = { workspace = true }
 
 [lints]
