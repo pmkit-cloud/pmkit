@@ -3904,9 +3904,8 @@ dependencies = [
 
 [[package]]
 name = "polymarket_client_sdk_v2"
-version = "0.6.0-canary.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60838f2225e2bf6578bc5f5e81fc7de5f855b611a6b4f0f3b65fa3c41f7d593f"
+version = "0.7.0"
+source = "git+https://github.com/yovanoc/rs-clob-client-v2?rev=8f39ed139d9be10f943ba1463bf63cfc30f39e87#8f39ed139d9be10f943ba1463bf63cfc30f39e87"
 dependencies = [
  "alloy",
  "async-stream",
