@@ -2,7 +2,10 @@ use std::fmt;
 
 use futures::StreamExt as _;
 use pmkit_core::PortfolioId;
-use pmkit_data::{DataSourceError, LiveAccountDataSource, SourceSignal};
+use pmkit_data::{
+    DataSourceError, LIVE_HEARTBEAT_INTERVAL_MS, LiveAccountDataSource, SourceSignal,
+    live_watermark_now, now_ms,
+};
 use pmkit_event::{
     FillIdentity, Liquidity, PmAccountEnvelope, PmAccountEvent, SourceEnvelope, StreamMetadata,
 };
@@ -29,6 +32,31 @@ pub struct PolymarketUserData {
     portfolio: PortfolioId,
     tokens: MarketTokens,
     market_condition: B256,
+}
+
+struct UserSubscription {
+    client: Client<Authenticated<Normal>>,
+    market: B256,
+    active: bool,
+}
+
+impl UserSubscription {
+    const fn new(client: Client<Authenticated<Normal>>, market: B256) -> Self {
+        Self {
+            client,
+            market,
+            active: true,
+        }
+    }
+}
+
+impl Drop for UserSubscription {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            let _ = self.client.unsubscribe_user_events(&[self.market]);
+        }
+    }
 }
 
 impl fmt::Debug for PolymarketUserData {
@@ -74,9 +102,26 @@ impl LiveAccountDataSource for PolymarketUserData {
             .client
             .subscribe_user_events(vec![self.market_condition])
             .map_err(|error| unavailable(error.to_string()))?;
+        let _subscription = UserSubscription::new(self.client.clone(), self.market_condition);
         let mut stream = Box::pin(stream);
         let mut sequence = 0_u64;
-        while let Some(message) = stream.next().await {
+        let mut heartbeat =
+            tokio::time::interval(std::time::Duration::from_millis(LIVE_HEARTBEAT_INTERVAL_MS));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat.tick().await;
+        loop {
+            let message = tokio::select! {
+                _ = heartbeat.tick() => {
+                    sink.send(SourceSignal::Watermark(live_watermark_now()))
+                        .await
+                        .map_err(|_| DataSourceError::SinkClosed)?;
+                    continue;
+                }
+                message = stream.next() => message,
+            };
+            let Some(message) = message else {
+                break;
+            };
             let message = message.map_err(|error| unavailable(error.to_string()))?;
             sequence = sequence
                 .checked_add(1)
@@ -97,7 +142,7 @@ impl LiveAccountDataSource for PolymarketUserData {
                         source_id: SOURCE_ID.into(),
                         source_time_ms: timestamp_ms,
                         canonical_source_rank: 0,
-                        receipt_time_ms: timestamp_ms,
+                        receipt_time_ms: now_ms(),
                         connection_id: SOURCE_ID.into(),
                         connection_epoch: 0,
                         frame_sequence,

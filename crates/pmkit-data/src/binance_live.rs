@@ -8,9 +8,9 @@ use tokio::sync::mpsc::Sender;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
-    DataSourceError, LiveCexDataSource, SourceSignal,
+    DataSourceError, LIVE_HEARTBEAT_INTERVAL_MS, LiveCexDataSource, SourceSignal,
     binance::{BINANCE_REFERENCE_SOURCE_ID, reference_trade_identity},
-    parse_binance_agg_trade_live,
+    live_watermark_now, now_ms, parse_binance_agg_trade_live,
 };
 
 const BINANCE_WS_BASE: &str = "wss://stream.binance.com:9443/ws";
@@ -47,7 +47,23 @@ impl LiveCexDataSource for BinanceAggTradeLive {
             .map_err(|error| DataSourceError::Unavailable {
                 message: format!("Binance aggTrade connection failed: {error}"),
             })?;
-        while let Some(message) = socket.next().await {
+        let mut heartbeat =
+            tokio::time::interval(std::time::Duration::from_millis(LIVE_HEARTBEAT_INTERVAL_MS));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat.tick().await;
+        loop {
+            let message = tokio::select! {
+                _ = heartbeat.tick() => {
+                    sink.send(SourceSignal::Watermark(live_watermark_now()))
+                        .await
+                        .map_err(|_| DataSourceError::SinkClosed)?;
+                    continue;
+                }
+                message = socket.next() => message,
+            };
+            let Some(message) = message else {
+                break;
+            };
             let message = message.map_err(|error| DataSourceError::Unavailable {
                 message: format!("Binance aggTrade stream failed: {error}"),
             })?;
@@ -70,7 +86,7 @@ impl LiveCexDataSource for BinanceAggTradeLive {
                         source_id: BINANCE_REFERENCE_SOURCE_ID.to_owned(),
                         source_time_ms: timestamp_ms,
                         canonical_source_rank: 1,
-                        receipt_time_ms: timestamp_ms,
+                        receipt_time_ms: now_ms(),
                         connection_id: self.endpoint.to_string(),
                         connection_epoch: 0,
                         frame_sequence,
