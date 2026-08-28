@@ -1,13 +1,13 @@
 use super::{
-    PaperReport, RunControl, RunLifecycleEvent, StartError, instantiate_strategies,
-    observe_reconnect, store_signal, validate_account_owner,
+    PaperReport, RunControl, RunLifecycleEvent, StartError, StrategyInstance,
+    instantiate_strategies, observe_reconnect, store_signal, validate_account_owner,
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_accounting::{
     ExposureReservation, PortfolioExposure, PositionExposure, aggregate_exposure,
 };
 use pmkit_book::OrderBookL2;
-use pmkit_event::{MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
+use pmkit_event::{CexReferenceEvent, MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
 use pmkit_exec::ExecError;
 use pmkit_market::Outcome;
 use pmkit_paper::{PaperExecutor, PaperLedgerEntry, PaperLedgerError};
@@ -208,6 +208,7 @@ pub async fn drive_with_control(
     let mut fills = paper.fill_count();
     metrics.set_fills(fills);
     let mut marks = HashMap::new();
+    let mut strategy_books = vec![OrderBookL2::default(); strategies.len()];
     let mut connection_epochs = HashMap::new();
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     control.emit(RunLifecycleEvent::Started {
@@ -257,6 +258,28 @@ pub async fn drive_with_control(
         })?;
         if let SourceEnvelope::CexReference(envelope) = &merged.source {
             cex_metrics.observe(&envelope.fact);
+            let timestamp_ms = match &envelope.fact {
+                CexReferenceEvent::Trade { timestamp_ms, .. } => *timestamp_ms,
+            };
+            // CEX facts have no PM market key, so fan them out once in the stable
+            // registration order; each key keeps its own latest PM context.
+            for (index, instance) in strategies.iter_mut().enumerate() {
+                let positions = paper.positions_for_market(&instance.market);
+                dispatch_strategy(
+                    instance,
+                    &merged.fact,
+                    &strategy_books[index],
+                    &positions,
+                    timestamp_ms,
+                    &paper,
+                    &mut fill_rx,
+                    &metrics,
+                    store,
+                    &scope,
+                    run.id(),
+                )
+                .await?;
+            }
             continue;
         }
         if let SourceEnvelope::PmAccount(envelope) = &merged.source {
@@ -339,58 +362,31 @@ pub async fn drive_with_control(
             fills = paper.fill_count();
             metrics.set_fills(fills);
             let mut actions_placed = 0_u32;
-            for instance in &mut *strategies {
+            for (index, instance) in strategies.iter_mut().enumerate() {
                 if instance.market != *market {
                     continue;
                 }
+                strategy_books[index] = book.clone();
                 let positions = paper.positions_for_market(market);
-                let context = StrategyContext {
-                    fact: &fact,
-                    market,
-                    book: &book,
-                    positions: &positions,
-                    now: LogicalTimestamp::from_millis(*timestamp_ms),
-                };
-                metrics.decision();
-                if let Ok(actions) = instance.strategy.on_event(context) {
-                    for action in actions.as_slice() {
-                        if let Action::Place(order) = action {
-                            let submit_result = paper
-                                .submit_for_strategy(order, instance.id.clone(), *timestamp_ms)
-                                .await;
-                            metrics.set_fills(paper.fill_count());
-                            if matches!(&submit_result, Err(ExecError::Rejected { .. })) {
-                                metrics.reject();
-                            }
-                            if let Some(store) = store {
-                                persist_paper_ledger(store, &scope, &paper).await.map_err(
-                                    |source| StartError::Storage {
-                                        run: run.id().clone(),
-                                        source,
-                                    },
-                                )?;
-                            } else {
-                                paper.drain_ledger();
-                            }
-                            match submit_result {
-                                Ok(_) => {
-                                    actions_placed = actions_placed.saturating_add(1);
-                                }
-                                Err(ExecError::Rejected { .. }) => {}
-                                Err(source) => {
-                                    return Err(StartError::ExecutionState {
-                                        run: run.id().clone(),
-                                        source,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-                drain_fills(&mut fill_rx);
-                fills = paper.fill_count();
-                metrics.set_fills(fills);
+                actions_placed = actions_placed.saturating_add(
+                    dispatch_strategy(
+                        instance,
+                        &fact,
+                        &strategy_books[index],
+                        &positions,
+                        *timestamp_ms,
+                        &paper,
+                        &mut fill_rx,
+                        &metrics,
+                        store,
+                        &scope,
+                        run.id(),
+                    )
+                    .await?,
+                );
             }
+            fills = paper.fill_count();
+            metrics.set_fills(fills);
             if let Some(store) = store {
                 let identity = CausalIdentity {
                     scope: scope.clone(),
@@ -442,6 +438,73 @@ pub async fn drive_with_control(
         metrics,
         exposure: report_exposure(&paper.account_state(), &marks),
     })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shared dispatch carries the paper driver state without changing its ownership"
+)]
+async fn dispatch_strategy(
+    instance: &mut StrategyInstance,
+    fact: &StrategyFact,
+    book: &OrderBookL2,
+    positions: &[pmkit_book::Position],
+    timestamp_ms: i64,
+    paper: &PaperExecutor,
+    fill_rx: &mut tokio::sync::mpsc::Receiver<MarketEvent>,
+    metrics: &crate::RunMetrics,
+    store: Option<&dyn TapeStore>,
+    scope: &OwnerScope,
+    run: &pmkit_core::RunId,
+) -> Result<u32, StartError> {
+    let strategy_id = instance.id.clone();
+    let context = StrategyContext {
+        fact,
+        market: &instance.market,
+        book,
+        positions,
+        now: LogicalTimestamp::from_millis(timestamp_ms),
+    };
+    metrics.decision();
+    let mut actions_placed = 0_u32;
+    if let Ok(actions) = instance.strategy.on_event(context) {
+        for action in actions.as_slice() {
+            if let Action::Place(order) = action {
+                let submit_result = paper
+                    .submit_for_strategy(order, strategy_id.clone(), timestamp_ms)
+                    .await;
+                metrics.set_fills(paper.fill_count());
+                if matches!(&submit_result, Err(ExecError::Rejected { .. })) {
+                    metrics.reject();
+                }
+                if let Some(store) = store {
+                    persist_paper_ledger(store, scope, paper)
+                        .await
+                        .map_err(|source| StartError::Storage {
+                            run: run.clone(),
+                            source,
+                        })?;
+                } else {
+                    paper.drain_ledger();
+                }
+                match submit_result {
+                    Ok(_) => {
+                        actions_placed = actions_placed.saturating_add(1);
+                    }
+                    Err(ExecError::Rejected { .. }) => {}
+                    Err(source) => {
+                        return Err(StartError::ExecutionState {
+                            run: run.clone(),
+                            source,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    drain_fills(fill_rx);
+    metrics.set_fills(paper.fill_count());
+    Ok(actions_placed)
 }
 
 fn report_exposure(
