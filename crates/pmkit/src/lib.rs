@@ -736,9 +736,27 @@ async fn store_signal(
                 raw_frame: envelope.raw_frame.clone(),
                 normalized: pmkit_tape::account_envelope_json(envelope),
             },
-            SourceEnvelope::CexReference(_) | SourceEnvelope::PolymarketReference(_) => {
-                return Ok(());
-            }
+            SourceEnvelope::PolymarketReference(envelope) => PmEnvelope {
+                schema_version: PM_ENVELOPE_VERSION,
+                scope: scope.clone(),
+                venue_id: "polymarket".into(),
+                config_hash: "runtime".into(),
+                source_id: envelope.metadata.source_id.clone(),
+                connection_id: envelope.metadata.connection_id.clone(),
+                source_timestamp_ms: envelope.metadata.source_time_ms,
+                canonical_source_rank: envelope.metadata.canonical_source_rank,
+                connection_epoch: envelope.metadata.connection_epoch,
+                frame_sequence: envelope.metadata.frame_sequence,
+                receipt_timestamp_ms: envelope.metadata.receipt_time_ms,
+                ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence).map_err(
+                    |_| StoreError::Storage {
+                        message: "PM ingest sequence exceeds storage range".into(),
+                    },
+                )?,
+                raw_frame: Vec::new(),
+                normalized: pmkit_tape::polymarket_reference_envelope_json(envelope),
+            },
+            SourceEnvelope::CexReference(_) => return Ok(()),
         },
         SourceSignal::Watermark(_) | SourceSignal::Eof => return Ok(()),
     };

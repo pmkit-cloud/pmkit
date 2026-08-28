@@ -215,8 +215,11 @@ impl SourceEnvelope {
                 source_timestamp_ms: metadata.source_time_ms,
                 canonical_source_rank: metadata.canonical_source_rank,
                 stream_id: format!(
-                    "polymarket:rtds:{}:{}",
-                    envelope.fact.symbol, envelope.fact.window_s
+                    "reference:{}:{}:{}:{}",
+                    envelope.metadata.source_id,
+                    envelope.fact.asset,
+                    envelope.fact.symbol,
+                    envelope.fact.window_s
                 ),
                 connection_epoch: metadata.connection_epoch,
                 frame_sequence: metadata.frame_sequence,

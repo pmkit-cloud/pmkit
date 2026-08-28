@@ -219,6 +219,7 @@ impl PolymarketRtdsLive {
     /// The SDK owns connection setup, heartbeat, reconnection, and
     /// subscription management. Its `subscribe_raw` stream contains parsed
     /// messages, so `PMKit` deliberately does not expose a lossless wire frame.
+    /// The raw SDK adapter remains live-only because upstream PR #105 discards `full_accuracy_value`.
     ///
     /// # Errors
     ///
@@ -409,5 +410,34 @@ mod tests {
             parse_polymarket_rtds_twap(&invalid_precision, Asset::Btc),
             Err(PolymarketRtdsParseError::InvalidFullAccuracyValue)
         ));
+        for invalid in [
+            "0",
+            "-1",
+            "+1",
+            "170141183460469231731687303715884105728",
+            "1x",
+        ] {
+            let message = MESSAGE.replace(
+                "\"full_accuracy_value\":\"65000500000000000000000\"",
+                &format!("\"full_accuracy_value\":\"{invalid}\""),
+            );
+            assert!(
+                matches!(
+                    parse_polymarket_rtds_twap(&message, Asset::Btc),
+                    Err(PolymarketRtdsParseError::InvalidFullAccuracyValue)
+                ),
+                "{invalid}"
+            );
+        }
+        for invalid in ["-1", "0"] {
+            let message = MESSAGE.replace("\"value\":65000.5", &format!("\"value\":{invalid}"));
+            assert!(
+                matches!(
+                    parse_polymarket_rtds_twap(&message, Asset::Btc),
+                    Err(PolymarketRtdsParseError::InvalidValue)
+                ),
+                "{invalid}"
+            );
+        }
     }
 }

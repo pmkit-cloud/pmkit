@@ -3765,6 +3765,7 @@ dependencies = [
  "pmkit-market",
  "pmkit-run",
  "pmkit-store",
+ "pmkit-tape",
  "polymarket_client_sdk_v2",
  "rust_decimal",
  "serde",
