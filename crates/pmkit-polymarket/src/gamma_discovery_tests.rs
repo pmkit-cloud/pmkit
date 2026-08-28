@@ -247,9 +247,13 @@ async fn gamma_discovery_rejects_missing_activity_metadata()
 #[tokio::test]
 async fn gamma_discovery_market_by_event_slug_uses_event_route_and_normalizes_market()
 -> Result<(), Box<dyn std::error::Error>> {
-    let market = gamma_page_with_window("10192", "2025-01-01T00:00:00Z", "2026-01-01T00:15:00Z");
+    let market = gamma_market_without_nested_events(&gamma_page_with_window(
+        "10192",
+        "2025-01-01T00:00:00Z",
+        "2026-01-01T00:15:00Z",
+    ));
     let (discovery, requests) = event_discovery(format!(
-        r#"{{"id":"event-0","slug":"btc-up","markets":{market}}}"#
+        r#"{{"id":"event-0","slug":"btc-up","series":[{{"id":"10192"}}],"markets":{market}}}"#
     ))?;
     let families = BTreeMap::from([(
         "10192".to_owned(),
@@ -261,6 +265,13 @@ async fn gamma_discovery_market_by_event_slug_uses_event_route_and_normalizes_ma
     assert_eq!(normalized.market_id, "market-0");
     assert_eq!(normalized.condition_id, format!("0x{:064x}", 1));
     assert_eq!(normalized.open_time_ms, normalized.close_time_ms - 900_000);
+    let family = normalized
+        .family
+        .as_ref()
+        .ok_or("missing normalized family")?;
+    assert_eq!(family.series_id(), "10192");
+    assert_eq!(family.asset(), Some("BTC"));
+    assert_eq!(family.duration(), Some("15m"));
     assert!(normalized.active);
     assert_eq!(normalized.outcomes.len(), 2);
     let requests = requests.lock().map_err(|_| "request capture poisoned")?;
@@ -383,6 +394,13 @@ fn gamma_page_with_window(series_id: &str, start_date: &str, end_date: &str) -> 
         r#"[{{"id":"market-0","conditionId":"0x{:064x}","startDate":"{start_date}","endDate":"{end_date}","active":true,"closed":false,"outcomes":"[\"Up\",\"Down\"]","clobTokenIds":"[\"1\",\"2\"]","events":[{{"id":"event-0","series":[{{"id":"{series_id}"}}]}}]}}]"#,
         1,
     )
+}
+
+fn gamma_market_without_nested_events(market_page: &str) -> String {
+    let Some(events_start) = market_page.find(",\"events\"") else {
+        return market_page.to_owned();
+    };
+    format!("{}}}]", &market_page[..events_start])
 }
 
 fn response(body: &str) -> String {

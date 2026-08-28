@@ -74,7 +74,12 @@ impl GammaDiscovery {
                 });
             }
         };
-        gamma_market(market, families)
+        let event_family = event.series.as_ref().and_then(|series| {
+            series
+                .first()
+                .map(|series| family_for_series_id(&series.id, families))
+        });
+        gamma_market(market, families, event_family)
     }
 
     /// Fetches a complete Gamma snapshot using fixed `limit` and `offset` pages.
@@ -119,7 +124,7 @@ impl GammaDiscovery {
             })?;
             let page = page
                 .into_iter()
-                .map(|market| gamma_market(market, families))
+                .map(|market| gamma_market(market, families, None))
                 .collect::<Result<Vec<_>, _>>()?;
             let count = page.len();
             let fingerprint = serde_json::to_vec(&page)
@@ -145,6 +150,7 @@ impl GammaDiscovery {
 fn gamma_market(
     market: Market,
     families: &BTreeMap<String, RecurringFamily>,
+    trusted_family: Option<RecurringFamily>,
 ) -> Result<GammaMarket, DiscoveryError> {
     let condition_id = market
         .condition_id
@@ -152,18 +158,15 @@ fn gamma_market(
             reason: "market lacks condition id",
         })?
         .to_string();
-    let family = market
-        .events
-        .as_ref()
-        .and_then(|events| events.first())
-        .and_then(|event| event.series.as_ref())
-        .and_then(|series| series.first())
-        .map(|series| {
-            families
-                .get(&series.id)
-                .cloned()
-                .unwrap_or_else(|| RecurringFamily::new(series.id.clone(), None, None))
-        });
+    let family = trusted_family.or_else(|| {
+        market
+            .events
+            .as_ref()
+            .and_then(|events| events.first())
+            .and_then(|event| event.series.as_ref())
+            .and_then(|series| series.first())
+            .map(|series| family_for_series_id(&series.id, families))
+    });
     let close_time_ms = market
         .end_date
         .ok_or(DiscoveryError::MalformedPage {
@@ -213,6 +216,16 @@ fn gamma_market(
         family,
         outcomes,
     })
+}
+
+fn family_for_series_id(
+    series_id: &str,
+    families: &BTreeMap<String, RecurringFamily>,
+) -> RecurringFamily {
+    families
+        .get(series_id)
+        .cloned()
+        .unwrap_or_else(|| RecurringFamily::new(series_id, None, None))
 }
 
 fn outcomes(
