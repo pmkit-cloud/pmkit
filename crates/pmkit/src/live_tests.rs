@@ -1,5 +1,5 @@
 use crate::{
-    Pmkit, StartError, live,
+    Pmkit, StartError, live, store_signal,
     test_support::{BuyFactory, config, risk},
 };
 use async_trait::async_trait;
@@ -7,10 +7,11 @@ use pmkit_book::Side;
 use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
 use pmkit_data::{DataSourceError, LiveAccountDataSource, LiveDataSource, SourceSignal};
 use pmkit_event::{
-    Liquidity, MarketEvent, PmAccountEnvelope, PmAccountEvent, SourceEnvelope, StreamMetadata,
+    Liquidity, MarketEvent, PmAccountEnvelope, PmAccountEvent, PolymarketReferenceEnvelope,
+    PolymarketTwapEvent, SourceEnvelope, StreamMetadata,
 };
 use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
-use pmkit_market::Outcome;
+use pmkit_market::{Asset, Outcome};
 use pmkit_runtime::{LiveOrderPolicy, StrategyRegistration};
 use pmkit_spec::LiveRun;
 use pmkit_store::{OwnerScope, TapeStore, TursoTapeStore};
@@ -739,6 +740,57 @@ async fn live_run_records_a_decision_with_storage() -> Result<(), Box<dyn std::e
     let scope = OwnerScope::new(PortfolioId::new("alice")?, RunId::new("live")?);
     let decisions = store.read_decisions(&scope).await?;
     assert_eq!(decisions.len(), 1);
+    store.delete_database()?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
+async fn store_signal_persists_polymarket_reference_for_shared_replay()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let store = TursoTapeStore::open_local(dir.path().join("reference.db")).await?;
+    let scope = OwnerScope::new(PortfolioId::new("alice")?, RunId::new("rtds")?);
+    let reference = PolymarketReferenceEnvelope {
+        metadata: StreamMetadata {
+            schema_version: 1,
+            source_id: "polymarket:rtds:crypto_prices_twap_sixty".into(),
+            source_time_ms: 10,
+            canonical_source_rank: 1,
+            receipt_time_ms: 11,
+            connection_id: "rtds".into(),
+            connection_epoch: 0,
+            frame_sequence: 1,
+            ingest_sequence: 1,
+        },
+        fact: PolymarketTwapEvent {
+            asset: Asset::Btc,
+            symbol: "btc/usd".into(),
+            timestamp_ms: 10,
+            provider_timestamp_ms: 9,
+            value: 1.0,
+            full_accuracy_value: "1".into(),
+            window_s: 60,
+        },
+    };
+    store_signal(
+        Some(&store),
+        &scope,
+        &SourceSignal::Data(Box::new(SourceEnvelope::PolymarketReference(
+            reference.clone(),
+        ))),
+    )
+    .await?;
+    let page = store
+        .read_envelopes(&scope, None, NonZeroUsize::MIN)
+        .await?;
+    let Some(pmkit_store::ReplayItem::Envelope(row)) = page.items.first() else {
+        return Err("missing envelope".into());
+    };
+    assert!(row.raw_frame.is_empty());
+    let parsed = pmkit_tape::polymarket_reference_envelope_from_json(&row.normalized)?;
+    assert_eq!(parsed, reference);
+    drop(page);
     store.delete_database()?;
     Ok(())
 }

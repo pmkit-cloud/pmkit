@@ -9,8 +9,10 @@ use std::io::{self, Write};
 use pmkit_book::Side;
 use pmkit_event::{
     CexReferenceEnvelope, CexReferenceEvent, FillIdentity, Liquidity, MarketEvent,
-    PmAccountEnvelope, PmAccountEvent, PmMarketEnvelope, SettlementIdentity, StreamMetadata,
+    PmAccountEnvelope, PmAccountEvent, PmMarketEnvelope, PolymarketReferenceEnvelope,
+    SettlementIdentity, StreamMetadata,
 };
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::json;
 
 mod raw;
@@ -368,6 +370,163 @@ pub fn reference_envelope_json(envelope: &CexReferenceEnvelope) -> serde_json::V
     envelope_json(&envelope.metadata, &payload)
 }
 
+/// Serializes a Polymarket RTDS envelope while preserving its transport metadata.
+#[must_use]
+pub fn polymarket_reference_envelope_json(
+    envelope: &PolymarketReferenceEnvelope,
+) -> serde_json::Value {
+    let fact = &envelope.fact;
+    let payload = json!({
+        "kind": "polymarket_twap",
+        "ts": fact.timestamp_ms,
+        "provider_timestamp_ms": fact.provider_timestamp_ms,
+        "asset": fact.asset.to_string(),
+        "symbol": fact.symbol,
+        "window_s": fact.window_s,
+        "value": fact.value,
+        "full_accuracy_value": fact.full_accuracy_value,
+    });
+    let mut value = envelope_json(&envelope.metadata, &payload);
+    value["representation"] = json!("sdk_parsed_normalized");
+    value["stream_id"] = json!(format!(
+        "reference:{}:{}:{}:{}",
+        envelope.metadata.source_id, fact.asset, fact.symbol, fact.window_s
+    ));
+    value
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolymarketReferenceJson {
+    schema_version: u16,
+    representation: String,
+    stream_id: String,
+    source_id: String,
+    source_time_ms: i64,
+    canonical_source_rank: i64,
+    receipt_time_ms: i64,
+    connection_id: String,
+    connection_epoch: i64,
+    frame_sequence: i64,
+    ingest_sequence: u64,
+    payload: PolymarketReferencePayloadJson,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolymarketReferencePayloadJson {
+    kind: String,
+    ts: i64,
+    provider_timestamp_ms: i64,
+    asset: String,
+    symbol: String,
+    window_s: u64,
+    value: f64,
+    full_accuracy_value: String,
+}
+
+fn from_value<T: DeserializeOwned>(value: &serde_json::Value) -> Result<T, String> {
+    serde_json::from_value(value.clone()).map_err(|error| error.to_string())
+}
+
+/// Parses and validates the normalized v1 Polymarket reference representation.
+///
+/// # Errors
+///
+/// Returns a string describing the first schema or value validation failure.
+pub fn polymarket_reference_envelope_from_json(
+    value: &serde_json::Value,
+) -> Result<PolymarketReferenceEnvelope, String> {
+    let normalized: PolymarketReferenceJson = from_value(value)?;
+    if normalized.schema_version != 1 {
+        return Err("unsupported normalized schema version".into());
+    }
+    if normalized.representation != "sdk_parsed_normalized" {
+        return Err("invalid normalized representation".into());
+    }
+    let payload = normalized.payload;
+    if payload.kind != "polymarket_twap" {
+        return Err("invalid normalized kind".into());
+    }
+    if payload.window_s != 60 {
+        return Err("invalid normalized window".into());
+    }
+    if normalized.source_time_ms != payload.ts {
+        return Err("source time does not match fact timestamp".into());
+    }
+    let asset = payload
+        .asset
+        .parse::<pmkit_market::Asset>()
+        .map_err(|_| "invalid normalized asset".to_owned())?;
+    if payload.symbol != format!("{asset}/usd") {
+        return Err("symbol does not match asset".into());
+    }
+    if !payload.value.is_finite() || payload.value <= 0.0 {
+        return Err("display value must be finite and positive".into());
+    }
+    validate_positive_i128(&payload.full_accuracy_value)?;
+    let expected_stream_id = format!(
+        "reference:{}:{}:{}:{}",
+        normalized.source_id, asset, payload.symbol, payload.window_s
+    );
+    if normalized.stream_id != expected_stream_id {
+        return Err("invalid normalized stream id".into());
+    }
+    if normalized.source_id.trim().is_empty() || normalized.connection_id.trim().is_empty() {
+        return Err("transport identifiers must be non-empty".into());
+    }
+    if normalized.source_time_ms < 0
+        || normalized.receipt_time_ms < 0
+        || payload.provider_timestamp_ms < 0
+    {
+        return Err("timestamps must be non-negative".into());
+    }
+    if normalized.canonical_source_rank != 1 {
+        return Err("invalid canonical source rank".into());
+    }
+    if normalized.connection_epoch < 0 {
+        return Err("connection epoch must be non-negative".into());
+    }
+    if normalized.frame_sequence <= 0 {
+        return Err("frame sequence must be positive".into());
+    }
+    if normalized.ingest_sequence == 0 {
+        return Err("ingest sequence must be positive".into());
+    }
+    Ok(PolymarketReferenceEnvelope {
+        metadata: StreamMetadata {
+            schema_version: normalized.schema_version,
+            source_id: normalized.source_id,
+            source_time_ms: normalized.source_time_ms,
+            canonical_source_rank: normalized.canonical_source_rank,
+            receipt_time_ms: normalized.receipt_time_ms,
+            connection_id: normalized.connection_id,
+            connection_epoch: normalized.connection_epoch,
+            frame_sequence: normalized.frame_sequence,
+            ingest_sequence: normalized.ingest_sequence,
+        },
+        fact: pmkit_event::PolymarketTwapEvent {
+            asset,
+            symbol: payload.symbol,
+            timestamp_ms: payload.ts,
+            provider_timestamp_ms: payload.provider_timestamp_ms,
+            value: payload.value,
+            full_accuracy_value: payload.full_accuracy_value,
+            window_s: payload.window_s,
+        },
+    })
+}
+
+fn validate_positive_i128(value: &str) -> Result<(), String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("full_accuracy_value is not positive decimal digits".into());
+    }
+    if !matches!(value.parse::<i128>(), Ok(scaled) if scaled > 0) {
+        return Err("full_accuracy_value must be a positive i128".into());
+    }
+    Ok(())
+}
+
 fn envelope_json(metadata: &StreamMetadata, payload: &serde_json::Value) -> serde_json::Value {
     json!({
         "schema_version": metadata.schema_version,
@@ -385,10 +544,13 @@ fn envelope_json(metadata: &StreamMetadata, payload: &serde_json::Value) -> serd
 
 #[cfg(test)]
 mod tests {
-    use super::{JsonLinesTape, UserTapeSink, account_envelope_json};
+    use super::{
+        JsonLinesTape, UserTapeSink, account_envelope_json,
+        polymarket_reference_envelope_from_json, polymarket_reference_envelope_json,
+    };
     use pmkit_core::{MarketId, PortfolioId};
     use pmkit_event::{PmAccountEnvelope, PmAccountEvent, SettlementIdentity, StreamMetadata};
-    use pmkit_market::Outcome;
+    use pmkit_market::{Asset, Outcome};
     use rust_decimal::Decimal;
 
     #[test]
@@ -426,6 +588,112 @@ mod tests {
         assert!(lines[0].contains("\"frame_sequence\":4"));
         assert!(lines[0].contains("\"ingest_sequence\":3"));
         Ok(())
+    }
+
+    #[test]
+    fn polymarket_reference_json_round_trips_exact_float_bits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let envelope = pmkit_event::PolymarketReferenceEnvelope {
+            metadata: StreamMetadata {
+                schema_version: 1,
+                source_id: "polymarket:rtds:crypto_prices_twap_sixty".into(),
+                source_time_ms: 1000,
+                canonical_source_rank: 1,
+                receipt_time_ms: 1001,
+                connection_id: "rtds".into(),
+                connection_epoch: 2,
+                frame_sequence: 3,
+                ingest_sequence: 4,
+            },
+            fact: pmkit_event::PolymarketTwapEvent {
+                asset: Asset::Btc,
+                symbol: "btc/usd".into(),
+                timestamp_ms: 1000,
+                provider_timestamp_ms: 999,
+                value: 0.000_000_000_000_001,
+                full_accuracy_value: "1".into(),
+                window_s: 60,
+            },
+        };
+        let value = polymarket_reference_envelope_json(&envelope);
+        assert_eq!(value["representation"], "sdk_parsed_normalized");
+        assert!(value["stream_id"].as_str().is_some_and(|id| {
+            id.contains(&envelope.metadata.source_id)
+                && id.contains("btc")
+                && id.contains("btc/usd")
+                && id.contains("60")
+        }));
+        let parsed = polymarket_reference_envelope_from_json(&value)?;
+        assert_eq!(parsed, envelope);
+        assert_eq!(parsed.fact.value.to_bits(), envelope.fact.value.to_bits());
+        let mut unknown = value;
+        unknown["extra"] = serde_json::json!(true);
+        assert!(polymarket_reference_envelope_from_json(&unknown).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn polymarket_reference_parser_rejects_non_positive_values() {
+        let envelope = pmkit_event::PolymarketReferenceEnvelope {
+            metadata: StreamMetadata {
+                schema_version: 1,
+                source_id: "polymarket:rtds:crypto_prices_twap_sixty".into(),
+                source_time_ms: 1000,
+                canonical_source_rank: 1,
+                receipt_time_ms: 1001,
+                connection_id: "rtds".into(),
+                connection_epoch: 2,
+                frame_sequence: 3,
+                ingest_sequence: 4,
+            },
+            fact: pmkit_event::PolymarketTwapEvent {
+                asset: Asset::Btc,
+                symbol: "btc/usd".into(),
+                timestamp_ms: 1000,
+                provider_timestamp_ms: 999,
+                value: 1.0,
+                full_accuracy_value: "1".into(),
+                window_s: 60,
+            },
+        };
+        let base = polymarket_reference_envelope_json(&envelope);
+        for invalid in [
+            "0",
+            "-1",
+            "+1",
+            "170141183460469231731687303715884105728",
+            "1x",
+        ] {
+            let mut value = base.clone();
+            value["payload"]["full_accuracy_value"] = serde_json::json!(invalid);
+            assert!(
+                polymarket_reference_envelope_from_json(&value).is_err(),
+                "{invalid}"
+            );
+        }
+        for invalid in [0.0, -1.0] {
+            let mut value = base.clone();
+            value["payload"]["value"] = serde_json::json!(invalid);
+            assert!(polymarket_reference_envelope_from_json(&value).is_err());
+        }
+        for (path, invalid) in [
+            (("source_id",), serde_json::json!("")),
+            (("connection_id",), serde_json::json!(" ")),
+            (("source_time_ms",), serde_json::json!(-1)),
+            (("receipt_time_ms",), serde_json::json!(-1)),
+            (("canonical_source_rank",), serde_json::json!(2)),
+            (("connection_epoch",), serde_json::json!(-1)),
+            (("frame_sequence",), serde_json::json!(0)),
+            (("ingest_sequence",), serde_json::json!(0)),
+        ] {
+            let mut value = base.clone();
+            value[path.0] = invalid;
+            assert!(
+                polymarket_reference_envelope_from_json(&value).is_err(),
+                "{}",
+                path.0
+            );
+        }
     }
 
     #[test]
