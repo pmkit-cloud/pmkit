@@ -31,7 +31,7 @@ tempfile = "3"
 # (see `gtd_expiration` in crates/pmkit-polymarket/src/execution.rs). Re-verify
 # that workaround before any bump: an SDK that converts to milliseconds itself
 # would double-convert and produce orders that effectively never expire.
-polymarket-client-sdk-v2 = { git = "https://github.com/yovanoc/rs-clob-client-v2", rev = "8f39ed139d9be10f943ba1463bf63cfc30f39e87", package = "polymarket_client_sdk_v2", features = ["gamma", "clob", "ws", "rtds"] }
+polymarket-client-sdk-v2 = { git = "https://github.com/yovanoc/rs-clob-client-v2", rev = "5b43708777f2d60fe55a2ac25c159980d6345a71", package = "polymarket_client_sdk_v2", features = ["gamma", "clob", "ws", "rtds"] }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 
