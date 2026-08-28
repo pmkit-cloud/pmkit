@@ -11,6 +11,9 @@ use pmkit_money::Money;
 use pmkit_runtime::StrategyRegistration;
 use pmkit_spec::{ConservativeV1Config, PaperRun};
 use pmkit_store::{OwnerScope, TapeStore, TursoTapeStore};
+use pmkit_strategy::{
+    Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
+};
 use rust_decimal::Decimal;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -24,6 +27,69 @@ struct StaleMarkLive;
 struct FailingLive;
 
 struct MismatchedAccountSource;
+
+struct CancelLive;
+
+struct CancelAfterPlace {
+    seen: usize,
+}
+
+struct CancelAfterPlaceFactory;
+
+impl Strategy for CancelAfterPlace {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        self.seen += 1;
+        if self.seen == 1 {
+            Ok(Actions::place(pmkit_exec::PlaceOrder {
+                market: context.market.clone(),
+                outcome: Outcome::Up,
+                side: pmkit_book::Side::Buy,
+                price: Decimal::new(45, 2),
+                qty: Decimal::ONE,
+                post_only: true,
+                tif: pmkit_exec::TimeInForce::Gtc,
+            }))
+        } else {
+            Ok(Actions::cancel_all())
+        }
+    }
+}
+
+impl StrategyFactory for CancelAfterPlaceFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(CancelAfterPlace { seen: 0 }))
+    }
+}
+
+#[async_trait]
+impl LiveDataSource for CancelLive {
+    async fn subscribe(
+        &self,
+        market: MarketId,
+        outcome: Outcome,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        if outcome == Outcome::Up {
+            for timestamp_ms in [1, 2] {
+                sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
+                    market: market.clone(),
+                    outcome,
+                    bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+                    asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
+                    timestamp_ms,
+                }))
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)?;
+            }
+        }
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
 
 #[async_trait]
 impl LiveAccountDataSource for MismatchedAccountSource {
@@ -146,6 +212,38 @@ impl LiveDataSource for FailingLive {
     ) -> Result<(), DataSourceError> {
         Err(DataSourceError::NotAvailable)
     }
+}
+
+#[tokio::test]
+async fn paper_cancel_all_releases_strategy_orders() -> Result<(), Box<dyn std::error::Error>> {
+    let run = PaperRun::new(
+        RunId::new("paper-cancel-action")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        risk()?,
+        Arc::new(CancelLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("cancel-maker")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(CancelAfterPlaceFactory),
+    ));
+
+    let app = Pmkit::builder(config()?).run(run).start().await?;
+    let RunReport::Paper(report) = app.wait_for(RunId::new("paper-cancel-action")?).await? else {
+        return Err("expected a paper report".into());
+    };
+    assert_eq!(report.fills, 0);
+    assert_eq!(report.exposure.portfolio_notional, Decimal::ZERO);
+    Ok(())
 }
 
 #[tokio::test]

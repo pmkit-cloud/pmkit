@@ -42,6 +42,12 @@ struct Taker;
 
 struct TakerFactory;
 
+struct RestThenCancel {
+    seen: usize,
+}
+
+struct RestThenCancelFactory;
+
 struct PositionProbe(Arc<Mutex<Vec<usize>>>);
 
 struct PositionProbeFactory(Arc<Mutex<Vec<usize>>>);
@@ -66,6 +72,31 @@ impl Strategy for Taker {
 impl StrategyFactory for TakerFactory {
     fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
         Ok(Box::new(Taker))
+    }
+}
+
+impl Strategy for RestThenCancel {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        self.seen += 1;
+        if self.seen == 1 {
+            Ok(Actions::place(pmkit_exec::PlaceOrder {
+                market: context.market.clone(),
+                outcome: Outcome::Up,
+                side: pmkit_book::Side::Buy,
+                price: Decimal::new(45, 2),
+                qty: Decimal::ONE,
+                post_only: true,
+                tif: pmkit_exec::TimeInForce::Gtc,
+            }))
+        } else {
+            Ok(Actions::cancel_all())
+        }
+    }
+}
+
+impl StrategyFactory for RestThenCancelFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(RestThenCancel { seen: 0 }))
     }
 }
 
@@ -334,7 +365,13 @@ async fn venue_limit_refusal_is_counted_not_reported_as_placed()
         min_order_size: Decimal::from(50),
         tick_size: Decimal::new(1, 2),
     }))?;
-    let app = Pmkit::builder(config()?).run(run).start().await?;
+    let dir = tempfile::tempdir()?;
+    let store = Arc::new(TursoTapeStore::open_local(dir.path().join("causal-rejection.db")).await?);
+    let app = Pmkit::builder(config()?)
+        .storage(store.clone())
+        .run(run)
+        .start()
+        .await?;
     let run_id = RunId::new("bt")?;
 
     // When: the run completes.
@@ -349,6 +386,55 @@ async fn venue_limit_refusal_is_counted_not_reported_as_placed()
     assert_eq!(report.fills, 0);
     let metrics = app.metrics(&run_id).ok_or("missing run metrics")?;
     assert_eq!(metrics.rejected, 1);
+    let decisions = store
+        .read_decisions(&OwnerScope::new(PortfolioId::new("research")?, run_id))
+        .await?;
+    assert!(decisions.iter().any(|decision| {
+        decision.payload["decision"]["kind"] == "actions"
+            && decision.payload["decision"]["risk"][0]["verdict"]["kind"] == "rejected"
+            && decision.payload["decision"]["risk"][0]["verdict"]["reason"]
+                == "simulation/execution rejection"
+    }));
+    drop(store);
+    Ok(())
+}
+
+#[tokio::test]
+async fn backtest_cancel_all_releases_strategy_orders() -> Result<(), Box<dyn std::error::Error>> {
+    let replay = ReplaySpec::new(
+        Arc::new(ScriptedHistory { ticks: vec![1, 2] }),
+        "2026-01-01T00:00:00Z".parse()?,
+        "2026-02-01T00:00:00Z".parse()?,
+        EvidenceRequirement::CorroboratedOnly,
+        RetrievalWait::ReturnPending,
+    );
+    let run = BacktestRun::new(
+        RunId::new("cancel-all")?,
+        PortfolioId::new("research")?,
+        replay,
+        Money::usdc(1_000),
+        risk()?,
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("cancel-maker")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(RestThenCancelFactory),
+    ));
+
+    let app = Pmkit::builder(config()?).run(run).start().await?;
+    let RunReport::Backtest(report) = app.wait_for(RunId::new("cancel-all")?).await? else {
+        return Err("expected a backtest report".into());
+    };
+    assert_eq!(report.fills, 0);
+    assert_eq!(report.exposure.portfolio_notional, Decimal::ZERO);
     Ok(())
 }
 

@@ -404,21 +404,17 @@ pub(crate) async fn record_book_decision(
     identity: &CausalIdentity,
     book: &OrderBookL2,
     cex_trade: CexTradeMetrics,
-    actions_placed: u32,
+    verdicts: Vec<ActionRiskVerdict>,
     simulation: Option<SimulationConfig>,
 ) -> Result<(), StoreError> {
     let mut snapshot = DecisionSnapshot::from_book(book, cex_trade);
     if let Some(simulation) = simulation {
         snapshot = snapshot.with_simulation(simulation);
     }
-    let decision = if actions_placed == 0 {
+    let decision = if verdicts.is_empty() {
         DecisionKind::NoAction
     } else {
-        DecisionKind::Actions(
-            (0..actions_placed)
-                .map(ActionRiskVerdict::accepted)
-                .collect(),
-        )
+        DecisionKind::Actions(verdicts)
     };
     CausalRecorder::new(store)
         .record_evaluation(identity, &snapshot, decision)

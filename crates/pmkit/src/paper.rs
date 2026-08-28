@@ -8,7 +8,7 @@ use pmkit_accounting::{
 };
 use pmkit_book::OrderBookL2;
 use pmkit_event::{MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
-use pmkit_exec::ExecError;
+use pmkit_exec::{ExecError, Executor, OrderId};
 use pmkit_market::Outcome;
 use pmkit_paper::{PaperExecutor, PaperLedgerEntry, PaperLedgerError};
 use pmkit_sim::SimulationConfig;
@@ -111,6 +111,105 @@ fn corrupt_paper_ledger(error: &PaperLedgerError) -> StoreError {
     StoreError::CorruptPaperLedger {
         message: error.to_string(),
     }
+}
+
+fn owned_paper_orders(paper: &PaperExecutor, strategy: &pmkit_core::StrategyId) -> Vec<OrderId> {
+    let account = paper.account_state();
+    account
+        .resting_orders
+        .into_iter()
+        .chain(account.delayed_orders)
+        .filter(|order| order.strategy.as_ref() == Some(strategy))
+        .map(|order| order.order_id)
+        .collect()
+}
+
+async fn cancel_paper_order(
+    run: &PaperRun,
+    paper: &PaperExecutor,
+    store: Option<&dyn TapeStore>,
+    scope: &OwnerScope,
+    strategy: &pmkit_core::StrategyId,
+    order_id: &OrderId,
+) -> Result<(), StartError> {
+    if owned_paper_orders(paper, strategy).contains(order_id) {
+        paper
+            .cancel(order_id)
+            .await
+            .map_err(|source| StartError::ExecutionState {
+                run: run.id().clone(),
+                source,
+            })?;
+        persist_or_drain_paper(store, scope, paper, run.id()).await?;
+    }
+    Ok(())
+}
+
+struct PaperActionContext<'a> {
+    run: &'a PaperRun,
+    paper: &'a PaperExecutor,
+    store: Option<&'a dyn TapeStore>,
+    scope: &'a OwnerScope,
+    strategy: &'a pmkit_core::StrategyId,
+    timestamp_ms: i64,
+    metrics: &'a crate::RunMetrics,
+}
+
+async fn submit_paper_order(
+    context: &PaperActionContext<'_>,
+    order: &pmkit_exec::PlaceOrder,
+    action_index: u32,
+    verdicts: &mut Vec<crate::causal::ActionRiskVerdict>,
+) -> Result<(), StartError> {
+    let submit_result = context
+        .paper
+        .submit_for_strategy(order, context.strategy.clone(), context.timestamp_ms)
+        .await;
+    context.metrics.set_fills(context.paper.fill_count());
+    if let Err(ExecError::Rejected { reason }) = &submit_result {
+        context.metrics.reject();
+        verdicts.push(crate::causal::ActionRiskVerdict::rejected(
+            action_index,
+            reason.clone(),
+        ));
+    }
+    persist_or_drain_paper(
+        context.store,
+        context.scope,
+        context.paper,
+        context.run.id(),
+    )
+    .await?;
+    match submit_result {
+        Ok(_) => verdicts.push(crate::causal::ActionRiskVerdict::accepted(action_index)),
+        Err(ExecError::Rejected { .. }) => {}
+        Err(source) => {
+            return Err(StartError::ExecutionState {
+                run: context.run.id().clone(),
+                source,
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn persist_or_drain_paper(
+    store: Option<&dyn TapeStore>,
+    scope: &OwnerScope,
+    paper: &PaperExecutor,
+    run: &pmkit_core::RunId,
+) -> Result<(), StartError> {
+    if let Some(store) = store {
+        persist_paper_ledger(store, scope, paper)
+            .await
+            .map_err(|source| StartError::Storage {
+                run: run.clone(),
+                source,
+            })?;
+    } else {
+        paper.drain_ledger();
+    }
+    Ok(())
 }
 
 #[expect(
@@ -338,7 +437,7 @@ pub async fn drive_with_control(
             drain_fills(&mut fill_rx);
             fills = paper.fill_count();
             metrics.set_fills(fills);
-            let mut actions_placed = 0_u32;
+            let mut verdicts = Vec::new();
             for instance in &mut *strategies {
                 if instance.market != *market {
                     continue;
@@ -353,35 +452,71 @@ pub async fn drive_with_control(
                 };
                 metrics.decision();
                 if let Ok(actions) = instance.strategy.on_event(context) {
-                    for action in actions.as_slice() {
-                        if let Action::Place(order) = action {
-                            let submit_result = paper
-                                .submit_for_strategy(order, instance.id.clone(), *timestamp_ms)
-                                .await;
-                            metrics.set_fills(paper.fill_count());
-                            if matches!(&submit_result, Err(ExecError::Rejected { .. })) {
-                                metrics.reject();
+                    let action_context = PaperActionContext {
+                        run,
+                        paper: &paper,
+                        store,
+                        scope: &scope,
+                        strategy: &instance.id,
+                        timestamp_ms: *timestamp_ms,
+                        metrics: &metrics,
+                    };
+                    for (action_index, action) in actions.as_slice().iter().enumerate() {
+                        let action_index = u32::try_from(action_index).unwrap_or(u32::MAX);
+                        match action {
+                            Action::Place(order) => {
+                                submit_paper_order(
+                                    &action_context,
+                                    order,
+                                    action_index,
+                                    &mut verdicts,
+                                )
+                                .await?;
                             }
-                            if let Some(store) = store {
-                                persist_paper_ledger(store, &scope, &paper).await.map_err(
-                                    |source| StartError::Storage {
-                                        run: run.id().clone(),
-                                        source,
-                                    },
-                                )?;
-                            } else {
-                                paper.drain_ledger();
+                            Action::Cancel(order_id) => {
+                                cancel_paper_order(
+                                    run,
+                                    &paper,
+                                    store,
+                                    &scope,
+                                    &instance.id,
+                                    order_id,
+                                )
+                                .await?;
                             }
-                            match submit_result {
-                                Ok(_) => {
-                                    actions_placed = actions_placed.saturating_add(1);
+                            Action::ReplaceQuotes { cancel, place } => {
+                                for order_id in cancel {
+                                    cancel_paper_order(
+                                        run,
+                                        &paper,
+                                        store,
+                                        &scope,
+                                        &instance.id,
+                                        order_id,
+                                    )
+                                    .await?;
                                 }
-                                Err(ExecError::Rejected { .. }) => {}
-                                Err(source) => {
-                                    return Err(StartError::ExecutionState {
-                                        run: run.id().clone(),
-                                        source,
-                                    });
+                                for order in place {
+                                    submit_paper_order(
+                                        &action_context,
+                                        order,
+                                        action_index,
+                                        &mut verdicts,
+                                    )
+                                    .await?;
+                                }
+                            }
+                            Action::CancelAll => {
+                                for order_id in owned_paper_orders(&paper, &instance.id) {
+                                    cancel_paper_order(
+                                        run,
+                                        &paper,
+                                        store,
+                                        &scope,
+                                        &instance.id,
+                                        &order_id,
+                                    )
+                                    .await?;
                                 }
                             }
                         }
@@ -404,7 +539,7 @@ pub async fn drive_with_control(
                     &identity,
                     &book,
                     cex_metrics.snapshot(),
-                    actions_placed,
+                    verdicts,
                     Some(simulation_config),
                 )
                 .await

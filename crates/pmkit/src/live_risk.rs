@@ -871,6 +871,42 @@ mod ledger_tests {
     }
 
     #[test]
+    fn fill_after_cancellation_remains_authoritative() -> Result<(), Box<dyn std::error::Error>> {
+        // Given: a marked ledger where cancellation arrives before the venue fill.
+        let market = MarketId::new("btc-5m")?;
+        let limits = risk()?;
+        let mut state = LiveRiskState::default();
+        state.update_book(
+            &market,
+            Outcome::Up,
+            &OrderBookL2 {
+                bids: vec![(Decimal::new(5, 1), Decimal::ONE)],
+                asks: vec![(Decimal::new(5, 1), Decimal::ONE)],
+                timestamp_ms: 900,
+                last_trade_price: None,
+            },
+            &limits,
+        );
+        state.apply_account_event(
+            &PmAccountEvent::OrderCancelled {
+                strategy: None,
+                order_id: "venue-1".into(),
+                timestamp_ms: 950,
+            },
+            &limits,
+        )?;
+
+        // When: the authoritative venue fill arrives after cancellation.
+        state.apply_account_event(&fill("late-fill", market.clone()), &limits)?;
+
+        // Then: reconciliation keeps the fill instead of dropping it with the cancel.
+        assert_eq!(state.filled_qty("venue-1"), Decimal::from(10));
+        assert_eq!(state.fill_count(), 1);
+        assert_eq!(state.positions(&market)[0].qty, Decimal::from(10));
+        Ok(())
+    }
+
+    #[test]
     fn distinct_fill_identities_apply_same_value_and_time_twice()
     -> Result<(), Box<dyn std::error::Error>> {
         // Given: two venue fills with identical economics and timestamps but distinct identities.
