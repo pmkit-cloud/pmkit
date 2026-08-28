@@ -9,6 +9,8 @@ use std::{
 use crate::{DiscoveryError, GammaDiscovery, RecurringFamily};
 use polymarket_client_sdk_v2::gamma::Client as SdkGammaClient;
 
+type CapturedRequests = Arc<Mutex<Vec<String>>>;
+
 #[tokio::test]
 async fn gamma_discovery_uses_fixed_limit_offset_pages() -> Result<(), Box<dyn std::error::Error>> {
     // Given: a Gamma server with two full pages and a short final page.
@@ -240,6 +242,120 @@ async fn gamma_discovery_rejects_missing_activity_metadata()
     // Then: the malformed page cannot be published as an empty snapshot.
     assert!(matches!(result, Err(DiscoveryError::MalformedPage { .. })));
     Ok(())
+}
+
+#[tokio::test]
+async fn gamma_discovery_market_by_event_slug_uses_event_route_and_normalizes_market()
+-> Result<(), Box<dyn std::error::Error>> {
+    let market = gamma_page_with_window("10192", "2025-01-01T00:00:00Z", "2026-01-01T00:15:00Z");
+    let (discovery, requests) = event_discovery(format!(
+        r#"{{"id":"event-0","slug":"btc-up","markets":{market}}}"#
+    ))?;
+    let families = BTreeMap::from([(
+        "10192".to_owned(),
+        RecurringFamily::new("10192", Some("BTC"), Some("15m")),
+    )]);
+
+    let normalized = discovery.market_by_event_slug("btc-up", &families).await?;
+
+    assert_eq!(normalized.market_id, "market-0");
+    assert_eq!(normalized.condition_id, format!("0x{:064x}", 1));
+    assert_eq!(normalized.open_time_ms, normalized.close_time_ms - 900_000);
+    assert!(normalized.active);
+    assert_eq!(normalized.outcomes.len(), 2);
+    let requests = requests.lock().map_err(|_| "request capture poisoned")?;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("GET /events/slug/btc-up HTTP/1.1"));
+    drop(requests);
+    Ok(())
+}
+
+#[tokio::test]
+async fn gamma_discovery_market_by_event_slug_rejects_blank_slug()
+-> Result<(), Box<dyn std::error::Error>> {
+    let discovery = GammaDiscovery::with_client(SdkGammaClient::new("http://127.0.0.1:1")?);
+
+    let result = discovery.market_by_event_slug("  ", &BTreeMap::new()).await;
+
+    assert!(matches!(
+        result,
+        Err(DiscoveryError::MalformedPage {
+            reason: "event slug is blank"
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn gamma_discovery_market_by_event_slug_requires_exactly_one_market()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (empty, _) = event_discovery(r#"{"id":"event-0","markets":[]}"#.to_owned())?;
+    let empty_result = empty.market_by_event_slug("target", &BTreeMap::new()).await;
+    assert!(matches!(
+        empty_result,
+        Err(DiscoveryError::MalformedPage {
+            reason: "event must contain exactly one market"
+        })
+    ));
+
+    let market = gamma_page_with_window("10192", "2025-01-01T00:00:00Z", "2026-01-01T00:15:00Z");
+    let market = &market[1..market.len() - 1];
+    let (multiple, _) = event_discovery(format!(
+        r#"{{"id":"event-0","markets":[{market},{market}]}}"#
+    ))?;
+    let multiple_result = multiple
+        .market_by_event_slug("target", &BTreeMap::new())
+        .await;
+    assert!(matches!(
+        multiple_result,
+        Err(DiscoveryError::MalformedPage {
+            reason: "event must contain exactly one market"
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn gamma_discovery_market_by_event_slug_rejects_malformed_market()
+-> Result<(), Box<dyn std::error::Error>> {
+    let market = gamma_page_with_window("10192", "2025-01-01T00:00:00Z", "2026-01-01T00:15:00Z")
+        .replacen("\"active\":true,", "", 1);
+    let (discovery, _) = event_discovery(format!(r#"{{"id":"event-0","markets":{market}}}"#))?;
+
+    let result = discovery
+        .market_by_event_slug("target", &BTreeMap::new())
+        .await;
+
+    assert!(matches!(result, Err(DiscoveryError::MalformedPage { .. })));
+    Ok(())
+}
+
+fn event_discovery(
+    body: String,
+) -> Result<(GammaDiscovery, CapturedRequests), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut request = [0_u8; 4096];
+        let Ok(read) = stream.read(&mut request) else {
+            return;
+        };
+        if let Ok(mut requests) = captured.lock() {
+            requests.push(String::from_utf8_lossy(&request[..read]).into_owned());
+        }
+        let reply = response(&body);
+        let _ = stream.write_all(reply.as_bytes());
+        let _ = stream.flush();
+    });
+    Ok((
+        GammaDiscovery::with_client(SdkGammaClient::new(&format!("http://{address}"))?),
+        requests,
+    ))
 }
 
 fn one_page_discovery(body: String) -> Result<GammaDiscovery, Box<dyn std::error::Error>> {

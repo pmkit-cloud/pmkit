@@ -4,7 +4,10 @@ use pmkit_market::MarketDuration;
 use polymarket_client_sdk_v2::{
     gamma::{
         Client as SdkGammaClient,
-        types::{request::MarketsRequest, response::Market},
+        types::{
+            request::{EventBySlugRequest, MarketsRequest},
+            response::Market,
+        },
     },
     types::U256,
 };
@@ -38,6 +41,40 @@ impl GammaDiscovery {
     #[must_use]
     pub const fn with_client(client: SdkGammaClient) -> Self {
         Self { client }
+    }
+
+    /// Fetches and normalizes the sole market attached to an event slug.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiscoveryError`] when the slug is blank, Gamma is unavailable, the event does not
+    /// contain exactly one market, or that market is malformed.
+    pub async fn market_by_event_slug(
+        &self,
+        slug: &str,
+        families: &BTreeMap<String, RecurringFamily>,
+    ) -> Result<GammaMarket, DiscoveryError> {
+        if slug.trim().is_empty() {
+            return Err(DiscoveryError::MalformedPage {
+                reason: "event slug is blank",
+            });
+        }
+        let request = EventBySlugRequest::builder().slug(slug).build();
+        let event = self
+            .client
+            .event_by_slug(&request)
+            .await
+            .map_err(|_| DiscoveryError::Unavailable)?;
+        let markets = event.markets.unwrap_or_default();
+        let market = match markets.as_slice() {
+            [market] => market.clone(),
+            _ => {
+                return Err(DiscoveryError::MalformedPage {
+                    reason: "event must contain exactly one market",
+                });
+            }
+        };
+        gamma_market(market, families)
     }
 
     /// Fetches a complete Gamma snapshot using fixed `limit` and `offset` pages.
