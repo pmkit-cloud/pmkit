@@ -7,7 +7,7 @@ use pmkit_event::MarketEvent;
 use pmkit_exec::{OrderId, PlaceOrder, TimeInForce};
 use pmkit_market::Outcome;
 use pmkit_money::Money;
-use pmkit_sim::{SimEngine, SimulationConfig};
+use pmkit_sim::{FeeModel, SimEngine, SimulationConfig};
 use rust_decimal::Decimal;
 use thiserror::Error;
 
@@ -317,19 +317,26 @@ impl PaperLedger {
     /// Cash still free to commit, or `None` when the run declared no cash and
     /// is therefore not cash-constrained.
     ///
-    /// Open buy orders hold their notional the way the venue holds collateral
-    /// against a resting bid: a run cannot commit the same dollar twice, and a
-    /// resting order that later fills is already paid for.
-    pub(crate) fn available_cash(&self) -> Option<Money> {
+    /// Open buy orders hold fee-inclusive worst-case collateral the way the
+    /// venue holds collateral against a resting bid: a run cannot commit the
+    /// same dollar twice, and a resting order that later fills is already paid for.
+    pub(crate) fn available_cash(&self, fee_model: FeeModel) -> Option<Money> {
         if !self.cash_funded {
             return None;
         }
-        let committed: Decimal = self
+        let committed = self
             .orders
             .values()
             .filter(|tracked| tracked.order.side == Side::Buy)
-            .map(|tracked| tracked.order.price * tracked.order.qty)
-            .sum();
+            .fold(Decimal::ZERO, |committed, tracked| {
+                committed
+                    .checked_add(
+                        fee_model
+                            .max_buy_cost(tracked.order.qty, tracked.order.price)
+                            .unwrap_or(Decimal::MAX),
+                    )
+                    .unwrap_or(Decimal::MAX)
+            });
         Some(self.account.cash() - Money::from_decimal(committed))
     }
 
