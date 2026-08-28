@@ -222,11 +222,13 @@ pub struct PaperLedger {
     next_order_id: u64,
     fill_count: usize,
     id_prefix: String,
+    cash_funded: bool,
 }
 
 impl PaperLedger {
     pub(crate) fn new(initial_cash: Money, id_prefix: String) -> Self {
         let mut ledger = Self::empty(PortfolioLedger::new(initial_cash), id_prefix);
+        ledger.cash_funded = initial_cash > Money::ZERO;
         let entry = PaperLedgerEntry {
             event_id: ledger.next_event_id(),
             sequence: 0,
@@ -262,6 +264,7 @@ impl PaperLedger {
             PortfolioLedger::new(Money::from_decimal(initial_cash)),
             id_prefix,
         );
+        ledger.cash_funded = initial_cash > Decimal::ZERO;
         for entry in &unique {
             if entry.sequence != ledger.next_sequence {
                 return Err(PaperLedgerError::SequenceGap {
@@ -307,7 +310,27 @@ impl PaperLedger {
             next_order_id: 0,
             fill_count: 0,
             id_prefix,
+            cash_funded: false,
         }
+    }
+
+    /// Cash still free to commit, or `None` when the run declared no cash and
+    /// is therefore not cash-constrained.
+    ///
+    /// Open buy orders hold their notional the way the venue holds collateral
+    /// against a resting bid: a run cannot commit the same dollar twice, and a
+    /// resting order that later fills is already paid for.
+    pub(crate) fn available_cash(&self) -> Option<Money> {
+        if !self.cash_funded {
+            return None;
+        }
+        let committed: Decimal = self
+            .orders
+            .values()
+            .filter(|tracked| tracked.order.side == Side::Buy)
+            .map(|tracked| tracked.order.price * tracked.order.qty)
+            .sum();
+        Some(self.account.cash() - Money::from_decimal(committed))
     }
 
     pub(crate) fn begin_order(
