@@ -34,6 +34,31 @@ pub struct PolymarketUserData {
     market_condition: B256,
 }
 
+struct UserSubscription {
+    client: Client<Authenticated<Normal>>,
+    market: B256,
+    active: bool,
+}
+
+impl UserSubscription {
+    const fn new(client: Client<Authenticated<Normal>>, market: B256) -> Self {
+        Self {
+            client,
+            market,
+            active: true,
+        }
+    }
+}
+
+impl Drop for UserSubscription {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            let _ = self.client.unsubscribe_user_events(&[self.market]);
+        }
+    }
+}
+
 impl fmt::Debug for PolymarketUserData {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -77,6 +102,7 @@ impl LiveAccountDataSource for PolymarketUserData {
             .client
             .subscribe_user_events(vec![self.market_condition])
             .map_err(|error| unavailable(error.to_string()))?;
+        let _subscription = UserSubscription::new(self.client.clone(), self.market_condition);
         let mut stream = Box::pin(stream);
         let mut sequence = 0_u64;
         let mut heartbeat =
