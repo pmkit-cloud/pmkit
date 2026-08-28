@@ -453,9 +453,6 @@ impl TokenBook {
         if update.asset_id != token {
             return Ok(false);
         }
-        if self.initialized && update.timestamp < self.timestamp_ms {
-            return Err(replay_gap("book snapshot timestamp regressed"));
-        }
         let bids = levels(&update.bids)?;
         let asks = levels(&update.asks)?;
         validate_book(&bids, &asks)?;
@@ -477,10 +474,6 @@ impl TokenBook {
         if !self.initialized {
             return Ok(false);
         }
-        if update.timestamp < self.timestamp_ms {
-            return Err(replay_gap("price change timestamp regressed"));
-        }
-
         let mut bids = self.bids.clone();
         let mut asks = self.asks.clone();
         let matching = update
@@ -1016,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn token_book_accepts_independent_trade_time_and_rejects_bad_updates()
+    fn token_book_accepts_ordered_messages_with_independent_times()
     -> Result<(), Box<dyn std::error::Error>> {
         let token = U256::from(1_u64);
         let market = MarketId::new("btc-5m")?;
@@ -1064,7 +1057,7 @@ mod tests {
         let regressed: PriceChange = serde_json::from_str(
             r#"{"event_type":"price_change","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"41","price_changes":[{"asset_id":"1","price":"0.48","size":"1","side":"BUY"}]}"#,
         )?;
-        assert!(book.apply(&regressed, token).is_err());
+        assert!(book.apply(&regressed, token)?);
         Ok(())
     }
 
