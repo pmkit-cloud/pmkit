@@ -6,7 +6,7 @@ use std::{
     thread,
 };
 
-use crate::{DiscoveryError, GammaDiscovery};
+use crate::{DiscoveryError, GammaDiscovery, RecurringFamily};
 use polymarket_client_sdk_v2::gamma::Client as SdkGammaClient;
 
 #[tokio::test]
@@ -145,6 +145,75 @@ async fn gamma_discovery_rejects_nonzero_decode_failure() -> Result<(), Box<dyn 
 }
 
 #[tokio::test]
+async fn gamma_discovery_derives_recurring_open_time_from_duration()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: Gamma's listing start differs from the configured recurring window.
+    let discovery = one_page_discovery(gamma_page_with_window(
+        "10192",
+        "2025-01-01T00:00:00Z",
+        "2026-01-01T00:15:00Z",
+    ))?;
+    let families = BTreeMap::from([(
+        "10192".to_owned(),
+        RecurringFamily::new("10192", Some("BTC"), Some("15m")),
+    )]);
+
+    // When: the mapped recurring family enters discovery.
+    let snapshot = discovery.snapshot(2, 2, &families).await?;
+
+    // Then: the opening instant is derived from the close, not Gamma's raw start.
+    let market = &snapshot.markets()[0];
+    assert_eq!(market.open_time_ms, market.close_time_ms - 900_000);
+    assert_ne!(market.open_time_ms, 1_735_689_600_000_i64);
+    Ok(())
+}
+
+#[tokio::test]
+async fn gamma_discovery_retains_raw_start_without_duration()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: Gamma reports an unknown family without configured duration.
+    let discovery = one_page_discovery(gamma_page_with_window(
+        "unknown-series",
+        "2025-01-01T00:00:00Z",
+        "2026-01-01T00:15:00Z",
+    ))?;
+
+    // When: discovery normalizes the market without structured duration.
+    let snapshot = discovery.snapshot(2, 2, &BTreeMap::new()).await?;
+
+    // Then: the raw Gamma start remains the fallback.
+    assert_eq!(snapshot.markets()[0].open_time_ms, 1_735_689_600_000_i64);
+    Ok(())
+}
+
+#[tokio::test]
+async fn gamma_discovery_rejects_invalid_configured_duration()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Given: a mapped family with an invalid duration string.
+    let discovery = one_page_discovery(gamma_page_with_window(
+        "10192",
+        "2025-01-01T00:00:00Z",
+        "2026-01-01T00:15:00Z",
+    ))?;
+    let families = BTreeMap::from([(
+        "10192".to_owned(),
+        RecurringFamily::new("10192", Some("BTC"), Some("1h")),
+    )]);
+
+    // When: discovery parses the configured duration.
+    let result = discovery.snapshot(2, 2, &families).await;
+
+    // Then: malformed configuration fails closed.
+    assert!(matches!(
+        result,
+        Err(DiscoveryError::MalformedPage {
+            reason: "market family has invalid duration"
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn gamma_discovery_rejects_missing_activity_metadata()
 -> Result<(), Box<dyn std::error::Error>> {
     // Given: a Gamma market payload whose activity status is absent.
@@ -171,6 +240,33 @@ async fn gamma_discovery_rejects_missing_activity_metadata()
     // Then: the malformed page cannot be published as an empty snapshot.
     assert!(matches!(result, Err(DiscoveryError::MalformedPage { .. })));
     Ok(())
+}
+
+fn one_page_discovery(body: String) -> Result<GammaDiscovery, Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut request = [0_u8; 4096];
+        if stream.read(&mut request).is_err() {
+            return;
+        }
+        let reply = response(&body);
+        let _ = stream.write_all(reply.as_bytes());
+        let _ = stream.flush();
+    });
+    Ok(GammaDiscovery::with_client(SdkGammaClient::new(&format!(
+        "http://{address}"
+    ))?))
+}
+
+fn gamma_page_with_window(series_id: &str, start_date: &str, end_date: &str) -> String {
+    format!(
+        r#"[{{"id":"market-0","conditionId":"0x{:064x}","startDate":"{start_date}","endDate":"{end_date}","active":true,"closed":false,"outcomes":"[\"Up\",\"Down\"]","clobTokenIds":"[\"1\",\"2\"]","events":[{{"id":"event-0","series":[{{"id":"{series_id}"}}]}}]}}]"#,
+        1,
+    )
 }
 
 fn response(body: &str) -> String {

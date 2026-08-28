@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use pmkit_market::MarketDuration;
 use polymarket_client_sdk_v2::{
     gamma::{
         Client as SdkGammaClient,
@@ -114,24 +115,6 @@ fn gamma_market(
             reason: "market lacks condition id",
         })?
         .to_string();
-    let open_time_ms = market
-        .start_date
-        .ok_or(DiscoveryError::MalformedPage {
-            reason: "market lacks start time",
-        })?
-        .timestamp_millis();
-    let close_time_ms = market
-        .end_date
-        .ok_or(DiscoveryError::MalformedPage {
-            reason: "market lacks end time",
-        })?
-        .timestamp_millis();
-    let active = market.active.ok_or(DiscoveryError::MalformedPage {
-        reason: "market lacks activity status",
-    })?;
-    let closed = market.closed.ok_or(DiscoveryError::MalformedPage {
-        reason: "market lacks closed status",
-    })?;
     let family = market
         .events
         .as_ref()
@@ -144,6 +127,45 @@ fn gamma_market(
                 .cloned()
                 .unwrap_or_else(|| RecurringFamily::new(series.id.clone(), None, None))
         });
+    let close_time_ms = market
+        .end_date
+        .ok_or(DiscoveryError::MalformedPage {
+            reason: "market lacks end time",
+        })?
+        .timestamp_millis();
+    let open_time_ms = if let Some(duration) = family.as_ref().and_then(RecurringFamily::duration) {
+        let duration =
+            duration
+                .parse::<MarketDuration>()
+                .map_err(|_| DiscoveryError::MalformedPage {
+                    reason: "market family has invalid duration",
+                })?;
+        let open_time_ms =
+            close_time_ms
+                .checked_sub(duration.millis())
+                .ok_or(DiscoveryError::MalformedPage {
+                    reason: "market window start overflows",
+                })?;
+        if open_time_ms < 0 || open_time_ms >= close_time_ms {
+            return Err(DiscoveryError::MalformedPage {
+                reason: "market window is invalid",
+            });
+        }
+        open_time_ms
+    } else {
+        market
+            .start_date
+            .ok_or(DiscoveryError::MalformedPage {
+                reason: "market lacks start time",
+            })?
+            .timestamp_millis()
+    };
+    let active = market.active.ok_or(DiscoveryError::MalformedPage {
+        reason: "market lacks activity status",
+    })?;
+    let closed = market.closed.ok_or(DiscoveryError::MalformedPage {
+        reason: "market lacks closed status",
+    })?;
     let outcomes = outcomes(market.outcomes, market.clob_token_ids)?;
     Ok(GammaMarket {
         market_id: market.id,
