@@ -559,19 +559,19 @@ fn validate_book(
     bids: &BTreeMap<rust_decimal::Decimal, rust_decimal::Decimal>,
     asks: &BTreeMap<rust_decimal::Decimal, rust_decimal::Decimal>,
 ) -> Result<(), DataSourceError> {
-    if bids
-        .last_key_value()
-        .zip(asks.first_key_value())
-        .is_some_and(|((bid, _), (ask, _))| bid >= ask)
+    if let Some(((bid, _), (ask, _))) = bids.last_key_value().zip(asks.first_key_value())
+        && bid >= ask
     {
-        return Err(replay_gap("book is crossed or locked"));
+        return Err(replay_gap(format!(
+            "book is crossed or locked: best_bid={bid} best_ask={ask}"
+        )));
     }
     Ok(())
 }
 
-fn replay_gap(message: &str) -> DataSourceError {
+fn replay_gap(message: impl Into<String>) -> DataSourceError {
     DataSourceError::ReplayGap {
-        message: message.to_owned(),
+        message: message.into(),
     }
 }
 
