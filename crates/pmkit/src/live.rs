@@ -6,7 +6,9 @@ use super::{
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_accounting::{ExposureReservation, aggregate_exposure};
 use pmkit_book::OrderBookL2;
-use pmkit_event::{FillIdentity, MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
+use pmkit_event::{
+    CexReferenceEvent, FillIdentity, MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact,
+};
 use pmkit_exec::{ExecError, Executor, OrderId, OrderStatus, PlaceOrder};
 use pmkit_market::Outcome;
 use pmkit_runtime::{LiveOrderPolicy, RuntimeConfig, StrategyRegistration};
@@ -229,9 +231,10 @@ fn sources(run: &LiveRun, strategies: &[StrategyInstance]) -> Vec<SourceTaskDefi
             }));
         }
     }
-    if let Some(reference) = run.reference_data_ref() {
+    for (name, reference) in run.reference_data_refs() {
+        let name = name.clone();
         let reference = reference.clone();
-        sources.push(SourceTaskDefinition::new("cex", move |sink| async move {
+        sources.push(SourceTaskDefinition::new(name, move |sink| async move {
             reference.subscribe_reference(sink).await
         }));
     }
@@ -808,6 +811,8 @@ async fn drive_with_control_and_rate_limits(
     }
 
     let mut connection_epochs = HashMap::new();
+    let mut strategy_books = vec![OrderBookL2::default(); strategies.len()];
+    let mut portfolio_daily_pnl = None;
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     control.emit(RunLifecycleEvent::Started {
         run: run.id().clone(),
@@ -856,6 +861,97 @@ async fn drive_with_control_and_rate_limits(
         .await?;
         if let SourceEnvelope::CexReference(envelope) = &merged.source {
             cex_metrics.observe(&envelope.fact);
+            let timestamp_ms = match &envelope.fact {
+                CexReferenceEvent::Trade { timestamp_ms, .. } => *timestamp_ms,
+            };
+            for (index, instance) in strategies.iter_mut().enumerate() {
+                let market = &instance.market;
+                let book = &strategy_books[index];
+                let identity = CausalIdentity {
+                    scope: scope.clone(),
+                    correlation_id: format!(
+                        "{:?}:cex:{}:{timestamp_ms}",
+                        instance.id, envelope.metadata.source_id
+                    ),
+                    source_timestamp_ms: envelope.metadata.source_time_ms,
+                    ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
+                        .unwrap_or(i64::MAX),
+                };
+                let mut verdicts: Vec<crate::causal::ActionRiskVerdict> = Vec::new();
+                let effective_limits = effective_limits_by_strategy
+                    .get(&instance.id)
+                    .map_or(&limits, |effective_limits| effective_limits);
+                let market_positions = risk_state.positions(market);
+                let context = StrategyContext {
+                    fact: &merged.fact,
+                    market,
+                    book,
+                    positions: market_positions,
+                    now: LogicalTimestamp::from_millis(timestamp_ms),
+                };
+                metrics.decision();
+                if let Ok(actions) = instance.strategy.on_event(context) {
+                    let mut action_context = LiveSubmitContext {
+                        run,
+                        runtime,
+                        store,
+                        executor: executor.as_ref(),
+                        identity: &identity,
+                        market,
+                        timestamp_ms,
+                        max_open_orders,
+                        portfolio_daily_pnl,
+                        effective_limits,
+                        market_positions,
+                        risk_state: &risk_state,
+                        order_rate_state: &mut order_rate_state,
+                        rate_limits,
+                        reservations: &mut reservations,
+                        open_orders: &mut open_orders,
+                        tape: &mut tape,
+                        metrics: &metrics,
+                        verdicts: &mut verdicts,
+                        strategy: &instance.id,
+                    };
+                    for action in actions.as_slice() {
+                        match action {
+                            Action::Place(order) => {
+                                submit_live_order(&mut action_context, order).await?;
+                            }
+                            Action::Cancel(order_id) => {
+                                cancel_live_order(&mut action_context, order_id).await?;
+                            }
+                            Action::ReplaceQuotes { cancel, place } => {
+                                for order_id in cancel {
+                                    cancel_live_order(&mut action_context, order_id).await?;
+                                }
+                                for order in place {
+                                    submit_live_order(&mut action_context, order).await?;
+                                }
+                            }
+                            Action::CancelAll => {
+                                cancel_live_strategy_orders(&mut action_context).await?;
+                            }
+                        }
+                    }
+                }
+                if let Some(store) = store {
+                    let snapshot =
+                        crate::causal::DecisionSnapshot::from_book(book, cex_metrics.snapshot());
+                    let decision = if verdicts.is_empty() {
+                        crate::causal::DecisionKind::NoAction
+                    } else {
+                        crate::causal::DecisionKind::Actions(verdicts)
+                    };
+                    crate::causal::CausalRecorder::new(store)
+                        .record_evaluation(&identity, &snapshot, decision)
+                        .await
+                        .map_err(|source| StartError::Storage {
+                            run: run.id().clone(),
+                            source,
+                        })?;
+                }
+            }
             continue;
         }
         if let SourceEnvelope::PmAccount(envelope) = &merged.source {
@@ -915,7 +1011,7 @@ async fn drive_with_control_and_rate_limits(
                     last_trade_price: None,
                 };
                 let fact = StrategyFact::Market(event.clone());
-                let portfolio_daily_pnl = risk_state.update_book(market, *outcome, &book, &limits);
+                portfolio_daily_pnl = risk_state.update_book(market, *outcome, &book, &limits);
                 if risk_state.loss_breached
                     && let Some(store) = store
                 {
@@ -927,10 +1023,11 @@ async fn drive_with_control_and_rate_limits(
                             source,
                         })?;
                 }
-                for instance in &mut *strategies {
+                for (index, instance) in strategies.iter_mut().enumerate() {
                     if instance.market != *market {
                         continue;
                     }
+                    strategy_books[index] = book.clone();
                     let identity = CausalIdentity {
                         scope: scope.clone(),
                         correlation_id: strategy_correlation_id(

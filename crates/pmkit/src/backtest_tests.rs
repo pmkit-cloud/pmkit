@@ -22,7 +22,10 @@ use pmkit_strategy::{
 };
 use rust_decimal::Decimal;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
@@ -41,6 +44,16 @@ struct FailingHistory;
 struct Taker;
 
 struct TakerFactory;
+
+struct ReferenceBuyer {
+    calls: Arc<AtomicUsize>,
+    nonempty_books: Arc<AtomicUsize>,
+}
+
+struct ReferenceBuyerFactory {
+    calls: Arc<AtomicUsize>,
+    nonempty_books: Arc<AtomicUsize>,
+}
 
 struct RestThenCancel {
     seen: usize,
@@ -72,6 +85,43 @@ impl Strategy for Taker {
 impl StrategyFactory for TakerFactory {
     fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
         Ok(Box::new(Taker))
+    }
+}
+
+impl Strategy for ReferenceBuyer {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        if !matches!(context.fact, pmkit_event::StrategyFact::Reference(_)) {
+            return Ok(Actions::none());
+        }
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        if !context.book.bids.is_empty()
+            || !context.book.asks.is_empty()
+            || context.book.last_trade_price.is_some()
+            || context.book.timestamp_ms != 0
+        {
+            self.nonempty_books.fetch_add(1, Ordering::Relaxed);
+        }
+        let Some((price, _)) = context.book.best_ask() else {
+            return Ok(Actions::none());
+        };
+        Ok(Actions::place(pmkit_exec::PlaceOrder {
+            market: context.market.clone(),
+            outcome: Outcome::Up,
+            side: pmkit_book::Side::Buy,
+            price,
+            qty: Decimal::ONE,
+            post_only: false,
+            tif: pmkit_exec::TimeInForce::Gtc,
+        }))
+    }
+}
+
+impl StrategyFactory for ReferenceBuyerFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(ReferenceBuyer {
+            calls: Arc::clone(&self.calls),
+            nonempty_books: Arc::clone(&self.nonempty_books),
+        }))
     }
 }
 
@@ -334,8 +384,59 @@ async fn backtest_drives_replay_through_strategy_to_fill() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
+async fn backtest_delivers_reference_facts_with_latest_market_context()
+-> Result<(), Box<dyn std::error::Error>> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let nonempty_books = Arc::new(AtomicUsize::new(0));
+    let replay = ReplaySpec::new(
+        Arc::new(ScriptedHistory { ticks: vec![1, 2] }),
+        "2026-01-01T00:00:00Z".parse()?,
+        "2026-02-01T00:00:00Z".parse()?,
+        EvidenceRequirement::CorroboratedOnly,
+        RetrievalWait::ReturnPending,
+    )
+    .reference_source(Arc::new(ScriptedReference));
+    let run = BacktestRun::new(
+        RunId::new("bt-reference")?,
+        PortfolioId::new("research")?,
+        replay,
+        Money::usdc(1_000),
+        risk()?,
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("reference-buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(ReferenceBuyerFactory {
+            calls: Arc::clone(&calls),
+            nonempty_books: Arc::clone(&nonempty_books),
+        }),
+    ));
+
+    let app = Pmkit::builder(config()?).run(run).start().await?;
+    let RunReport::Backtest(report) = app.wait_for(RunId::new("bt-reference")?).await? else {
+        return Err("expected a backtest report".into());
+    };
+
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(nonempty_books.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        report.fills, 1,
+        "reference actions should reach the simulator"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn metrics_match_report() -> Result<(), Box<dyn std::error::Error>> {
-    // Given: a completed backtest with two PM book events.
+    // Given: a completed backtest with two PM book events and one CEX reference fact.
     let app = backtest_app().await?;
     let run = RunId::new("bt")?;
     let RunReport::Backtest(report) = app.wait_for(run.clone()).await? else {
@@ -351,7 +452,7 @@ async fn metrics_match_report() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(metrics.fills, report.fills);
     assert_eq!(metrics.rejected, 0);
     assert_eq!(metrics.reconnects, 0);
-    assert_eq!(metrics.decisions, 2);
+    assert_eq!(metrics.decisions, 3);
     assert_eq!(report.metrics, *metrics);
     Ok(())
 }
@@ -565,7 +666,8 @@ async fn metrics_count_each_strategy_evaluation() -> Result<(), Box<dyn std::err
     let app = Pmkit::builder(config()?).run(run).start().await?;
     let metrics = app.metrics(&RunId::new("bt")?).ok_or("missing metrics")?;
 
-    assert_eq!(metrics.decisions, 4);
+    // Two strategies evaluate two PM books and one reference fact each.
+    assert_eq!(metrics.decisions, 6);
     Ok(())
 }
 
@@ -689,7 +791,7 @@ async fn wait_for_rejects_unknown_run() -> Result<(), Box<dyn std::error::Error>
 
 #[tokio::test]
 async fn backtest_records_one_decision_per_book_event() -> Result<(), Box<dyn std::error::Error>> {
-    // Given: a store-backed backtest over two scripted book events.
+    // Given: a store-backed backtest over two scripted book events and one reference fact.
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("pmkit-bt-decisions.db");
     let store = Arc::new(TursoTapeStore::open_local(&path).await?);
@@ -729,10 +831,10 @@ async fn backtest_records_one_decision_per_book_event() -> Result<(), Box<dyn st
         .start()
         .await?;
 
-    // Then: exactly one causal decision is recorded per book event, owner-scoped.
+    // Then: each book and reference evaluation is recorded once, owner-scoped.
     let scope = OwnerScope::new(PortfolioId::new("research")?, RunId::new("bt-rec")?);
     let decisions = store.read_decisions(&scope).await?;
-    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions.len(), 3);
     assert!(
         decisions.iter().any(|decision| {
             decision.payload["snapshot"]["cex_trade"]["volume"] == "2"

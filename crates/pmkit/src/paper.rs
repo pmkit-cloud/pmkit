@@ -1,13 +1,13 @@
 use super::{
-    PaperReport, RunControl, RunLifecycleEvent, StartError, instantiate_strategies,
-    observe_reconnect, store_signal, validate_account_owner,
+    PaperReport, RunControl, RunLifecycleEvent, StartError, StrategyInstance,
+    instantiate_strategies, observe_reconnect, store_signal, validate_account_owner,
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_accounting::{
     ExposureReservation, PortfolioExposure, PositionExposure, aggregate_exposure,
 };
 use pmkit_book::OrderBookL2;
-use pmkit_event::{MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
+use pmkit_event::{CexReferenceEvent, MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
 use pmkit_exec::{ExecError, Executor, OrderId};
 use pmkit_market::Outcome;
 use pmkit_paper::{PaperExecutor, PaperLedgerEntry, PaperLedgerError};
@@ -213,6 +213,75 @@ async fn persist_or_drain_paper(
 }
 
 #[expect(
+    clippy::too_many_arguments,
+    reason = "the shared dispatcher carries ordered paper execution state"
+)]
+async fn dispatch_paper_strategy(
+    run: &PaperRun,
+    paper: &PaperExecutor,
+    store: Option<&dyn TapeStore>,
+    scope: &OwnerScope,
+    instance: &mut StrategyInstance,
+    fact: &StrategyFact,
+    book: &OrderBookL2,
+    positions: &[pmkit_book::Position],
+    timestamp_ms: i64,
+    fill_rx: &mut tokio::sync::mpsc::Receiver<MarketEvent>,
+    metrics: &crate::RunMetrics,
+) -> Result<Vec<crate::causal::ActionRiskVerdict>, StartError> {
+    let context = StrategyContext {
+        fact,
+        market: &instance.market,
+        book,
+        positions,
+        now: LogicalTimestamp::from_millis(timestamp_ms),
+    };
+    metrics.decision();
+    let mut verdicts = Vec::new();
+    if let Ok(actions) = instance.strategy.on_event(context) {
+        let action_context = PaperActionContext {
+            run,
+            paper,
+            store,
+            scope,
+            strategy: &instance.id,
+            timestamp_ms,
+            metrics,
+        };
+        for (action_index, action) in actions.as_slice().iter().enumerate() {
+            let action_index = u32::try_from(action_index).unwrap_or(u32::MAX);
+            match action {
+                Action::Place(order) => {
+                    submit_paper_order(&action_context, order, action_index, &mut verdicts).await?;
+                }
+                Action::Cancel(order_id) => {
+                    cancel_paper_order(run, paper, store, scope, &instance.id, order_id).await?;
+                }
+                Action::ReplaceQuotes { cancel, place } => {
+                    for order_id in cancel {
+                        cancel_paper_order(run, paper, store, scope, &instance.id, order_id)
+                            .await?;
+                    }
+                    for order in place {
+                        submit_paper_order(&action_context, order, action_index, &mut verdicts)
+                            .await?;
+                    }
+                }
+                Action::CancelAll => {
+                    for order_id in owned_paper_orders(paper, &instance.id) {
+                        cancel_paper_order(run, paper, store, scope, &instance.id, &order_id)
+                            .await?;
+                    }
+                }
+            }
+        }
+    }
+    drain_fills(fill_rx);
+    metrics.set_fills(paper.fill_count());
+    Ok(verdicts)
+}
+
+#[expect(
     clippy::too_many_lines,
     reason = "the paper run owns one ordered feed, executor, strategy, and recording loop"
 )]
@@ -287,9 +356,10 @@ pub async fn drive_with_control(
             }));
         }
     }
-    if let Some(reference) = run.reference_data_ref() {
+    for (name, reference) in run.reference_data_refs() {
+        let name = name.clone();
         let reference = reference.clone();
-        sources.push(SourceTaskDefinition::new("cex", move |sink| async move {
+        sources.push(SourceTaskDefinition::new(name, move |sink| async move {
             reference.subscribe_reference(sink).await
         }));
     }
@@ -307,6 +377,7 @@ pub async fn drive_with_control(
     let mut fills = paper.fill_count();
     metrics.set_fills(fills);
     let mut marks = HashMap::new();
+    let mut strategy_books = vec![OrderBookL2::default(); strategies.len()];
     let mut connection_epochs = HashMap::new();
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     control.emit(RunLifecycleEvent::Started {
@@ -356,6 +427,52 @@ pub async fn drive_with_control(
         })?;
         if let SourceEnvelope::CexReference(envelope) = &merged.source {
             cex_metrics.observe(&envelope.fact);
+            let timestamp_ms = match &envelope.fact {
+                CexReferenceEvent::Trade { timestamp_ms, .. } => *timestamp_ms,
+            };
+            let mut verdicts = Vec::new();
+            for (index, instance) in strategies.iter_mut().enumerate() {
+                let positions = paper.positions_for_market(&instance.market);
+                verdicts.extend(
+                    dispatch_paper_strategy(
+                        run,
+                        &paper,
+                        store,
+                        &scope,
+                        instance,
+                        &merged.fact,
+                        &strategy_books[index],
+                        &positions,
+                        timestamp_ms,
+                        &mut fill_rx,
+                        &metrics,
+                    )
+                    .await?,
+                );
+            }
+            if let Some(store) = store {
+                let book = strategy_books.first().cloned().unwrap_or_default();
+                let identity = CausalIdentity {
+                    scope: scope.clone(),
+                    correlation_id: format!("cex:{}:{timestamp_ms}", envelope.metadata.source_id),
+                    source_timestamp_ms: envelope.metadata.source_time_ms,
+                    ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
+                        .unwrap_or(i64::MAX),
+                };
+                crate::causal::record_book_decision(
+                    store,
+                    &identity,
+                    &book,
+                    cex_metrics.snapshot(),
+                    verdicts,
+                    Some(simulation_config),
+                )
+                .await
+                .map_err(|source| StartError::Storage {
+                    run: run.id().clone(),
+                    source,
+                })?;
+            }
             continue;
         }
         if let SourceEnvelope::PmAccount(envelope) = &merged.source {
@@ -438,93 +555,28 @@ pub async fn drive_with_control(
             fills = paper.fill_count();
             metrics.set_fills(fills);
             let mut verdicts = Vec::new();
-            for instance in &mut *strategies {
+            for (index, instance) in strategies.iter_mut().enumerate() {
                 if instance.market != *market {
                     continue;
                 }
+                strategy_books[index] = book.clone();
                 let positions = paper.positions_for_market(market);
-                let context = StrategyContext {
-                    fact: &fact,
-                    market,
-                    book: &book,
-                    positions: &positions,
-                    now: LogicalTimestamp::from_millis(*timestamp_ms),
-                };
-                metrics.decision();
-                if let Ok(actions) = instance.strategy.on_event(context) {
-                    let action_context = PaperActionContext {
+                verdicts.extend(
+                    dispatch_paper_strategy(
                         run,
-                        paper: &paper,
+                        &paper,
                         store,
-                        scope: &scope,
-                        strategy: &instance.id,
-                        timestamp_ms: *timestamp_ms,
-                        metrics: &metrics,
-                    };
-                    for (action_index, action) in actions.as_slice().iter().enumerate() {
-                        let action_index = u32::try_from(action_index).unwrap_or(u32::MAX);
-                        match action {
-                            Action::Place(order) => {
-                                submit_paper_order(
-                                    &action_context,
-                                    order,
-                                    action_index,
-                                    &mut verdicts,
-                                )
-                                .await?;
-                            }
-                            Action::Cancel(order_id) => {
-                                cancel_paper_order(
-                                    run,
-                                    &paper,
-                                    store,
-                                    &scope,
-                                    &instance.id,
-                                    order_id,
-                                )
-                                .await?;
-                            }
-                            Action::ReplaceQuotes { cancel, place } => {
-                                for order_id in cancel {
-                                    cancel_paper_order(
-                                        run,
-                                        &paper,
-                                        store,
-                                        &scope,
-                                        &instance.id,
-                                        order_id,
-                                    )
-                                    .await?;
-                                }
-                                for order in place {
-                                    submit_paper_order(
-                                        &action_context,
-                                        order,
-                                        action_index,
-                                        &mut verdicts,
-                                    )
-                                    .await?;
-                                }
-                            }
-                            Action::CancelAll => {
-                                for order_id in owned_paper_orders(&paper, &instance.id) {
-                                    cancel_paper_order(
-                                        run,
-                                        &paper,
-                                        store,
-                                        &scope,
-                                        &instance.id,
-                                        &order_id,
-                                    )
-                                    .await?;
-                                }
-                            }
-                        }
-                    }
-                }
-                drain_fills(&mut fill_rx);
-                fills = paper.fill_count();
-                metrics.set_fills(fills);
+                        &scope,
+                        instance,
+                        &fact,
+                        &strategy_books[index],
+                        &positions,
+                        *timestamp_ms,
+                        &mut fill_rx,
+                        &metrics,
+                    )
+                    .await?,
+                );
             }
             if let Some(store) = store {
                 let identity = CausalIdentity {
