@@ -472,7 +472,7 @@ impl TokenBook {
             return Ok(false);
         }
         if !self.initialized {
-            return Err(replay_gap("price change before initial book snapshot"));
+            return Ok(false);
         }
         if update.timestamp < self.timestamp_ms {
             return Err(replay_gap("price change timestamp regressed"));
@@ -636,7 +636,7 @@ fn market_event(
             .map(|matched| matched.then(|| book.event(market.clone(), outcome))),
         WsMessage::LastTradePrice(update) if update.asset_id == token => {
             if !book.initialized {
-                return Err(replay_gap("last trade before initial book snapshot"));
+                return Ok(None);
             }
             if update.timestamp < book.timestamp_ms {
                 return Err(replay_gap("last trade timestamp regressed"));
@@ -927,17 +927,14 @@ mod tests {
     }
 
     #[test]
-    fn token_book_rejects_malformed_or_pre_snapshot_matching_changes()
+    fn token_book_holds_pre_snapshot_and_rejects_malformed_changes()
     -> Result<(), Box<dyn std::error::Error>> {
         let token = U256::from(1_u64);
         let delta: PriceChange = serde_json::from_str(
             r#"{"event_type":"price_change","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"42","price_changes":[{"asset_id":"1","price":"0.50","size":"1","side":"BUY"}]}"#,
         )?;
         let mut book = TokenBook::default();
-        assert!(matches!(
-            book.apply(&delta, token),
-            Err(DataSourceError::ReplayGap { .. })
-        ));
+        assert!(!book.apply(&delta, token)?);
 
         let snapshot: BookUpdate = serde_json::from_str(
             r#"{"asset_id":"1","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"42","bids":[],"asks":[]}"#,
@@ -962,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn token_book_rejects_crossed_regressed_and_pre_snapshot_trade()
+    fn token_book_holds_pre_snapshot_trade_and_rejects_bad_updates()
     -> Result<(), Box<dyn std::error::Error>> {
         let token = U256::from(1_u64);
         let market = MarketId::new("btc-5m")?;
@@ -980,8 +977,8 @@ mod tests {
                 token,
                 &mut book,
                 WsMessage::LastTradePrice(trade),
-            )
-            .is_err()
+            )?
+            .is_none()
         );
         book.replace(&snapshot, token)?;
         let regressed_trade: LastTradePrice = serde_json::from_str(
