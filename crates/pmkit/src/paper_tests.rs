@@ -4,9 +4,14 @@ use crate::{
 };
 use async_trait::async_trait;
 use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
-use pmkit_data::{DataSourceError, LiveAccountDataSource, LiveDataSource, SourceSignal};
-use pmkit_event::{MarketEvent, PmAccountEnvelope, PmAccountEvent, SourceEnvelope, StreamMetadata};
-use pmkit_market::Outcome;
+use pmkit_data::{
+    DataSourceError, LiveAccountDataSource, LiveCexDataSource, LiveDataSource, SourceSignal,
+};
+use pmkit_event::{
+    CexReferenceEnvelope, CexReferenceEvent, MarketEvent, PmAccountEnvelope, PmAccountEvent,
+    SourceEnvelope, StreamMetadata,
+};
+use pmkit_market::{Asset, Exchange, Outcome};
 use pmkit_money::Money;
 use pmkit_runtime::StrategyRegistration;
 use pmkit_spec::{ConservativeV1Config, PaperRun};
@@ -16,11 +21,26 @@ use pmkit_strategy::{
 };
 use rust_decimal::Decimal;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
 struct ScriptedLive;
+
+struct ScriptedReferenceLive;
+
+struct ReferenceBuyer {
+    calls: Arc<AtomicUsize>,
+    nonempty_books: Arc<AtomicUsize>,
+}
+
+struct ReferenceBuyerFactory {
+    calls: Arc<AtomicUsize>,
+    nonempty_books: Arc<AtomicUsize>,
+}
 
 struct StaleMarkLive;
 
@@ -61,6 +81,43 @@ impl StrategyFactory for CancelAfterPlaceFactory {
     }
 }
 
+impl Strategy for ReferenceBuyer {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        if !matches!(context.fact, pmkit_event::StrategyFact::Reference(_)) {
+            return Ok(Actions::none());
+        }
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        if !context.book.bids.is_empty()
+            || !context.book.asks.is_empty()
+            || context.book.last_trade_price.is_some()
+            || context.book.timestamp_ms != 0
+        {
+            self.nonempty_books.fetch_add(1, Ordering::Relaxed);
+        }
+        let Some((price, _)) = context.book.best_ask() else {
+            return Ok(Actions::none());
+        };
+        Ok(Actions::place(pmkit_exec::PlaceOrder {
+            market: context.market.clone(),
+            outcome: Outcome::Up,
+            side: pmkit_book::Side::Buy,
+            price,
+            qty: Decimal::ONE,
+            post_only: false,
+            tif: pmkit_exec::TimeInForce::Gtc,
+        }))
+    }
+}
+
+impl StrategyFactory for ReferenceBuyerFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(ReferenceBuyer {
+            calls: Arc::clone(&self.calls),
+            nonempty_books: Arc::clone(&self.nonempty_books),
+        }))
+    }
+}
+
 #[async_trait]
 impl LiveDataSource for CancelLive {
     async fn subscribe(
@@ -82,6 +139,44 @@ impl LiveDataSource for CancelLive {
                 .map_err(|_| DataSourceError::SinkClosed)?;
             }
         }
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+#[async_trait]
+impl LiveCexDataSource for ScriptedReferenceLive {
+    async fn subscribe_reference(&self, sink: Sender<SourceSignal>) -> Result<(), DataSourceError> {
+        sink.send(SourceSignal::Data(Box::new(SourceEnvelope::CexReference(
+            CexReferenceEnvelope {
+                metadata: StreamMetadata {
+                    schema_version: 1,
+                    source_id: "binance-live".into(),
+                    source_time_ms: 1,
+                    canonical_source_rank: 1,
+                    receipt_time_ms: 1,
+                    connection_id: "reference".into(),
+                    connection_epoch: 0,
+                    frame_sequence: 1,
+                    ingest_sequence: 1,
+                },
+                fact: CexReferenceEvent::Trade {
+                    asset: Asset::Btc,
+                    exchange: Exchange::Binance,
+                    aggregate_trade_id: 1,
+                    price: Decimal::new(42, 2),
+                    qty: Decimal::ONE,
+                    is_buyer_maker: false,
+                    timestamp_ms: 1,
+                },
+            },
+        ))))
+        .await
+        .map_err(|_| DataSourceError::SinkClosed)?;
         sink.send(SourceSignal::Watermark(i64::MAX))
             .await
             .map_err(|_| DataSourceError::SinkClosed)?;
@@ -243,6 +338,50 @@ async fn paper_cancel_all_releases_strategy_orders() -> Result<(), Box<dyn std::
     };
     assert_eq!(report.fills, 0);
     assert_eq!(report.exposure.portfolio_notional, Decimal::ZERO);
+    Ok(())
+}
+
+#[tokio::test]
+async fn paper_delivers_reference_facts_with_latest_market_context()
+-> Result<(), Box<dyn std::error::Error>> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let nonempty_books = Arc::new(AtomicUsize::new(0));
+    let run = PaperRun::new(
+        RunId::new("paper-reference")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        risk()?,
+        Arc::new(ScriptedLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .reference_data(Arc::new(ScriptedReferenceLive))
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("reference-buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(ReferenceBuyerFactory {
+            calls: Arc::clone(&calls),
+            nonempty_books: Arc::clone(&nonempty_books),
+        }),
+    ));
+
+    let app = Pmkit::builder(config()?).run(run).start().await?;
+    let RunReport::Paper(report) = app.wait_for(RunId::new("paper-reference")?).await? else {
+        return Err("expected a paper report".into());
+    };
+
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(nonempty_books.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        report.fills, 1,
+        "reference actions should reach paper execution"
+    );
     Ok(())
 }
 
