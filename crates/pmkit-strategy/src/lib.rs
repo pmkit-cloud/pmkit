@@ -96,7 +96,7 @@ pub struct StrategyContext<'a> {
     pub fact: &'a StrategyFact,
     /// The exact market the strategy trades.
     pub market: &'a MarketId,
-    /// The current order book for the traded outcome token.
+    /// The triggering outcome book, or an empty book for outcome-less CEX reference facts.
     pub book: &'a OrderBookL2,
     /// The strategy's current positions.
     pub positions: &'a [Position],

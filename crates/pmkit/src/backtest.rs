@@ -84,6 +84,7 @@ pub async fn drive_with_control(
     let mut sim = SimEngine::with_fee_config("bt", 0, simulation_config);
     let mut positions_by_market: HashMap<MarketId, Vec<pmkit_book::Position>> = HashMap::new();
     let mut marks: HashMap<(MarketId, Outcome), Decimal> = HashMap::new();
+    let empty_book = OrderBookL2::default();
     let mut connection_epochs = HashMap::new();
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
@@ -133,6 +134,21 @@ pub async fn drive_with_control(
         })?;
         if let SourceEnvelope::CexReference(envelope) = &merged.source {
             cex_metrics.observe(&envelope.fact);
+            let timestamp_ms = match &envelope.fact {
+                pmkit_event::CexReferenceEvent::Trade { timestamp_ms, .. } => *timestamp_ms,
+            };
+            let (added, _, rejected, decisions) = run_strategies(&mut RunStrategiesInputs {
+                strategies: &mut strategies,
+                fact: &merged.fact,
+                market: None,
+                book: &empty_book,
+                positions_by_market: &mut positions_by_market,
+                timestamp_ms,
+                sim: &mut sim,
+            });
+            metrics.add_fills(added);
+            metrics.add_rejected(rejected);
+            metrics.add_decisions(decisions);
             continue;
         }
         let SourceEnvelope::PmMarket(envelope) = merged.source else {
@@ -162,11 +178,12 @@ pub async fn drive_with_control(
             sim.update_book(market, *outcome, book.clone());
             let drained = sim.drain_fills();
             metrics.add_fills(absorb_market_fills(&drained, &mut positions_by_market));
+            let fact = StrategyFact::Market(event.clone());
             let (added, actions_placed, rejected, decisions) =
                 run_strategies(&mut RunStrategiesInputs {
                     strategies: &mut strategies,
-                    market,
-                    outcome: *outcome,
+                    fact: &fact,
+                    market: Some(market),
                     book: &book,
                     positions_by_market: &mut positions_by_market,
                     timestamp_ms: *timestamp_ms,
@@ -281,8 +298,8 @@ fn report_exposure(
 
 struct RunStrategiesInputs<'a> {
     strategies: &'a mut [StrategyInstance],
-    market: &'a pmkit_core::MarketId,
-    outcome: pmkit_market::Outcome,
+    fact: &'a StrategyFact,
+    market: Option<&'a pmkit_core::MarketId>,
     book: &'a OrderBookL2,
     positions_by_market: &'a mut HashMap<MarketId, Vec<pmkit_book::Position>>,
     timestamp_ms: i64,
@@ -295,22 +312,19 @@ fn run_strategies(inputs: &mut RunStrategiesInputs<'_>) -> (usize, u32, usize, u
     let mut rejected = 0_usize;
     let mut decisions = 0;
     for instance in inputs.strategies.iter_mut() {
-        if instance.market != *inputs.market {
+        if inputs
+            .market
+            .is_some_and(|market| instance.market != *market)
+        {
             continue;
         }
         let positions = inputs
             .positions_by_market
-            .get(inputs.market)
+            .get(&instance.market)
             .map_or(&[] as &[pmkit_book::Position], Vec::as_slice);
         let context = StrategyContext {
-            fact: &StrategyFact::Market(MarketEvent::BookUpdate {
-                market: inputs.market.clone(),
-                outcome: inputs.outcome,
-                bids: inputs.book.bids.clone(),
-                asks: inputs.book.asks.clone(),
-                timestamp_ms: inputs.timestamp_ms,
-            }),
-            market: inputs.market,
+            fact: inputs.fact,
+            market: &instance.market,
             book: inputs.book,
             positions,
             now: LogicalTimestamp::from_millis(inputs.timestamp_ms),
