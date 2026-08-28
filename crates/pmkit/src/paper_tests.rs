@@ -40,9 +40,15 @@ struct FiniteReferenceSource {
     events: Vec<CexReferenceEvent>,
 }
 
-struct RecordingStrategy(Arc<Mutex<Vec<StrategyFact>>>);
+struct RecordingStrategy {
+    facts: Arc<Mutex<Vec<StrategyFact>>>,
+    nonempty_reference_books: Arc<AtomicUsize>,
+}
 
-struct RecordingFactory(Arc<Mutex<Vec<StrategyFact>>>);
+struct RecordingFactory {
+    facts: Arc<Mutex<Vec<StrategyFact>>>,
+    nonempty_reference_books: Arc<AtomicUsize>,
+}
 
 struct FailingStrategy(Arc<AtomicUsize>);
 
@@ -105,14 +111,26 @@ impl LiveCexDataSource for FiniteReferenceSource {
 
 impl Strategy for RecordingStrategy {
     fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
-        record_fact(&self.0, context.fact);
+        if matches!(context.fact, StrategyFact::Reference(_))
+            && (!context.book.bids.is_empty()
+                || !context.book.asks.is_empty()
+                || context.book.last_trade_price.is_some()
+                || context.book.timestamp_ms != 0)
+        {
+            self.nonempty_reference_books
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        record_fact(&self.facts, context.fact);
         Ok(Actions::none())
     }
 }
 
 impl StrategyFactory for RecordingFactory {
     fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
-        Ok(Box::new(RecordingStrategy(Arc::clone(&self.0))))
+        Ok(Box::new(RecordingStrategy {
+            facts: Arc::clone(&self.facts),
+            nonempty_reference_books: Arc::clone(&self.nonempty_reference_books),
+        }))
     }
 }
 
@@ -298,6 +316,7 @@ async fn paper_run_delivers_reference_facts_once_in_causal_order()
     let market = MarketId::new("btc-5m")?;
     let failing_calls = Arc::new(AtomicUsize::new(0));
     let recording_facts = Arc::new(Mutex::new(Vec::new()));
+    let nonempty_reference_books = Arc::new(AtomicUsize::new(0));
     let reference = FiniteReferenceSource {
         events: vec![
             reference_trade(3, 4, 103),
@@ -329,7 +348,10 @@ async fn paper_run_delivers_reference_facts_once_in_causal_order()
     .strategy(StrategyRegistration::new(
         StrategyId::new("recording")?,
         market.clone(),
-        Arc::new(RecordingFactory(Arc::clone(&recording_facts))),
+        Arc::new(RecordingFactory {
+            facts: Arc::clone(&recording_facts),
+            nonempty_reference_books: Arc::clone(&nonempty_reference_books),
+        }),
     ))
     .strategy(StrategyRegistration::new(
         StrategyId::new("buyer")?,
@@ -352,6 +374,7 @@ async fn paper_run_delivers_reference_facts_once_in_causal_order()
 
     // Then: reference facts are ordered once, and one failing key does not stop the recorder.
     assert_eq!(failing_calls.load(Ordering::Relaxed), 4);
+    assert_eq!(nonempty_reference_books.load(Ordering::Relaxed), 0);
     assert_eq!(recording_facts.len(), 4);
     assert!(matches!(
         recording_facts.first(),

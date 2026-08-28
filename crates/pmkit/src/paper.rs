@@ -208,7 +208,7 @@ pub async fn drive_with_control(
     let mut fills = paper.fill_count();
     metrics.set_fills(fills);
     let mut marks = HashMap::new();
-    let mut strategy_books = vec![OrderBookL2::default(); strategies.len()];
+    let empty_book = OrderBookL2::default();
     let mut connection_epochs = HashMap::new();
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     control.emit(RunLifecycleEvent::Started {
@@ -261,14 +261,14 @@ pub async fn drive_with_control(
             let timestamp_ms = match &envelope.fact {
                 CexReferenceEvent::Trade { timestamp_ms, .. } => *timestamp_ms,
             };
-            // CEX facts have no PM market key, so fan them out once in the stable
-            // registration order; each key keeps its own latest PM context.
-            for (index, instance) in strategies.iter_mut().enumerate() {
+            // CEX facts have no PM outcome, so fan them out once with an
+            // explicitly empty book in stable registration order.
+            for instance in &mut *strategies {
                 let positions = paper.positions_for_market(&instance.market);
                 dispatch_strategy(
                     instance,
                     &merged.fact,
-                    &strategy_books[index],
+                    &empty_book,
                     &positions,
                     timestamp_ms,
                     &paper,
@@ -362,17 +362,16 @@ pub async fn drive_with_control(
             fills = paper.fill_count();
             metrics.set_fills(fills);
             let mut actions_placed = 0_u32;
-            for (index, instance) in strategies.iter_mut().enumerate() {
+            for instance in &mut *strategies {
                 if instance.market != *market {
                     continue;
                 }
-                strategy_books[index] = book.clone();
                 let positions = paper.positions_for_market(market);
                 actions_placed = actions_placed.saturating_add(
                     dispatch_strategy(
                         instance,
                         &fact,
-                        &strategy_books[index],
+                        &book,
                         &positions,
                         *timestamp_ms,
                         &paper,
