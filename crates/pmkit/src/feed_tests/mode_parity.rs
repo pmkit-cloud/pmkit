@@ -30,7 +30,11 @@ use tokio::sync::mpsc::Sender;
 
 struct ParitySource;
 
-struct ParityReference;
+struct ParityReference {
+    source_id: &'static str,
+    timestamp_ms: i64,
+    rank: i64,
+}
 
 async fn emit_market(
     market: MarketId,
@@ -84,19 +88,22 @@ impl LiveDataSource for ParitySource {
     }
 }
 
-async fn emit_reference(sink: Sender<SourceSignal>) -> Result<(), DataSourceError> {
+async fn emit_reference(
+    source: &ParityReference,
+    sink: Sender<SourceSignal>,
+) -> Result<(), DataSourceError> {
     sink.send(SourceSignal::Data(Box::new(SourceEnvelope::CexReference(
         CexReferenceEnvelope {
             metadata: StreamMetadata {
                 schema_version: 1,
-                source_id: "binance-parity".into(),
-                source_time_ms: 2_000,
-                canonical_source_rank: 1,
+                source_id: source.source_id.into(),
+                source_time_ms: source.timestamp_ms,
+                canonical_source_rank: source.rank,
                 receipt_time_ms: 2_000,
-                connection_id: "binance-parity".into(),
+                connection_id: source.source_id.into(),
                 connection_epoch: 0,
-                frame_sequence: 9,
-                ingest_sequence: 9,
+                frame_sequence: source.rank,
+                ingest_sequence: source.rank.cast_unsigned(),
             },
             fact: CexReferenceEvent::Trade {
                 asset: Asset::Btc,
@@ -105,7 +112,7 @@ async fn emit_reference(sink: Sender<SourceSignal>) -> Result<(), DataSourceErro
                 price: Decimal::from(42),
                 qty: Decimal::ONE,
                 is_buyer_maker: false,
-                timestamp_ms: 2_000,
+                timestamp_ms: source.timestamp_ms,
             },
         },
     ))))
@@ -126,14 +133,14 @@ impl HistoricalDataSource for ParityReference {
         _query: ReplayQuery,
         sink: Sender<SourceSignal>,
     ) -> Result<(), DataSourceError> {
-        emit_reference(sink).await
+        emit_reference(self, sink).await
     }
 }
 
 #[async_trait]
 impl LiveCexDataSource for ParityReference {
     async fn subscribe_reference(&self, sink: Sender<SourceSignal>) -> Result<(), DataSourceError> {
-        emit_reference(sink).await
+        emit_reference(self, sink).await
     }
 }
 
@@ -219,6 +226,7 @@ fn portable_decision(decision: &CausalDecision) -> Value {
     })
 }
 
+#[expect(clippy::too_many_lines)]
 #[tokio::test]
 async fn actual_modes_observe_identical_facts_and_portable_decisions()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -237,7 +245,19 @@ async fn actual_modes_observe_identical_facts_and_portable_decisions()
             EvidenceRequirement::CorroboratedOnly,
             RetrievalWait::ReturnPending,
         )
-        .reference_source(Arc::new(ParityReference));
+        .reference_source(Arc::new(ParityReference {
+            source_id: "binance-parity",
+            timestamp_ms: 2_000,
+            rank: 1,
+        }))
+        .reference_source_named(
+            "rtds",
+            Arc::new(ParityReference {
+                source_id: "rtds-parity",
+                timestamp_ms: 2_001,
+                rank: 2,
+            }),
+        );
         let backtest_run = BacktestRun::new(
             RunId::new("parity-backtest")?,
             portfolio.clone(),
@@ -255,7 +275,19 @@ async fn actual_modes_observe_identical_facts_and_portable_decisions()
             Arc::new(ParitySource),
             simulation(),
         )
-        .reference_data(Arc::new(ParityReference))
+        .reference_data(Arc::new(ParityReference {
+            source_id: "binance-parity",
+            timestamp_ms: 2_000,
+            rank: 1,
+        }))
+        .reference_data_named(
+            "rtds",
+            Arc::new(ParityReference {
+                source_id: "rtds-parity",
+                timestamp_ms: 2_001,
+                rank: 2,
+            }),
+        )
         .strategy(registration(&paper_facts)?);
         let live_run = LiveRun::new(
             RunId::new("parity-live")?,
@@ -264,7 +296,19 @@ async fn actual_modes_observe_identical_facts_and_portable_decisions()
             Arc::new(ParitySource),
             risk()?,
         )
-        .reference_data(Arc::new(ParityReference))
+        .reference_data(Arc::new(ParityReference {
+            source_id: "binance-parity",
+            timestamp_ms: 2_000,
+            rank: 1,
+        }))
+        .reference_data_named(
+            "rtds",
+            Arc::new(ParityReference {
+                source_id: "rtds-parity",
+                timestamp_ms: 2_001,
+                rank: 2,
+            }),
+        )
         .strategy(registration(&live_facts)?);
 
         // When: each driver persists the fact and its causal decision.
@@ -300,7 +344,11 @@ async fn actual_modes_observe_identical_facts_and_portable_decisions()
         assert_eq!(captured(&live_facts), expected_facts);
         assert!(matches!(
             expected_facts.as_slice(),
-            [StrategyFact::Market(_), StrategyFact::Reference(_)]
+            [
+                StrategyFact::Market(_),
+                StrategyFact::Reference(_),
+                StrategyFact::Reference(_),
+            ]
         ));
         assert_eq!(decisions[1], decisions[0]);
         assert_eq!(decisions[2], decisions[0]);
