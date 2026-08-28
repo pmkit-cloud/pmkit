@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, VecDeque},
     fmt,
     sync::{
         Arc,
@@ -17,7 +18,10 @@ use pmkit_event::{
 };
 use pmkit_market::Outcome;
 use pmkit_store::{OwnerScope, PM_ENVELOPE_VERSION, PmEnvelope, StoreError, TapeStore};
-use polymarket_client_sdk_v2::clob::ws::{BookUpdate, Client, LastTradePrice};
+use polymarket_client_sdk_v2::clob::{
+    types::Side as VenueSide,
+    ws::{BookUpdate, Client, LastTradePrice, PriceChange},
+};
 use polymarket_client_sdk_v2::error::Error as SdkError;
 use polymarket_client_sdk_v2::types::U256;
 use thiserror::Error;
@@ -326,6 +330,10 @@ impl fmt::Debug for PolymarketLiveData {
 
 #[async_trait]
 impl LiveDataSource for PolymarketLiveData {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "market subscription keeps stream merge and cleanup in one lifecycle"
+    )]
     async fn subscribe(
         &self,
         market: MarketId,
@@ -343,27 +351,60 @@ impl LiveDataSource for PolymarketLiveData {
             .subscribe_orderbook(vec![token])
             .map_err(|error| data_error(&error))?;
         subscriptions.add();
+        let prices = self
+            .client
+            .subscribe_prices(vec![token])
+            .map_err(|error| data_error(&error))?;
+        subscriptions.add();
         let trades = self
             .client
             .subscribe_last_trade_price(vec![token])
             .map_err(|error| data_error(&error))?;
         subscriptions.add();
         let mut books = Box::pin(books);
+        let mut prices = Box::pin(prices);
         let mut trades = Box::pin(trades);
+        let mut book = TokenBook::default();
+        let mut pending_prices: VecDeque<PriceChange> = VecDeque::new();
+        let mut pending_events = VecDeque::new();
         let mut sequence = 0;
 
         let result = loop {
+            if let Some(event) = pending_events.pop_front() {
+                let signal = match sequenced_market_signal(&mut sequence, connection_epoch, event) {
+                    Ok(signal) => signal,
+                    Err(error) => break Err(error),
+                };
+                if sink.send(signal).await.is_err() {
+                    break Err(DataSourceError::SinkClosed);
+                }
+                continue;
+            }
             tokio::select! {
                 update = books.next() => match update {
                     Some(Ok(update)) => {
-                        let signal = match sequenced_market_signal(
+                        book.replace(&update, token)?;
+                        let mut events = VecDeque::from([book.event(market.clone(), outcome)]);
+                        let mut previous = book.timestamp_ms;
+                        pending_prices.make_contiguous().sort_unstable_by_key(|change| change.timestamp);
+                        for change in std::mem::take(&mut pending_prices) {
+                            if change.timestamp <= previous {
+                                continue;
+                            }
+                            if book.apply(&change, token)? {
+                                previous = book.timestamp_ms;
+                                events.push_back(book.event(market.clone(), outcome));
+                            }
+                        }
+                        let event = events
+                            .pop_front()
+                            .ok_or_else(|| replay_gap("book snapshot produced no event"))?;
+                        pending_events.extend(events);
+                        let signal = sequenced_market_signal(
                             &mut sequence,
                             connection_epoch,
-                            book_event(market.clone(), outcome, update),
-                        ) {
-                            Ok(signal) => signal,
-                            Err(error) => break Err(error),
-                        };
+                            event,
+                        )?;
                         if sink.send(signal).await.is_err() {
                             break Err(DataSourceError::SinkClosed);
                         }
@@ -371,10 +412,32 @@ impl LiveDataSource for PolymarketLiveData {
                     Some(Err(error)) => break Err(data_error(&error)),
                     None => break Ok(()),
                 },
+                update = prices.next() => match update {
+                    Some(Ok(update)) => {
+                        if !book.initialized {
+                            if pending_prices.len() >= MAX_PENDING_PRICE_CHANGES {
+                                break Err(replay_gap("price changes exceeded pre-snapshot buffer"));
+                            }
+                            pending_prices.push_back(update);
+                            continue;
+                        }
+                        if book.apply(&update, token)? {
+                            let signal = sequenced_market_signal(
+                                &mut sequence,
+                                connection_epoch,
+                                book.event(market.clone(), outcome),
+                            )?;
+                            if sink.send(signal).await.is_err() {
+                                break Err(DataSourceError::SinkClosed);
+                            }
+                        }
+                    }
+                    Some(Err(error)) => break Err(data_error(&error)),
+                    None => break Ok(()),
+                },
                 update = trades.next() => match update {
                     Some(Ok(update)) => {
-                        if let Some(event) = trade_event(market.clone(), outcome, &update)
-                        {
+                        if let Some(event) = trade_event(market.clone(), outcome, &update) {
                             let signal = match sequenced_market_signal(
                                 &mut sequence,
                                 connection_epoch,
@@ -395,10 +458,114 @@ impl LiveDataSource for PolymarketLiveData {
         };
 
         drop(books);
+        drop(prices);
         drop(trades);
         let cleanup = subscriptions.close();
         result?;
         cleanup
+    }
+}
+
+const MAX_PENDING_PRICE_CHANGES: usize = 1_024;
+
+#[derive(Debug, Default)]
+struct TokenBook {
+    bids: BTreeMap<rust_decimal::Decimal, rust_decimal::Decimal>,
+    asks: BTreeMap<rust_decimal::Decimal, rust_decimal::Decimal>,
+    timestamp_ms: i64,
+    initialized: bool,
+}
+
+impl TokenBook {
+    fn replace(&mut self, update: &BookUpdate, token: U256) -> Result<(), DataSourceError> {
+        if update.asset_id != token {
+            return Err(replay_gap("book snapshot has the wrong asset id"));
+        }
+        if self.initialized && update.timestamp < self.timestamp_ms {
+            return Err(replay_gap("stale book snapshot"));
+        }
+        self.bids = levels(&update.bids)?;
+        self.asks = levels(&update.asks)?;
+        self.timestamp_ms = update.timestamp;
+        self.initialized = true;
+        Ok(())
+    }
+
+    fn apply(&mut self, update: &PriceChange, token: U256) -> Result<bool, DataSourceError> {
+        if !self.initialized {
+            return Err(replay_gap("price change before initial book snapshot"));
+        }
+        if update.timestamp < self.timestamp_ms {
+            return Err(replay_gap("stale price change"));
+        }
+        let mut matched = false;
+        for change in update
+            .price_changes
+            .iter()
+            .filter(|change| change.asset_id == token)
+        {
+            matched = true;
+            let size = change
+                .size
+                .ok_or_else(|| replay_gap("price change lacks size"))?;
+            if size.is_sign_negative() {
+                return Err(replay_gap("price change has negative size"));
+            }
+            let target_levels = match change.side {
+                VenueSide::Buy => &mut self.bids,
+                VenueSide::Sell => &mut self.asks,
+                _ => return Err(replay_gap("price change has unknown side")),
+            };
+            if size.is_zero() {
+                target_levels.remove(&change.price);
+            } else {
+                target_levels.insert(change.price, size);
+            }
+        }
+        if matched {
+            self.timestamp_ms = update.timestamp;
+        }
+        Ok(matched)
+    }
+
+    fn event(&self, market: MarketId, outcome: Outcome) -> MarketEvent {
+        MarketEvent::BookUpdate {
+            market,
+            outcome,
+            bids: self
+                .bids
+                .iter()
+                .rev()
+                .map(|(price, size)| (*price, *size))
+                .collect(),
+            asks: self
+                .asks
+                .iter()
+                .map(|(price, size)| (*price, *size))
+                .collect(),
+            timestamp_ms: self.timestamp_ms,
+        }
+    }
+}
+
+fn levels(
+    levels: &[polymarket_client_sdk_v2::clob::ws::types::response::OrderBookLevel],
+) -> Result<BTreeMap<rust_decimal::Decimal, rust_decimal::Decimal>, DataSourceError> {
+    let mut result = BTreeMap::new();
+    for level in levels {
+        if level.size.is_sign_negative() {
+            return Err(replay_gap("book snapshot has negative size"));
+        }
+        if !level.size.is_zero() {
+            result.insert(level.price, level.size);
+        }
+    }
+    Ok(result)
+}
+
+fn replay_gap(message: &str) -> DataSourceError {
+    DataSourceError::ReplayGap {
+        message: message.to_owned(),
     }
 }
 
@@ -534,7 +701,7 @@ mod tests {
     use async_trait::async_trait;
     use pmkit_book::Side;
     use pmkit_core::{MarketId, PortfolioId, RunId};
-    use pmkit_data::{RawPmAccountFrame, RawPmMarketFrame, SourceSignal};
+    use pmkit_data::{DataSourceError, RawPmAccountFrame, RawPmMarketFrame, SourceSignal};
     use pmkit_event::{MarketEvent, PmAccountEvent, SourceEnvelope, StreamMetadata};
 
     use pmkit_market::Outcome;
@@ -542,12 +709,15 @@ mod tests {
         CausalDecision, CausalIdentity, IntentOutcome, OwnerScope, PmEnvelope, ReplayCursor,
         ReplayPage, StoreError, TapeStore, TursoTapeStore,
     };
-    use polymarket_client_sdk_v2::clob::ws::{BookUpdate, LastTradePrice};
+    use polymarket_client_sdk_v2::{
+        clob::ws::{BookUpdate, LastTradePrice, PriceChange},
+        types::U256,
+    };
     use rust_decimal::Decimal;
 
     use super::{
-        RawFrameAdapterError, RawPolymarketFrameAdapter, book_event, next_connection_epoch,
-        sequenced_market_signal, trade_event,
+        RawFrameAdapterError, RawPolymarketFrameAdapter, TokenBook, book_event,
+        next_connection_epoch, sequenced_market_signal, trade_event,
     };
 
     fn metadata(sequence: i64) -> StreamMetadata {
@@ -614,6 +784,80 @@ mod tests {
         assert_eq!(side, Side::Buy);
         assert_eq!(size, Decimal::from(4));
         assert_eq!(timestamp_ms, 43);
+        Ok(())
+    }
+
+    #[test]
+    fn price_change_batches_keep_complementary_books_isolated()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let market = MarketId::new("btc-15m")?;
+        let up_token = U256::from(1_u64);
+        let down_token = U256::from(2_u64);
+        let up_snapshot: BookUpdate = serde_json::from_str(
+            r#"{"asset_id":"1","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"42","bids":[{"price":"0.49","size":"2"}],"asks":[{"price":"0.51","size":"3"}]}"#,
+        )?;
+        let down_snapshot: BookUpdate = serde_json::from_str(
+            r#"{"asset_id":"2","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"42","bids":[{"price":"0.98","size":"2"}],"asks":[{"price":"0.99","size":"3"}]}"#,
+        )?;
+        let batch: PriceChange = serde_json::from_str(
+            r#"{"event_type":"price_change","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"43","price_changes":[{"asset_id":"1","price":"0.49","size":"0","side":"BUY"},{"asset_id":"1","price":"0.52","size":"4","side":"SELL"},{"asset_id":"2","price":"0.01","size":"5","side":"SELL"}]}"#,
+        )?;
+        let mut up = TokenBook::default();
+        let mut down = TokenBook::default();
+        up.replace(&up_snapshot, up_token)?;
+        down.replace(&down_snapshot, down_token)?;
+
+        assert!(up.apply(&batch, up_token)?);
+        assert!(down.apply(&batch, down_token)?);
+        let MarketEvent::BookUpdate {
+            bids: up_bids,
+            asks: up_asks,
+            ..
+        } = up.event(market.clone(), Outcome::Up)
+        else {
+            return Err("expected UP book".into());
+        };
+        let MarketEvent::BookUpdate {
+            bids: down_bids,
+            asks: down_asks,
+            ..
+        } = down.event(market, Outcome::Down)
+        else {
+            return Err("expected DOWN book".into());
+        };
+        assert!(up_bids.is_empty());
+        assert_eq!(up_asks[0], (Decimal::new(51, 2), Decimal::from(3)));
+        assert_eq!(up_asks[1], (Decimal::new(52, 2), Decimal::from(4)));
+        assert_eq!(down_bids, vec![(Decimal::new(98, 2), Decimal::from(2))]);
+        assert_eq!(down_asks[0], (Decimal::new(1, 2), Decimal::from(5)));
+        assert!(
+            !up_asks
+                .iter()
+                .any(|(price, _)| *price == Decimal::new(1, 2))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn price_change_requires_a_snapshot_and_monotonic_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let token = U256::from(1_u64);
+        let snapshot: BookUpdate = serde_json::from_str(
+            r#"{"asset_id":"1","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"42","bids":[],"asks":[]}"#,
+        )?;
+        let stale: PriceChange = serde_json::from_str(
+            r#"{"event_type":"price_change","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"41","price_changes":[{"asset_id":"1","price":"0.5","size":"1","side":"BUY"}]}"#,
+        )?;
+        let mut book = TokenBook::default();
+        assert!(matches!(
+            book.apply(&stale, token),
+            Err(DataSourceError::ReplayGap { .. })
+        ));
+        book.replace(&snapshot, token)?;
+        assert!(matches!(
+            book.apply(&stale, token),
+            Err(DataSourceError::ReplayGap { .. })
+        ));
         Ok(())
     }
 
