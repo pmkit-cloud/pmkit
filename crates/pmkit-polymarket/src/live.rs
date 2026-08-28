@@ -558,25 +558,33 @@ fn reconcile_reported_top(
     let best_bid = changes.iter().rev().find_map(|change| change.best_bid);
     let best_ask = changes.iter().rev().find_map(|change| change.best_ask);
     if let Some(best_bid) = best_bid {
-        if best_bid <= rust_decimal::Decimal::ZERO || best_bid > rust_decimal::Decimal::ONE {
-            return Err(replay_gap("reported best bid is outside (0, 1]"));
+        if best_bid < rust_decimal::Decimal::ZERO || best_bid > rust_decimal::Decimal::ONE {
+            return Err(replay_gap("reported best bid is outside [0, 1]"));
         }
-        bids.retain(|price, _| *price <= best_bid);
-        if bids.last_key_value().map(|(price, _)| *price) != Some(best_bid) {
-            return Err(replay_gap(
-                "reported best bid is absent from reconstructed depth",
-            ));
+        if best_bid.is_zero() {
+            bids.clear();
+        } else {
+            bids.retain(|price, _| *price <= best_bid);
+            if bids.last_key_value().map(|(price, _)| *price) != Some(best_bid) {
+                return Err(replay_gap(
+                    "reported best bid is absent from reconstructed depth",
+                ));
+            }
         }
     }
     if let Some(best_ask) = best_ask {
-        if best_ask <= rust_decimal::Decimal::ZERO || best_ask > rust_decimal::Decimal::ONE {
-            return Err(replay_gap("reported best ask is outside (0, 1]"));
+        if best_ask < rust_decimal::Decimal::ZERO || best_ask > rust_decimal::Decimal::ONE {
+            return Err(replay_gap("reported best ask is outside [0, 1]"));
         }
-        asks.retain(|price, _| *price >= best_ask);
-        if asks.first_key_value().map(|(price, _)| *price) != Some(best_ask) {
-            return Err(replay_gap(
-                "reported best ask is absent from reconstructed depth",
-            ));
+        if best_ask.is_zero() {
+            asks.clear();
+        } else {
+            asks.retain(|price, _| *price >= best_ask);
+            if asks.first_key_value().map(|(price, _)| *price) != Some(best_ask) {
+                return Err(replay_gap(
+                    "reported best ask is absent from reconstructed depth",
+                ));
+            }
         }
     }
     Ok(())
@@ -976,6 +984,11 @@ mod tests {
             book.asks.first_key_value().map(|(price, _)| *price),
             Some(Decimal::new(42, 2))
         );
+        let empty_bid: PriceChange = serde_json::from_str(
+            r#"{"event_type":"price_change","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"44","price_changes":[{"asset_id":"1","price":"0.41","size":"0","side":"BUY","best_bid":"0","best_ask":"0.42"}]}"#,
+        )?;
+        assert!(book.apply(&empty_bid, token)?);
+        assert!(book.bids.is_empty());
         Ok(())
     }
 
