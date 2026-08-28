@@ -3905,7 +3905,7 @@ dependencies = [
 [[package]]
 name = "polymarket_client_sdk_v2"
 version = "0.7.0"
-source = "git+https://github.com/yovanoc/rs-clob-client-v2?rev=868bbfcad98f1deea233aebfeff46945f0c4c526#868bbfcad98f1deea233aebfeff46945f0c4c526"
+source = "git+https://github.com/yovanoc/rs-clob-client-v2?rev=7997eef5921a34bb08fdaef0ec68a50dbfde2ec6#7997eef5921a34bb08fdaef0ec68a50dbfde2ec6"
 dependencies = [
  "alloy",
  "async-stream",

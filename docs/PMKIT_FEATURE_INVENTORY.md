@@ -206,6 +206,8 @@ repository, not the long-term target.
 - Store-before-adapt behavior.
 - Historical cursor source backed by stored PM envelopes.
 - Gamma SDK client in `pmkit-api` for market metadata and token/outcome helpers.
+- Typed Chainlink 60-second TWAP SDK subscription normalized into strict PMKit
+  evidence; the live source retains no raw wire bytes.
 
 **Crates:** `pmkit-polymarket`, `pmkit-api`.
 

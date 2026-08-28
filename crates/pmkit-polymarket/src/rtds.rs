@@ -16,9 +16,10 @@ use pmkit_event::{
     PolymarketReferenceEnvelope, PolymarketTwapEvent, SourceEnvelope, StreamMetadata,
 };
 use pmkit_market::Asset;
-use polymarket_client_sdk_v2::rtds::{Client, RtdsMessage, Subscription};
+use polymarket_client_sdk_v2::rtds::{ChainlinkTwapPrice, ChainlinkTwapWindow, Client};
 use polymarket_client_sdk_v2::ws::connection::ConnectionState;
-use serde_json::{Map, Value, json};
+use rust_decimal::prelude::ToPrimitive;
+use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 
@@ -115,33 +116,27 @@ fn parse_polymarket_rtds_twap_value(
         .and_then(Value::as_object)
         .ok_or(PolymarketRtdsParseError::InvalidShape)?;
     let symbol = string_field(payload, "symbol")?.to_owned();
-    if symbol != format!("{asset}/usd") {
-        return Err(PolymarketRtdsParseError::WrongSymbol);
-    }
     let timestamp_ms = timestamp_field(payload, "timestamp")?;
     let window_s = payload
         .get("window_s")
-        .and_then(Value::as_u64)
-        .filter(|window| *window == 60)
+        .and_then(Value::as_i64)
         .ok_or(PolymarketRtdsParseError::InvalidWindow)?;
     let display_value = payload
         .get("value")
         .and_then(Value::as_number)
         .and_then(serde_json::Number::as_f64)
-        .filter(|number| number.is_finite() && *number > 0.0)
         .ok_or(PolymarketRtdsParseError::InvalidValue)?;
     let full_accuracy_value = string_field(payload, "full_accuracy_value")?.to_owned();
-    validate_full_accuracy_value(&full_accuracy_value)?;
 
-    Ok(PolymarketTwapEvent {
+    validate_twap_fields(
         asset,
         symbol,
         timestamp_ms,
         provider_timestamp_ms,
-        value: display_value,
+        display_value,
         full_accuracy_value,
         window_s,
-    })
+    )
 }
 
 fn string_field<'a>(
@@ -167,6 +162,40 @@ fn timestamp_field(
         .ok_or(PolymarketRtdsParseError::InvalidTimestamp)
 }
 
+fn validate_twap_fields(
+    asset: Asset,
+    symbol: String,
+    timestamp_ms: i64,
+    provider_timestamp_ms: i64,
+    display_value: f64,
+    full_accuracy_value: String,
+    window_s: i64,
+) -> Result<PolymarketTwapEvent, PolymarketRtdsParseError> {
+    if symbol != format!("{asset}/usd") {
+        return Err(PolymarketRtdsParseError::WrongSymbol);
+    }
+    if timestamp_ms < 0 || provider_timestamp_ms < 0 {
+        return Err(PolymarketRtdsParseError::InvalidTimestamp);
+    }
+    if window_s != 60 {
+        return Err(PolymarketRtdsParseError::InvalidWindow);
+    }
+    if !display_value.is_finite() || display_value <= 0.0 {
+        return Err(PolymarketRtdsParseError::InvalidValue);
+    }
+    validate_full_accuracy_value(&full_accuracy_value)?;
+
+    Ok(PolymarketTwapEvent {
+        asset,
+        symbol,
+        timestamp_ms,
+        provider_timestamp_ms,
+        value: display_value,
+        full_accuracy_value,
+        window_s: 60,
+    })
+}
+
 fn validate_full_accuracy_value(value: &str) -> Result<(), PolymarketRtdsParseError> {
     let digits = value.strip_prefix('-').unwrap_or(value);
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -176,6 +205,25 @@ fn validate_full_accuracy_value(value: &str) -> Result<(), PolymarketRtdsParseEr
         return Err(PolymarketRtdsParseError::InvalidFullAccuracyValue);
     }
     Ok(())
+}
+
+fn chainlink_twap_price_to_event(
+    price: ChainlinkTwapPrice,
+    asset: Asset,
+) -> Result<PolymarketTwapEvent, PolymarketRtdsParseError> {
+    let display_value = price
+        .value
+        .to_f64()
+        .ok_or(PolymarketRtdsParseError::InvalidValue)?;
+    validate_twap_fields(
+        asset,
+        price.symbol,
+        price.timestamp,
+        price.provider_timestamp_ms,
+        display_value,
+        price.full_accuracy_value,
+        price.window_s,
+    )
 }
 
 /// A live credential-free Polymarket RTDS 60-second TWAP source.
@@ -217,9 +265,9 @@ impl PolymarketRtdsLive {
     /// envelopes until the stream ends.
     ///
     /// The SDK owns connection setup, heartbeat, reconnection, and
-    /// subscription management. Its `subscribe_raw` stream contains parsed
-    /// messages, so `PMKit` deliberately does not expose a lossless wire frame.
-    /// The raw SDK adapter remains live-only because upstream PR #105 discards `full_accuracy_value`.
+    /// subscription management. Its typed `ChainlinkTwapPrice` stream is
+    /// converted through `PMKit`'s strict semantic validator into normalized
+    /// evidence; this source does not retain raw wire bytes.
     ///
     /// # Errors
     ///
@@ -235,14 +283,14 @@ impl PolymarketRtdsLive {
             polymarket_client_sdk_v2::ws::config::Config::default(),
         )
         .map_err(|error| unavailable(format!("Polymarket RTDS client failed: {error}")))?;
-        let subscription = Subscription::builder()
-            .topic(POLYMARKET_RTDS_TOPIC.to_owned())
-            .msg_type("*".to_owned())
-            .filters(format!(r#"{{"symbol":"{}/usd"}}"#, self.asset))
-            .build();
-        let stream = client.subscribe_raw(subscription).map_err(|error| {
-            unavailable(format!("Polymarket RTDS subscription failed: {error}"))
-        })?;
+        let stream = client
+            .subscribe_chainlink_twap_prices(
+                Some(format!("{}/usd", self.asset)),
+                ChainlinkTwapWindow::SixtySeconds,
+            )
+            .map_err(|error| {
+                unavailable(format!("Polymarket RTDS subscription failed: {error}"))
+            })?;
         let mut stream = Box::pin(stream);
         let mut connection_since = None;
         let mut connection_epoch = 0_i64;
@@ -256,7 +304,7 @@ impl PolymarketRtdsLive {
                     let Some(message) = message else {
                         return Err(unavailable("Polymarket RTDS stream ended"));
                     };
-                    let message = message
+                    let price = message
                         .map_err(|error| unavailable(format!("Polymarket RTDS stream failed: {error}")))?;
                     update_connection_identity(
                         &client,
@@ -270,7 +318,7 @@ impl PolymarketRtdsLive {
                     ingest_sequence = ingest_sequence
                         .checked_add(1)
                         .ok_or_else(|| replay_gap("Polymarket RTDS ingest sequence overflow"))?;
-                    let fact = parse_sdk_message(&message, self.asset)
+                    let fact = chainlink_twap_price_to_event(price, self.asset)
                         .map_err(|error| replay_gap(format!("invalid Polymarket RTDS update: {error}")))?;
                     sink.send(SourceSignal::Data(Box::new(SourceEnvelope::PolymarketReference(
                         PolymarketReferenceEnvelope {
@@ -301,19 +349,6 @@ impl LiveCexDataSource for PolymarketRtdsLive {
     async fn subscribe_reference(&self, sink: Sender<SourceSignal>) -> Result<(), DataSourceError> {
         Self::subscribe_reference(self, sink).await
     }
-}
-
-fn parse_sdk_message(
-    message: &RtdsMessage,
-    asset: Asset,
-) -> Result<PolymarketTwapEvent, PolymarketRtdsParseError> {
-    let value = json!({
-        "topic": &message.topic,
-        "type": &message.msg_type,
-        "timestamp": message.timestamp,
-        "payload": &message.payload,
-    });
-    parse_polymarket_rtds_twap_value(&value, asset)
 }
 
 fn update_connection_identity(
@@ -361,8 +396,13 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{POLYMARKET_RTDS_TOPIC, PolymarketRtdsParseError, parse_polymarket_rtds_twap};
+    use super::{
+        POLYMARKET_RTDS_TOPIC, PolymarketRtdsParseError, chainlink_twap_price_to_event,
+        parse_polymarket_rtds_twap,
+    };
     use pmkit_market::Asset;
+    use polymarket_client_sdk_v2::rtds::ChainlinkTwapPrice;
+    use rust_decimal::Decimal;
 
     const MESSAGE: &str = r#"{"topic":"crypto_prices_twap_sixty","payload":{"symbol":"btc/usd","timestamp":1785178800000,"value":65000.5,"full_accuracy_value":"65000500000000000000000","window_s":60},"timestamp":1785178800123,"type":"update"}"#;
 
@@ -378,6 +418,55 @@ mod tests {
         assert_eq!(event.full_accuracy_value, "65000500000000000000000");
         assert_eq!(event.window_s, 60);
         Ok(())
+    }
+
+    fn typed_price() -> ChainlinkTwapPrice {
+        ChainlinkTwapPrice::builder()
+            .symbol("btc/usd".to_owned())
+            .timestamp(1_785_178_800_000)
+            .value(Decimal::new(6_500_051_234, 5))
+            .full_accuracy_value("65000512340000000000000".to_owned())
+            .provider_timestamp_ms(1_785_178_800_123)
+            .window_s(60)
+            .build()
+    }
+
+    #[test]
+    fn typed_conversion_preserves_exact_provider_and_display_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let event = chainlink_twap_price_to_event(typed_price(), Asset::Btc)?;
+        assert_eq!(event.asset, Asset::Btc);
+        assert_eq!(event.symbol, "btc/usd");
+        assert_eq!(event.timestamp_ms, 1_785_178_800_000);
+        assert_eq!(event.provider_timestamp_ms, 1_785_178_800_123);
+        assert_eq!(event.value.to_string(), "65000.51234");
+        assert_eq!(event.full_accuracy_value, "65000512340000000000000");
+        assert_eq!(event.window_s, 60);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_conversion_rejects_wrong_symbol_window_and_precision() {
+        let mut wrong_symbol = typed_price();
+        wrong_symbol.symbol = "eth/usd".to_owned();
+        assert!(matches!(
+            chainlink_twap_price_to_event(wrong_symbol, Asset::Btc),
+            Err(PolymarketRtdsParseError::WrongSymbol)
+        ));
+
+        let mut wrong_window = typed_price();
+        wrong_window.window_s = 30;
+        assert!(matches!(
+            chainlink_twap_price_to_event(wrong_window, Asset::Btc),
+            Err(PolymarketRtdsParseError::InvalidWindow)
+        ));
+
+        let mut wrong_precision = typed_price();
+        wrong_precision.full_accuracy_value = "65000.51234".to_owned();
+        assert!(matches!(
+            chainlink_twap_price_to_event(wrong_precision, Asset::Btc),
+            Err(PolymarketRtdsParseError::InvalidFullAccuracyValue)
+        ));
     }
 
     #[test]
