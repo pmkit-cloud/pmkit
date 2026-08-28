@@ -14,6 +14,9 @@ use pmkit_market::Outcome;
 use pmkit_runtime::{LiveOrderPolicy, StrategyRegistration};
 use pmkit_spec::LiveRun;
 use pmkit_store::{OwnerScope, TapeStore, TursoTapeStore};
+use pmkit_strategy::{
+    Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
+};
 use rust_decimal::Decimal;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
@@ -220,6 +223,69 @@ struct LiveWithDuplicatePartialFill;
 
 struct MismatchedAccountSource;
 
+struct LiveWithCancel;
+
+struct CancelAfterPlace {
+    seen: usize,
+}
+
+struct CancelAfterPlaceFactory;
+
+impl Strategy for CancelAfterPlace {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        self.seen += 1;
+        if self.seen == 1 {
+            Ok(Actions::place(PlaceOrder {
+                market: context.market.clone(),
+                outcome: Outcome::Up,
+                side: Side::Buy,
+                price: Decimal::new(45, 2),
+                qty: Decimal::ONE,
+                post_only: true,
+                tif: pmkit_exec::TimeInForce::Gtc,
+            }))
+        } else {
+            Ok(Actions::cancel_all())
+        }
+    }
+}
+
+impl StrategyFactory for CancelAfterPlaceFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(CancelAfterPlace { seen: 0 }))
+    }
+}
+
+#[async_trait]
+impl LiveDataSource for LiveWithCancel {
+    async fn subscribe(
+        &self,
+        market: MarketId,
+        outcome: Outcome,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        if outcome == Outcome::Up {
+            for timestamp_ms in [1, 2] {
+                sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
+                    market: market.clone(),
+                    outcome,
+                    bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+                    asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
+                    timestamp_ms,
+                }))
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)?;
+            }
+        }
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
 #[async_trait]
 impl LiveAccountDataSource for MismatchedAccountSource {
     async fn subscribe_account(
@@ -392,6 +458,31 @@ fn live_run() -> Result<LiveRun, Box<dyn std::error::Error>> {
         MarketId::new("btc-5m")?,
         Arc::new(BuyFactory),
     )))
+}
+
+#[tokio::test]
+async fn live_cancel_all_only_cancels_strategy_orders() -> Result<(), Box<dyn std::error::Error>> {
+    let executor = Arc::new(ShutdownExec::default());
+    let run = LiveRun::new(
+        RunId::new("live-cancel-action")?,
+        PortfolioId::new("alice")?,
+        Arc::clone(&executor) as Arc<dyn Executor>,
+        Arc::new(LiveWithCancel),
+        risk()?,
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("cancel-maker")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(CancelAfterPlaceFactory),
+    ));
+
+    let mut runtime = config()?;
+    runtime.shutdown.live_orders = LiveOrderPolicy::Leave;
+    live::drive(&run, &runtime).await?;
+
+    assert_eq!(executor.cancels.load(Ordering::Relaxed), 1);
+    assert_eq!(executor.cancel_all_calls.load(Ordering::Relaxed), 0);
+    Ok(())
 }
 
 #[tokio::test]
