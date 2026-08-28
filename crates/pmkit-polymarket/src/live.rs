@@ -458,7 +458,7 @@ impl TokenBook {
         validate_book(&bids, &asks)?;
         self.bids = bids;
         self.asks = asks;
-        self.timestamp_ms = update.timestamp;
+        self.timestamp_ms = self.timestamp_ms.max(update.timestamp);
         self.initialized = true;
         Ok(true)
     }
@@ -508,7 +508,7 @@ impl TokenBook {
         validate_book(&bids, &asks)?;
         self.bids = bids;
         self.asks = asks;
-        self.timestamp_ms = update.timestamp;
+        self.timestamp_ms = self.timestamp_ms.max(update.timestamp);
         Ok(true)
     }
 
@@ -666,6 +666,9 @@ fn market_event(
             .map(|matched| matched.then(|| book.event(market.clone(), outcome))),
         WsMessage::LastTradePrice(update) if update.asset_id == token => {
             if !book.initialized {
+                return Ok(None);
+            }
+            if update.timestamp < book.timestamp_ms {
                 return Ok(None);
             }
             trade_event(market.clone(), outcome, &update)
@@ -1009,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn token_book_accepts_ordered_messages_with_independent_times()
+    fn token_book_ignores_stale_trade_and_keeps_monotonic_time()
     -> Result<(), Box<dyn std::error::Error>> {
         let token = U256::from(1_u64);
         let market = MarketId::new("btc-5m")?;
@@ -1042,7 +1045,7 @@ mod tests {
                 &mut book,
                 WsMessage::LastTradePrice(regressed_trade),
             )?
-            .is_some()
+            .is_none()
         );
 
         let crossed: PriceChange = serde_json::from_str(
@@ -1058,6 +1061,7 @@ mod tests {
             r#"{"event_type":"price_change","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"41","price_changes":[{"asset_id":"1","price":"0.48","size":"1","side":"BUY"}]}"#,
         )?;
         assert!(book.apply(&regressed, token)?);
+        assert_eq!(book.timestamp_ms, 42);
         Ok(())
     }
 
