@@ -483,11 +483,12 @@ impl TokenBook {
 
         let mut bids = self.bids.clone();
         let mut asks = self.asks.clone();
-        for change in update
+        let matching = update
             .price_changes
             .iter()
             .filter(|change| change.asset_id == token)
-        {
+            .collect::<Vec<_>>();
+        for change in &matching {
             if change.price <= rust_decimal::Decimal::ZERO
                 || change.price > rust_decimal::Decimal::ONE
             {
@@ -510,6 +511,7 @@ impl TokenBook {
                 target_levels.insert(change.price, size);
             }
         }
+        reconcile_reported_top(&mut bids, &mut asks, &matching)?;
         validate_book(&bids, &asks)?;
         self.bids = bids;
         self.asks = asks;
@@ -553,6 +555,38 @@ fn levels(
         }
     }
     Ok(result)
+}
+
+fn reconcile_reported_top(
+    bids: &mut BTreeMap<rust_decimal::Decimal, rust_decimal::Decimal>,
+    asks: &mut BTreeMap<rust_decimal::Decimal, rust_decimal::Decimal>,
+    changes: &[&polymarket_client_sdk_v2::clob::ws::types::response::PriceChangeBatchEntry],
+) -> Result<(), DataSourceError> {
+    let best_bid = changes.iter().rev().find_map(|change| change.best_bid);
+    let best_ask = changes.iter().rev().find_map(|change| change.best_ask);
+    if let Some(best_bid) = best_bid {
+        if best_bid <= rust_decimal::Decimal::ZERO || best_bid > rust_decimal::Decimal::ONE {
+            return Err(replay_gap("reported best bid is outside (0, 1]"));
+        }
+        bids.retain(|price, _| *price <= best_bid);
+        if bids.last_key_value().map(|(price, _)| *price) != Some(best_bid) {
+            return Err(replay_gap(
+                "reported best bid is absent from reconstructed depth",
+            ));
+        }
+    }
+    if let Some(best_ask) = best_ask {
+        if best_ask <= rust_decimal::Decimal::ZERO || best_ask > rust_decimal::Decimal::ONE {
+            return Err(replay_gap("reported best ask is outside (0, 1]"));
+        }
+        asks.retain(|price, _| *price >= best_ask);
+        if asks.first_key_value().map(|(price, _)| *price) != Some(best_ask) {
+            return Err(replay_gap(
+                "reported best ask is absent from reconstructed depth",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_book(
@@ -922,6 +956,30 @@ mod tests {
         )?;
         assert!(!book.apply(&complement_only, token)?);
         assert_eq!(book.timestamp_ms, 43);
+        Ok(())
+    }
+
+    #[test]
+    fn token_book_uses_reported_top_to_prune_stale_levels() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let token = U256::from(1_u64);
+        let snapshot: BookUpdate = serde_json::from_str(
+            r#"{"asset_id":"1","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"42","bids":[{"price":"0.41","size":"2"},{"price":"0.43","size":"1"}],"asks":[{"price":"0.44","size":"3"}]}"#,
+        )?;
+        let batch: PriceChange = serde_json::from_str(
+            r#"{"event_type":"price_change","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"43","price_changes":[{"asset_id":"1","price":"0.42","size":"4","side":"SELL","best_bid":"0.41","best_ask":"0.42"}]}"#,
+        )?;
+        let mut book = TokenBook::default();
+        book.replace(&snapshot, token)?;
+        assert!(book.apply(&batch, token)?);
+        assert_eq!(
+            book.bids.last_key_value().map(|(price, _)| *price),
+            Some(Decimal::new(41, 2))
+        );
+        assert_eq!(
+            book.asks.first_key_value().map(|(price, _)| *price),
+            Some(Decimal::new(42, 2))
+        );
         Ok(())
     }
 
