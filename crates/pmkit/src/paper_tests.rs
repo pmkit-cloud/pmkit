@@ -1,5 +1,5 @@
 use crate::{
-    Pmkit, RunReport,
+    Cancellation, Pmkit, RunControl, RunLifecycleEvent, RunReport,
     test_support::{BuyFactory, config, risk},
 };
 use async_trait::async_trait;
@@ -29,6 +29,8 @@ use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
 struct ScriptedLive;
+
+struct IdleLive;
 
 struct StaleMarkLive;
 
@@ -190,6 +192,18 @@ impl LiveAccountDataSource for MismatchedAccountSource {
         sink.send(SourceSignal::Eof)
             .await
             .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+#[async_trait]
+impl LiveDataSource for IdleLive {
+    async fn subscribe(
+        &self,
+        _market: MarketId,
+        _outcome: Outcome,
+        _sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        std::future::pending::<Result<(), DataSourceError>>().await
     }
 }
 
@@ -589,5 +603,53 @@ async fn default_fee_unchanged() -> Result<(), Box<dyn std::error::Error>> {
     // Then: the durable fill fee exactly matches the legacy Crypto calculation.
     assert_eq!(fill.payload["event"]["fee"], "0.17388");
     drop(store);
+    Ok(())
+}
+
+#[tokio::test]
+async fn paper_driver_cancellation_wakes_without_an_event() -> Result<(), Box<dyn std::error::Error>>
+{
+    let run = PaperRun::new(
+        RunId::new("paper-idle-cancel")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        risk()?,
+        Arc::new(IdleLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(BuyFactory),
+    ));
+    let cancellation = Cancellation::new();
+    let (subscriber, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let control = RunControl {
+        cancel: Some(cancellation.clone()),
+        subscriber: Some(subscriber),
+        metrics: None,
+    };
+    let task =
+        tokio::spawn(async move { crate::paper::drive_with_control(&run, None, &control).await });
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await?
+            .ok_or("missing started event")?,
+        RunLifecycleEvent::Started { .. }
+    ));
+    cancellation.cancel();
+    let report = tokio::time::timeout(Duration::from_secs(1), task).await???;
+    assert_eq!(report.events_processed, 0);
+    assert!(matches!(
+        events.recv().await,
+        Some(RunLifecycleEvent::Cancelled { .. })
+    ));
     Ok(())
 }

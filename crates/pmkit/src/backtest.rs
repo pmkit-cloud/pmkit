@@ -61,7 +61,7 @@ pub async fn drive_with_control(
         Some(run.replay().to().timestamp_millis()),
     )
     .with_metrics(metrics.clone());
-    let replay = tokio::spawn(async move { feed.forward(tx).await });
+    let replay = feed.spawn(tx, control.cancellation());
 
     // ponytail: fee category fixed to Crypto; positions tracked from fills.
     let simulation = run.simulation();
@@ -85,6 +85,7 @@ pub async fn drive_with_control(
         run: run.id().clone(),
     });
     if control.is_cancelled() {
+        replay.abort().await;
         control.emit(RunLifecycleEvent::Cancelled {
             run: run.id().clone(),
         });
@@ -100,6 +101,7 @@ pub async fn drive_with_control(
 
     while let Some(merged) = rx.recv().await {
         if control.is_cancelled() {
+            replay.abort().await;
             control.emit(RunLifecycleEvent::Cancelled {
                 run: run.id().clone(),
             });
@@ -211,6 +213,7 @@ pub async fn drive_with_control(
     }
 
     replay
+        .join()
         .await
         .map_err(|error| StartError::Source {
             run: run.id().clone(),
@@ -222,8 +225,15 @@ pub async fn drive_with_control(
             run: run.id().clone(),
             source,
         })?;
-    control.emit(RunLifecycleEvent::Completed {
-        run: run.id().clone(),
+    let cancelled = control.is_cancelled();
+    control.emit(if cancelled {
+        RunLifecycleEvent::Cancelled {
+            run: run.id().clone(),
+        }
+    } else {
+        RunLifecycleEvent::Completed {
+            run: run.id().clone(),
+        }
     });
     let metrics = metrics.snapshot();
     Ok(BacktestReport {

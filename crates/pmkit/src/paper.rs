@@ -204,7 +204,7 @@ pub async fn drive_with_control(
         ));
     }
     let feed = MergedFeed::from_tasks(FeedMode::Paper, sources, None).with_metrics(metrics.clone());
-    let merge = tokio::spawn(async move { feed.forward(event_tx).await });
+    let merge = feed.spawn(event_tx, control.cancellation());
 
     let mut fills = paper.fill_count();
     metrics.set_fills(fills);
@@ -216,6 +216,7 @@ pub async fn drive_with_control(
         run: run.id().clone(),
     });
     if control.is_cancelled() {
+        merge.abort().await;
         control.emit(RunLifecycleEvent::Cancelled {
             run: run.id().clone(),
         });
@@ -231,6 +232,7 @@ pub async fn drive_with_control(
 
     while let Some(merged) = event_rx.recv().await {
         if control.is_cancelled() {
+            merge.abort().await;
             control.emit(RunLifecycleEvent::Cancelled {
                 run: run.id().clone(),
             });
@@ -412,6 +414,7 @@ pub async fn drive_with_control(
         }
     }
     merge
+        .join()
         .await
         .map_err(|error| StartError::Source {
             run: run.id().clone(),
@@ -423,6 +426,19 @@ pub async fn drive_with_control(
             run: run.id().clone(),
             source,
         })?;
+    if control.is_cancelled() {
+        control.emit(RunLifecycleEvent::Cancelled {
+            run: run.id().clone(),
+        });
+        let metrics = metrics.snapshot();
+        return Ok(PaperReport {
+            run: run.id().clone(),
+            events_processed: metrics.events_processed,
+            fills: metrics.fills,
+            metrics,
+            exposure: report_exposure(&paper.account_state(), &marks),
+        });
+    }
     drain_fills(&mut fill_rx);
     fills = paper.fill_count();
     metrics.set_fills(fills);

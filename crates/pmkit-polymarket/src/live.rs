@@ -10,7 +10,8 @@ use async_trait::async_trait;
 use futures::StreamExt as _;
 use pmkit_core::MarketId;
 use pmkit_data::{
-    DataSourceError, LiveDataSource, RawPmAccountFrame, RawPmMarketFrame, SourceSignal,
+    DataSourceError, LIVE_HEARTBEAT_INTERVAL_MS, LiveDataSource, RawPmAccountFrame,
+    RawPmMarketFrame, SourceSignal, live_watermark_now, now_ms,
 };
 use pmkit_event::{
     MarketEvent, PmAccountEnvelope, PmMarketEnvelope, SourceEnvelope, StreamMetadata,
@@ -310,9 +311,18 @@ impl LiveDataSource for PolymarketLiveData {
         let mut books = Box::pin(books);
         let mut trades = Box::pin(trades);
         let mut sequence = 0;
+        let mut heartbeat =
+            tokio::time::interval(std::time::Duration::from_millis(LIVE_HEARTBEAT_INTERVAL_MS));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat.tick().await;
 
         let result = loop {
             tokio::select! {
+                _ = heartbeat.tick() => {
+                    if sink.send(SourceSignal::Watermark(live_watermark_now())).await.is_err() {
+                        break Err(DataSourceError::SinkClosed);
+                    }
+                }
                 update = books.next() => match update {
                     Some(Ok(update)) => {
                         let signal = match sequenced_market_signal(
@@ -328,7 +338,7 @@ impl LiveDataSource for PolymarketLiveData {
                         }
                     }
                     Some(Err(error)) => break Err(data_error(&error)),
-                    None => break Ok(()),
+                    None => break Err(unavailable("Polymarket market book stream ended")),
                 },
                 update = trades.next() => match update {
                     Some(Ok(update)) => {
@@ -348,7 +358,7 @@ impl LiveDataSource for PolymarketLiveData {
                         }
                     }
                     Some(Err(error)) => break Err(data_error(&error)),
-                    None => break Ok(()),
+                    None => break Err(unavailable("Polymarket market trade stream ended")),
                 },
             }
         };
@@ -356,7 +366,7 @@ impl LiveDataSource for PolymarketLiveData {
         drop(books);
         drop(trades);
         let book_cleanup = self.client.unsubscribe_orderbook(&[token]);
-        let trade_cleanup = self.client.unsubscribe_orderbook(&[token]);
+        let trade_cleanup = self.client.unsubscribe_prices(&[token]);
         result?;
         book_cleanup.map_err(|error| data_error(&error))?;
         trade_cleanup.map_err(|error| data_error(&error))
@@ -394,7 +404,7 @@ fn sequenced_market_signal(
                 source_id: MARKET_SOURCE_ID.into(),
                 source_time_ms: timestamp_ms,
                 canonical_source_rank: 0,
-                receipt_time_ms: timestamp_ms,
+                receipt_time_ms: now_ms(),
                 connection_id: MARKET_SOURCE_ID.into(),
                 connection_epoch,
                 frame_sequence,
@@ -477,6 +487,12 @@ pub fn parse_market_frame(
 fn data_error(error: &SdkError) -> DataSourceError {
     DataSourceError::Unavailable {
         message: error.to_string(),
+    }
+}
+
+fn unavailable(message: &str) -> DataSourceError {
+    DataSourceError::Unavailable {
+        message: message.to_owned(),
     }
 }
 

@@ -819,7 +819,7 @@ async fn drive_with_control_and_rate_limits(
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1024);
     let feed = MergedFeed::from_tasks(FeedMode::Live, sources(run, &strategies), None)
         .with_metrics(metrics.clone());
-    let merge = tokio::spawn(async move { feed.forward(event_tx).await });
+    let merge = feed.spawn(event_tx, control.cancellation());
     let mut tape = LiveTape::open(run, runtime)?;
     let mut order_rate_state = OrderRateState::default();
     let mut risk_state = LiveRiskState::default();
@@ -859,6 +859,7 @@ async fn drive_with_control_and_rate_limits(
         run: run.id().clone(),
     });
     if control.is_cancelled() {
+        merge.abort().await;
         control.emit(RunLifecycleEvent::Cancelled {
             run: run.id().clone(),
         });
@@ -875,6 +876,7 @@ async fn drive_with_control_and_rate_limits(
     }
     while let Some(merged) = event_rx.recv().await {
         if control.is_cancelled() {
+            merge.abort().await;
             control.emit(RunLifecycleEvent::Cancelled {
                 run: run.id().clone(),
             });
@@ -1067,6 +1069,7 @@ async fn drive_with_control_and_rate_limits(
     }
 
     merge
+        .join()
         .await
         .map_err(|error| StartError::Source {
             run: run.id().clone(),
@@ -1089,8 +1092,14 @@ async fn drive_with_control_and_rate_limits(
         &mut reservations,
     )
     .await?;
-    control.emit(RunLifecycleEvent::Completed {
-        run: run.id().clone(),
+    control.emit(if control.is_cancelled() {
+        RunLifecycleEvent::Cancelled {
+            run: run.id().clone(),
+        }
+    } else {
+        RunLifecycleEvent::Completed {
+            run: run.id().clone(),
+        }
     });
     Ok(report)
 }
