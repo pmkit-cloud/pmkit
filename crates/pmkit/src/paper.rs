@@ -293,7 +293,7 @@ pub async fn drive_with_control(
                     &merged.fact,
                     &empty_book,
                     &positions,
-                    envelope.fact.timestamp_ms,
+                    envelope.metadata.receipt_time_ms,
                     &paper,
                     &mut fill_rx,
                     &metrics,

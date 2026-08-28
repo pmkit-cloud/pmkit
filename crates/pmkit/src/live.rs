@@ -1013,7 +1013,7 @@ async fn drive_with_control_and_rate_limits(
                     fact: &merged.fact,
                     market: None,
                     book: &empty_book,
-                    timestamp_ms: envelope.fact.timestamp_ms,
+                    timestamp_ms: envelope.metadata.receipt_time_ms,
                     source_timestamp_ms: envelope.metadata.source_time_ms,
                     ingest_sequence: envelope.metadata.ingest_sequence,
                     source_kind: "polymarket-reference",

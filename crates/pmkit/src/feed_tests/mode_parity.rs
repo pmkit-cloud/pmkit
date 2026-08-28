@@ -455,7 +455,7 @@ async fn actual_modes_observe_identical_facts_and_portable_decisions()
         );
         assert!(
             rtds.iter()
-                .all(|observation| observation.timestamp_ms == 2_001)
+                .all(|observation| observation.timestamp_ms == 2_002)
         );
         assert_eq!(decisions[1], decisions[0]);
         assert_eq!(decisions[2], decisions[0]);

@@ -153,7 +153,7 @@ pub async fn drive_with_control(
                 market: None,
                 book: &empty_book,
                 positions_by_market: &mut positions_by_market,
-                timestamp_ms: envelope.fact.timestamp_ms,
+                timestamp_ms: envelope.metadata.receipt_time_ms,
                 sim: &mut sim,
             });
             metrics.add_fills(added);
