@@ -638,13 +638,9 @@ fn market_event(
             if !book.initialized {
                 return Ok(None);
             }
-            if update.timestamp < book.timestamp_ms {
-                return Err(replay_gap("last trade timestamp regressed"));
-            }
-            let event = trade_event(market.clone(), outcome, &update)
-                .ok_or_else(|| replay_gap("invalid last trade price"))?;
-            book.timestamp_ms = update.timestamp;
-            Ok(Some(event))
+            trade_event(market.clone(), outcome, &update)
+                .map(Some)
+                .ok_or_else(|| replay_gap("invalid last trade price"))
         }
         _ => Ok(None),
     }
@@ -959,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn token_book_holds_pre_snapshot_trade_and_rejects_bad_updates()
+    fn token_book_accepts_independent_trade_time_and_rejects_bad_updates()
     -> Result<(), Box<dyn std::error::Error>> {
         let token = U256::from(1_u64);
         let market = MarketId::new("btc-5m")?;
@@ -991,8 +987,8 @@ mod tests {
                 token,
                 &mut book,
                 WsMessage::LastTradePrice(regressed_trade),
-            )
-            .is_err()
+            )?
+            .is_some()
         );
 
         let crossed: PriceChange = serde_json::from_str(
