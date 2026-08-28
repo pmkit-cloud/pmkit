@@ -28,7 +28,7 @@ changes until `0.1.0` stabilizes.
 ## Workspace
 
 | Crate | Purpose |
-|---|---|
+| --- | --- |
 | [`pmkit-core`](crates/pmkit-core) | Pure ownership value types: `PortfolioId`, `MarketId`, `StrategyId`, `RunId`, `Mode`, `PortfolioKey`, `StrategyKey`. |
 | [`pmkit-money`](crates/pmkit-money) | `Money` — a USDC monetary amount. |
 | [`pmkit-market`](crates/pmkit-market) | Market-data domain primitives: `Asset`, `Outcome`, `MarketDuration`, `Exchange`. |
@@ -164,6 +164,9 @@ let _ = replay; // Pass `replay` to `BacktestRun::new`.
 The source checks coverage before listing segments, returns archive retrieval
 states without starting a restore, verifies encoded and logical SHA-256
 digests, and reuses immutable frames by release, segment, and encoded digest.
+For rolling asset windows, call `source.coverage(CloudReplayQuery::asset(...))`
+first to discover the concrete market instances; the historical source can then
+replay all discovered markets through the same public `/v1` path.
 
 ### Whole-database deletion
 
