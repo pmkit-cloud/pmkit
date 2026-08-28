@@ -3773,7 +3773,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-tungstenite",
  "turso",
  "zstd",
 ]
