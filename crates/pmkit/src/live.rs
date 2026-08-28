@@ -474,8 +474,8 @@ async fn cancel_live_strategy_orders(
 async fn submit_live_order(
     context: &mut LiveSubmitContext<'_>,
     order: &PlaceOrder,
-    action_index: u32,
 ) -> Result<(), StartError> {
+    let action_index = u32::try_from(context.verdicts.len()).unwrap_or(u32::MAX);
     if context.open_orders.len() >= context.max_open_orders {
         *context.open_orders = reconcile_open_orders(context.run, context.runtime).await?;
     }
@@ -978,12 +978,10 @@ async fn drive_with_control_and_rate_limits(
                             verdicts: &mut verdicts,
                             strategy: &instance.id,
                         };
-                        for (action_index, action) in actions.as_slice().iter().enumerate() {
-                            let action_index = u32::try_from(action_index).unwrap_or(u32::MAX);
+                        for action in actions.as_slice() {
                             match action {
                                 Action::Place(order) => {
-                                    submit_live_order(&mut action_context, order, action_index)
-                                        .await?;
+                                    submit_live_order(&mut action_context, order).await?;
                                 }
                                 Action::Cancel(order_id) => {
                                     cancel_live_order(&mut action_context, order_id).await?;
@@ -993,8 +991,7 @@ async fn drive_with_control_and_rate_limits(
                                         cancel_live_order(&mut action_context, order_id).await?;
                                     }
                                     for order in place {
-                                        submit_live_order(&mut action_context, order, action_index)
-                                            .await?;
+                                        submit_live_order(&mut action_context, order).await?;
                                     }
                                 }
                                 Action::CancelAll => {
