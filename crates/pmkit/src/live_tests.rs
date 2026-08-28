@@ -41,6 +41,7 @@ struct ReferenceExec {
 }
 
 struct ReferenceLive;
+struct RtdsReferenceLive;
 
 struct ReferenceStrategy {
     calls: Arc<AtomicUsize>,
@@ -106,7 +107,10 @@ impl Executor for ReferenceExec {
 
 impl Strategy for ReferenceStrategy {
     fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
-        if !matches!(context.fact, StrategyFact::Reference(_)) {
+        if !matches!(
+            context.fact,
+            StrategyFact::Reference(_) | StrategyFact::PolymarketReference(_)
+        ) {
             return Ok(Actions::none());
         }
         self.calls.fetch_add(1, Ordering::Relaxed);
@@ -385,6 +389,44 @@ impl LiveCexDataSource for ReferenceLive {
 }
 
 #[async_trait]
+impl LiveCexDataSource for RtdsReferenceLive {
+    async fn subscribe_reference(&self, sink: Sender<SourceSignal>) -> Result<(), DataSourceError> {
+        sink.send(SourceSignal::Data(Box::new(
+            SourceEnvelope::PolymarketReference(PolymarketReferenceEnvelope {
+                metadata: StreamMetadata {
+                    schema_version: 1,
+                    source_id: "rtds-live".into(),
+                    source_time_ms: 2,
+                    canonical_source_rank: 2,
+                    receipt_time_ms: 3,
+                    connection_id: "rtds-live".into(),
+                    connection_epoch: 0,
+                    frame_sequence: 1,
+                    ingest_sequence: 1,
+                },
+                fact: PolymarketTwapEvent {
+                    asset: Asset::Btc,
+                    symbol: "btc/usd".into(),
+                    timestamp_ms: 2,
+                    provider_timestamp_ms: 2,
+                    value: 42.0,
+                    full_accuracy_value: "42000000000000000000".into(),
+                    window_s: 60,
+                },
+            }),
+        )))
+        .await
+        .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+#[async_trait]
 impl LiveDataSource for LiveWithFill {
     async fn subscribe(
         &self,
@@ -573,6 +615,39 @@ async fn live_reference_actions_cannot_bypass_the_risk_gate()
     .reference_data(Arc::new(ReferenceLive))
     .strategy(StrategyRegistration::new(
         StrategyId::new("reference-buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(ReferenceFactory {
+            calls: Arc::clone(&calls),
+            nonempty_books: Arc::new(AtomicUsize::new(0)),
+        }),
+    ));
+
+    let report = live::drive(&run, &config()?).await?;
+
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(executor.submissions.load(Ordering::Relaxed), 0);
+    assert_eq!(report.rejected, 1);
+    assert_eq!(report.exposure.portfolio_notional, Decimal::ZERO);
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_polymarket_reference_actions_cannot_bypass_the_risk_gate()
+-> Result<(), Box<dyn std::error::Error>> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(ReferenceExec::default());
+    let mut limits = risk()?;
+    limits.max_order_notional = pmkit_money::Money::ZERO;
+    let run = LiveRun::new(
+        RunId::new("live-rtds-reference-risk")?,
+        PortfolioId::new("alice")?,
+        executor.clone(),
+        Arc::new(LiveWithBook),
+        limits,
+    )
+    .reference_data(Arc::new(RtdsReferenceLive))
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("rtds-reference-buyer")?,
         MarketId::new("btc-5m")?,
         Arc::new(ReferenceFactory {
             calls: Arc::clone(&calls),

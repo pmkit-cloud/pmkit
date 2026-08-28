@@ -519,6 +519,7 @@ struct LivePipelineInput<'a> {
     ingest_sequence: u64,
     source_kind: &'static str,
     source_id: &'a str,
+    source_discriminator: Option<&'a str>,
     aggregate_trade_id: Option<u64>,
 }
 
@@ -586,6 +587,7 @@ async fn dispatch_live_pipeline(
                 input.timestamp_ms,
                 input.source_kind,
                 input.source_id,
+                input.source_discriminator,
                 input.aggregate_trade_id,
                 input.ingest_sequence,
             ),
@@ -724,22 +726,77 @@ async fn dispatch_live_pipeline(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "durable event identity includes strategy, market, source, stream, and transport coordinates"
+)]
 fn strategy_event_correlation_id(
     strategy: &pmkit_core::StrategyId,
     market: &pmkit_core::MarketId,
     timestamp_ms: i64,
     source_kind: &str,
     source_id: &str,
+    source_discriminator: Option<&str>,
     aggregate_trade_id: Option<u64>,
     ingest_sequence: u64,
 ) -> String {
     let base = strategy_correlation_id(strategy, market, timestamp_ms);
-    aggregate_trade_id.map_or_else(
+    if let Some(aggregate_trade_id) = aggregate_trade_id {
+        return format!("{base}:{source_kind}:{source_id}:{aggregate_trade_id}:{ingest_sequence}");
+    }
+    source_discriminator.map_or_else(
         || base.clone(),
-        |aggregate_trade_id| {
-            format!("{base}:{source_kind}:{source_id}:{aggregate_trade_id}:{ingest_sequence}")
+        |source_discriminator| {
+            format!("{base}:{source_kind}:{source_id}:{source_discriminator}:{ingest_sequence}")
         },
     )
+}
+
+#[cfg(test)]
+mod correlation_tests {
+    use super::{strategy_correlation_id, strategy_event_correlation_id};
+    use pmkit_core::{MarketId, StrategyId};
+
+    #[test]
+    fn reference_streams_have_distinct_correlation_ids() -> Result<(), Box<dyn std::error::Error>> {
+        let strategy = StrategyId::new("strategy")?;
+        let market = MarketId::new("btc-5m")?;
+        let book = strategy_event_correlation_id(
+            &strategy,
+            &market,
+            1_000,
+            "book",
+            "polymarket",
+            None,
+            None,
+            1,
+        );
+        let btc = strategy_event_correlation_id(
+            &strategy,
+            &market,
+            1_000,
+            "polymarket-reference",
+            "polymarket-rtds",
+            Some("btc:btc/usd:60"),
+            None,
+            1,
+        );
+        let eth = strategy_event_correlation_id(
+            &strategy,
+            &market,
+            1_000,
+            "polymarket-reference",
+            "polymarket-rtds",
+            Some("eth:eth/usd:60"),
+            None,
+            1,
+        );
+
+        assert_eq!(book, strategy_correlation_id(&strategy, &market, 1_000));
+        assert_ne!(btc, book);
+        assert_ne!(btc, eth);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -919,7 +976,50 @@ async fn drive_with_control_and_rate_limits(
                     ingest_sequence: envelope.metadata.ingest_sequence,
                     source_kind: "cex-trade",
                     source_id: &envelope.metadata.source_id,
+                    source_discriminator: None,
                     aggregate_trade_id: Some(*aggregate_trade_id),
+                },
+                LivePipelineState {
+                    run,
+                    runtime,
+                    store,
+                    scope: &scope,
+                    executor: executor.as_ref(),
+                    limits: &limits,
+                    effective_limits_by_strategy: &effective_limits_by_strategy,
+                    strategies: &mut strategies,
+                    risk_state: &risk_state,
+                    open_orders: &mut open_orders,
+                    reservations: &mut reservations,
+                    order_rate_state: &mut order_rate_state,
+                    rate_limits,
+                    metrics: &metrics,
+                    tape: &mut tape,
+                    max_open_orders,
+                    cex_metrics: &cex_metrics,
+                },
+                risk_state.daily_pnl(),
+            )
+            .await?;
+            continue;
+        }
+        if let SourceEnvelope::PolymarketReference(envelope) = &merged.source {
+            let source_discriminator = format!(
+                "{}:{}:{}",
+                envelope.fact.asset, envelope.fact.symbol, envelope.fact.window_s
+            );
+            dispatch_live_pipeline(
+                LivePipelineInput {
+                    fact: &merged.fact,
+                    market: None,
+                    book: &empty_book,
+                    timestamp_ms: envelope.fact.timestamp_ms,
+                    source_timestamp_ms: envelope.metadata.source_time_ms,
+                    ingest_sequence: envelope.metadata.ingest_sequence,
+                    source_kind: "polymarket-reference",
+                    source_id: &envelope.metadata.source_id,
+                    source_discriminator: Some(&source_discriminator),
+                    aggregate_trade_id: None,
                 },
                 LivePipelineState {
                     run,
@@ -1024,6 +1124,7 @@ async fn drive_with_control_and_rate_limits(
                         ingest_sequence: envelope.metadata.ingest_sequence,
                         source_kind: "book",
                         source_id: &envelope.metadata.source_id,
+                        source_discriminator: None,
                         aggregate_trade_id: None,
                     },
                     LivePipelineState {

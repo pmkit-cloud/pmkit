@@ -285,6 +285,26 @@ pub async fn drive_with_control(
             }
             continue;
         }
+        if let SourceEnvelope::PolymarketReference(envelope) = &merged.source {
+            for instance in &mut *strategies {
+                let positions = paper.positions_for_market(&instance.market);
+                dispatch_strategy(
+                    instance,
+                    &merged.fact,
+                    &empty_book,
+                    &positions,
+                    envelope.fact.timestamp_ms,
+                    &paper,
+                    &mut fill_rx,
+                    &metrics,
+                    store,
+                    &scope,
+                    run.id(),
+                )
+                .await?;
+            }
+            continue;
+        }
         if let SourceEnvelope::PmAccount(envelope) = &merged.source {
             if let PmAccountEvent::Settlement {
                 market,

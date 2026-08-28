@@ -146,6 +146,21 @@ pub async fn drive_with_control(
             metrics.add_decisions(decisions);
             continue;
         }
+        if let SourceEnvelope::PolymarketReference(envelope) = &merged.source {
+            let (added, _, rejected, decisions) = run_strategies(&mut RunStrategiesInputs {
+                strategies: &mut strategies,
+                fact: &merged.fact,
+                market: None,
+                book: &empty_book,
+                positions_by_market: &mut positions_by_market,
+                timestamp_ms: envelope.fact.timestamp_ms,
+                sim: &mut sim,
+            });
+            metrics.add_fills(added);
+            metrics.add_rejected(rejected);
+            metrics.add_decisions(decisions);
+            continue;
+        }
         let SourceEnvelope::PmMarket(envelope) = merged.source else {
             continue;
         };

@@ -9,8 +9,8 @@ use pmkit_data::{
     SourceSignal,
 };
 use pmkit_event::{
-    CexReferenceEnvelope, CexReferenceEvent, MarketEvent, SourceEnvelope, StrategyFact,
-    StreamMetadata,
+    CexReferenceEnvelope, CexReferenceEvent, MarketEvent, PolymarketReferenceEnvelope,
+    PolymarketTwapEvent, SourceEnvelope, StrategyFact, StreamMetadata,
 };
 use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
 use pmkit_market::{Asset, Exchange, Outcome};
@@ -32,6 +32,11 @@ struct ParitySource;
 
 struct ParityReference {
     source_id: &'static str,
+    timestamp_ms: i64,
+    rank: i64,
+}
+
+struct ParityRtdsReference {
     timestamp_ms: i64,
     rank: i64,
 }
@@ -67,12 +72,26 @@ impl HistoricalDataSource for ParitySource {
         query: ReplayQuery,
         sink: Sender<SourceSignal>,
     ) -> Result<(), DataSourceError> {
-        let market = query
-            .markets
-            .first()
-            .cloned()
-            .ok_or(DataSourceError::NotAvailable)?;
-        emit_market(market, Outcome::Up, sink).await
+        if query.markets.is_empty() {
+            return Err(DataSourceError::NotAvailable);
+        }
+        for market in query.markets {
+            sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
+                market,
+                outcome: Outcome::Up,
+                bids: vec![(Decimal::new(49, 2), Decimal::from(20))],
+                asks: vec![(Decimal::new(51, 2), Decimal::from(20))],
+                timestamp_ms: 1_000,
+            }))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        }
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
     }
 }
 
@@ -144,19 +163,93 @@ impl LiveCexDataSource for ParityReference {
     }
 }
 
-struct FactProbe(Arc<Mutex<Vec<StrategyFact>>>);
+async fn emit_rtds_reference(
+    source: &ParityRtdsReference,
+    sink: Sender<SourceSignal>,
+) -> Result<(), DataSourceError> {
+    sink.send(SourceSignal::Data(Box::new(
+        SourceEnvelope::PolymarketReference(PolymarketReferenceEnvelope {
+            metadata: StreamMetadata {
+                schema_version: 1,
+                source_id: "rtds-parity".into(),
+                source_time_ms: source.timestamp_ms,
+                canonical_source_rank: source.rank,
+                receipt_time_ms: source.timestamp_ms + 1,
+                connection_id: "rtds-parity".into(),
+                connection_epoch: 0,
+                frame_sequence: 1,
+                ingest_sequence: 1,
+            },
+            fact: PolymarketTwapEvent {
+                asset: Asset::Btc,
+                symbol: "btc/usd".into(),
+                timestamp_ms: source.timestamp_ms,
+                provider_timestamp_ms: source.timestamp_ms,
+                value: 42.0,
+                full_accuracy_value: "42000000000000000000".into(),
+                window_s: 60,
+            },
+        }),
+    )))
+    .await
+    .map_err(|_| DataSourceError::SinkClosed)?;
+    sink.send(SourceSignal::Watermark(i64::MAX))
+        .await
+        .map_err(|_| DataSourceError::SinkClosed)?;
+    sink.send(SourceSignal::Eof)
+        .await
+        .map_err(|_| DataSourceError::SinkClosed)
+}
+
+#[async_trait]
+impl HistoricalDataSource for ParityRtdsReference {
+    async fn replay(
+        &self,
+        _query: ReplayQuery,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        emit_rtds_reference(self, sink).await
+    }
+}
+
+#[async_trait]
+impl LiveCexDataSource for ParityRtdsReference {
+    async fn subscribe_reference(&self, sink: Sender<SourceSignal>) -> Result<(), DataSourceError> {
+        emit_rtds_reference(self, sink).await
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Observation {
+    fact: StrategyFact,
+    market: MarketId,
+    empty_book: bool,
+    position_count: usize,
+    timestamp_ms: i64,
+}
+
+struct FactProbe(Arc<Mutex<Vec<Observation>>>);
 
 impl Strategy for FactProbe {
     fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        let observation = Observation {
+            fact: context.fact.clone(),
+            market: context.market.clone(),
+            empty_book: context.book.bids.is_empty()
+                && context.book.asks.is_empty()
+                && context.book.last_trade_price.is_none(),
+            position_count: context.positions.len(),
+            timestamp_ms: context.now.0,
+        };
         match self.0.lock() {
-            Ok(mut facts) => facts.push(context.fact.clone()),
-            Err(poisoned) => poisoned.into_inner().push(context.fact.clone()),
+            Ok(mut facts) => facts.push(observation),
+            Err(poisoned) => poisoned.into_inner().push(observation),
         }
         Ok(Actions::none())
     }
 }
 
-struct FactProbeFactory(Arc<Mutex<Vec<StrategyFact>>>);
+struct FactProbeFactory(Arc<Mutex<Vec<Observation>>>);
 
 impl StrategyFactory for FactProbeFactory {
     fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
@@ -201,16 +294,18 @@ fn simulation() -> ConservativeV1Config {
 }
 
 fn registration(
-    facts: &Arc<Mutex<Vec<StrategyFact>>>,
+    facts: &Arc<Mutex<Vec<Observation>>>,
+    strategy: &str,
+    market: &str,
 ) -> Result<StrategyRegistration, Box<dyn std::error::Error>> {
     Ok(StrategyRegistration::new(
-        StrategyId::new("parity-probe")?,
-        MarketId::new("btc-5m")?,
+        StrategyId::new(strategy)?,
+        MarketId::new(market)?,
         Arc::new(FactProbeFactory(Arc::clone(facts))),
     ))
 }
 
-fn captured(facts: &Mutex<Vec<StrategyFact>>) -> Vec<StrategyFact> {
+fn captured(facts: &Mutex<Vec<Observation>>) -> Vec<Observation> {
     match facts.lock() {
         Ok(facts) => facts.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
@@ -252,8 +347,7 @@ async fn actual_modes_observe_identical_facts_and_portable_decisions()
         }))
         .reference_source_named(
             "rtds",
-            Arc::new(ParityReference {
-                source_id: "rtds-parity",
+            Arc::new(ParityRtdsReference {
                 timestamp_ms: 2_001,
                 rank: 2,
             }),
@@ -266,7 +360,8 @@ async fn actual_modes_observe_identical_facts_and_portable_decisions()
             risk()?,
             simulation(),
         )
-        .strategy(registration(&backtest_facts)?);
+        .strategy(registration(&backtest_facts, "btc-probe", "btc-5m")?)
+        .strategy(registration(&backtest_facts, "eth-probe", "eth-5m")?);
         let paper_run = PaperRun::new(
             RunId::new("parity-paper")?,
             portfolio.clone(),
@@ -282,13 +377,13 @@ async fn actual_modes_observe_identical_facts_and_portable_decisions()
         }))
         .reference_data_named(
             "rtds",
-            Arc::new(ParityReference {
-                source_id: "rtds-parity",
+            Arc::new(ParityRtdsReference {
                 timestamp_ms: 2_001,
                 rank: 2,
             }),
         )
-        .strategy(registration(&paper_facts)?);
+        .strategy(registration(&paper_facts, "btc-probe", "btc-5m")?)
+        .strategy(registration(&paper_facts, "eth-probe", "eth-5m")?);
         let live_run = LiveRun::new(
             RunId::new("parity-live")?,
             portfolio.clone(),
@@ -303,13 +398,13 @@ async fn actual_modes_observe_identical_facts_and_portable_decisions()
         }))
         .reference_data_named(
             "rtds",
-            Arc::new(ParityReference {
-                source_id: "rtds-parity",
+            Arc::new(ParityRtdsReference {
                 timestamp_ms: 2_001,
                 rank: 2,
             }),
         )
-        .strategy(registration(&live_facts)?);
+        .strategy(registration(&live_facts, "btc-probe", "btc-5m")?)
+        .strategy(registration(&live_facts, "eth-probe", "eth-5m")?);
 
         // When: each driver persists the fact and its causal decision.
         let control = RunControl::default();
@@ -337,19 +432,31 @@ async fn actual_modes_observe_identical_facts_and_portable_decisions()
                 paper_report.events_processed,
                 live_report.events_processed,
             ],
-            [1, 1, 1]
+            [2, 2, 2]
         );
         let expected_facts = captured(&backtest_facts);
         assert_eq!(captured(&paper_facts), expected_facts);
         assert_eq!(captured(&live_facts), expected_facts);
-        assert!(matches!(
-            expected_facts.as_slice(),
-            [
-                StrategyFact::Market(_),
-                StrategyFact::Reference(_),
-                StrategyFact::Reference(_),
-            ]
-        ));
+        let rtds = expected_facts
+            .iter()
+            .filter(|observation| matches!(observation.fact, StrategyFact::PolymarketReference(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(rtds.len(), 2);
+        assert_eq!(
+            rtds.iter()
+                .map(|observation| observation.market.to_string())
+                .collect::<Vec<_>>(),
+            ["btc-5m", "eth-5m"]
+        );
+        assert!(rtds.iter().all(|observation| observation.empty_book));
+        assert!(
+            rtds.iter()
+                .all(|observation| observation.position_count == 0)
+        );
+        assert!(
+            rtds.iter()
+                .all(|observation| observation.timestamp_ms == 2_001)
+        );
         assert_eq!(decisions[1], decisions[0]);
         assert_eq!(decisions[2], decisions[0]);
         store.delete_database()?;
