@@ -558,7 +558,13 @@ pub async fn drive_with_control(
             if let Some(store) = store {
                 let identity = CausalIdentity {
                     scope: scope.clone(),
-                    correlation_id: format!("{market:?}:{timestamp_ms}"),
+                    correlation_id: format!(
+                        "paper-market:{}:{}:{}:{}:{market}:{outcome}",
+                        envelope.metadata.source_id,
+                        envelope.metadata.connection_id,
+                        envelope.metadata.connection_epoch,
+                        envelope.metadata.frame_sequence,
+                    ),
                     source_timestamp_ms: envelope.metadata.source_time_ms,
                     ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
                         .unwrap_or(i64::MAX),

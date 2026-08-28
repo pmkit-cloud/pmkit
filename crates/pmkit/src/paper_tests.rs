@@ -29,6 +29,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
 struct ScriptedLive;
+struct BothOutcomesLive;
 
 struct IdleLive;
 
@@ -257,6 +258,32 @@ impl LiveDataSource for IdleLive {
 }
 
 #[async_trait]
+impl LiveDataSource for BothOutcomesLive {
+    async fn subscribe(
+        &self,
+        market: MarketId,
+        outcome: Outcome,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
+            market,
+            outcome,
+            bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+            asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
+            timestamp_ms: 1,
+        }))
+        .await
+        .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+#[async_trait]
 impl LiveDataSource for ScriptedLive {
     async fn subscribe(
         &self,
@@ -333,6 +360,61 @@ impl LiveDataSource for FailingLive {
     ) -> Result<(), DataSourceError> {
         Err(DataSourceError::NotAvailable)
     }
+}
+
+#[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
+async fn same_timestamp_outcome_books_have_distinct_decision_identities()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(TursoTapeStore::open_local(directory.path().join("outcomes.db")).await?);
+    let facts = Arc::new(Mutex::new(Vec::new()));
+    let run = PaperRun::new(
+        RunId::new("paper-outcomes")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(100),
+        risk()?,
+        Arc::new(BothOutcomesLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("observer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(RecordingFactory {
+            facts,
+            nonempty_reference_books: Arc::new(AtomicUsize::new(0)),
+        }),
+    ));
+
+    let app = Pmkit::builder(config()?)
+        .storage(store.clone())
+        .run(run)
+        .start()
+        .await?;
+    let RunReport::Paper(report) = app
+        .report(&RunId::new("paper-outcomes")?)
+        .ok_or("missing report")?
+    else {
+        return Err("expected paper report".into());
+    };
+    assert_eq!(report.events_processed, 2);
+    let scope = OwnerScope::new(PortfolioId::new("alice")?, RunId::new("paper-outcomes")?);
+    let decisions = store.read_decisions(&scope).await?;
+    let ids = decisions
+        .iter()
+        .filter(|decision| decision.payload["snapshot"].is_object())
+        .map(|decision| decision.identity.correlation_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+    Ok(())
 }
 
 #[tokio::test]
