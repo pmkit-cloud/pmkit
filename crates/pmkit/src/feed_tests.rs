@@ -290,13 +290,16 @@ async fn source_gap_aborts_before_strategy_evaluation() -> Result<(), Box<dyn st
 #[tokio::test]
 async fn live_frame_is_checked_before_its_receipt_frontier()
 -> Result<(), Box<dyn std::error::Error>> {
-    // The first frame establishes the five-second bounded frontier only after
-    // it has been accepted; it cannot reject itself as late.
+    // The first frame establishes its one-millisecond receipt bound only after acceptance.
     let facts = MergedFeed::from_fixture(
         FeedMode::Live,
         vec![SourceDefinition::finite(
             "pm",
-            vec![pm_with_receipt(1_000, 1, 10_000)?, SourceSignal::Eof],
+            vec![
+                pm_with_receipt(1_000, 1, 10_000)?,
+                SourceSignal::Watermark(10_000),
+                SourceSignal::Eof,
+            ],
         )],
         None,
     )
@@ -325,7 +328,7 @@ async fn live_rejects_data_older_than_emitted_watermark() -> Result<(), Box<dyn 
     .collect()
     .await;
     assert!(
-        matches!(result, Err(DataSourceError::ReplayGap { message }) if message == "late record")
+        matches!(result, Err(DataSourceError::ReplayGap { message }) if message.starts_with("late record from pm:"))
     );
     Ok(())
 }

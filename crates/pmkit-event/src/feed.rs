@@ -119,6 +119,26 @@ impl Ord for CanonicalSourceKey {
 }
 
 impl CanonicalSourceKey {
+    /// Replaces only the timestamp used for cross-source ordering.
+    #[must_use]
+    pub const fn with_ordering_timestamp(mut self, timestamp_ms: i64) -> Self {
+        match &mut self {
+            Self::Pm {
+                source_timestamp_ms,
+                ..
+            }
+            | Self::Cex {
+                source_timestamp_ms,
+                ..
+            }
+            | Self::Polymarket {
+                source_timestamp_ms,
+                ..
+            } => *source_timestamp_ms = timestamp_ms,
+        }
+        self
+    }
+
     /// Returns the timestamp used for watermark eligibility.
     #[must_use]
     pub const fn timestamp_ms(&self) -> i64 {

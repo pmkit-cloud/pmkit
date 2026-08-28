@@ -366,9 +366,7 @@ pub async fn drive_with_control(
         })?;
         if let SourceEnvelope::CexReference(envelope) = &merged.source {
             cex_metrics.observe(&envelope.fact);
-            let timestamp_ms = match &envelope.fact {
-                CexReferenceEvent::Trade { timestamp_ms, .. } => *timestamp_ms,
-            };
+            let timestamp_ms = envelope.metadata.receipt_time_ms;
             // CEX facts have no PM outcome, so fan them out once with an
             // explicitly empty book in stable registration order.
             for instance in &mut *strategies {
@@ -538,7 +536,7 @@ pub async fn drive_with_control(
                         &fact,
                         &book,
                         &positions,
-                        *timestamp_ms,
+                        envelope.metadata.receipt_time_ms,
                         &paper,
                         &marks,
                         &limits,

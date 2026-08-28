@@ -98,7 +98,7 @@ impl LiveCexDataSource for FiniteReferenceSource {
                         source_id: "test-cex".into(),
                         source_time_ms: timestamp_ms,
                         canonical_source_rank: 1,
-                        receipt_time_ms: timestamp_ms,
+                        receipt_time_ms: sequence.saturating_add(1),
                         connection_id: "test-cex".into(),
                         connection_epoch: 0,
                         frame_sequence: sequence,
@@ -603,9 +603,9 @@ async fn paper_run_delivers_reference_facts_once_in_causal_order()
     assert_eq!(
         recording_facts[1..].to_vec(),
         vec![
+            StrategyFact::Reference(reference_trade(3, 4, 103)),
             StrategyFact::Reference(reference_trade(1, 2, 101)),
             StrategyFact::Reference(reference_trade(2, 3, 102)),
-            StrategyFact::Reference(reference_trade(3, 4, 103)),
         ]
     );
     assert_eq!(report.events_processed, 1);

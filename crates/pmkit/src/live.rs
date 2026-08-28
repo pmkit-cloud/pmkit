@@ -972,16 +972,14 @@ async fn drive_with_control_and_rate_limits(
         if let SourceEnvelope::CexReference(envelope) = &merged.source {
             cex_metrics.observe(&envelope.fact);
             let CexReferenceEvent::Trade {
-                aggregate_trade_id,
-                timestamp_ms,
-                ..
+                aggregate_trade_id, ..
             } = &envelope.fact;
             dispatch_live_pipeline(
                 LivePipelineInput {
                     fact: &merged.fact,
                     market: None,
                     book: &empty_book,
-                    timestamp_ms: *timestamp_ms,
+                    timestamp_ms: envelope.metadata.receipt_time_ms,
                     source_timestamp_ms: envelope.metadata.source_time_ms,
                     ingest_sequence: envelope.metadata.ingest_sequence,
                     source_kind: "cex-trade",
@@ -1129,7 +1127,7 @@ async fn drive_with_control_and_rate_limits(
                         fact: &fact,
                         market: Some(market),
                         book: &book,
-                        timestamp_ms: *timestamp_ms,
+                        timestamp_ms: envelope.metadata.receipt_time_ms,
                         source_timestamp_ms: envelope.metadata.source_time_ms,
                         ingest_sequence: envelope.metadata.ingest_sequence,
                         source_kind: "book",

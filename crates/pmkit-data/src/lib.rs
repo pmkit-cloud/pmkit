@@ -126,12 +126,11 @@ pub enum DataSourceError {
 /// heartbeats.
 pub const LIVE_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 
-/// Maximum source-event lateness covered by a production live watermark.
+/// One-millisecond tie guard for receipt-clock production watermarks.
 ///
-/// Live adapters derive heartbeats from their local receipt clock. An adapter
-/// must not emit a watermark unless it can exclude source events older than
-/// this bound.
-pub const LIVE_MAX_LATENESS_MS: i64 = 5_000;
+/// Live/Paper merge ordering uses local receipt time. Adapters send data before later sequential
+/// heartbeats; this guard prevents equal-clock-tick frames from being classified late.
+pub const LIVE_MAX_LATENESS_MS: i64 = 1;
 
 /// Returns a bounded live watermark for a received frame's metadata.
 #[must_use]

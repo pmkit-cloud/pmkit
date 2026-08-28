@@ -406,17 +406,25 @@ impl MergedFeed {
                     let error = match signal {
                         SourceSignal::Data(envelope) => {
                             let envelope = *envelope;
-                            let key = envelope.canonical_key();
+                            let key = if matches!(mode, FeedMode::Paper | FeedMode::Live) {
+                                envelope
+                                    .canonical_key()
+                                    .with_ordering_timestamp(envelope.metadata().receipt_time_ms)
+                            } else {
+                                envelope.canonical_key()
+                            };
                             // Evaluate against the frontier established before this
                             // frame. A frame must not reject itself merely because
                             // its receipt-time bound is derived while handling it.
-                            let late = state
-                                .eof_seen
-                                || state
-                                    .frontier(mode)
-                                    .is_some_and(|frontier| key.timestamp_ms() <= frontier);
+                            let frontier = state.frontier(mode);
+                            let late = state.eof_seen
+                                || frontier.is_some_and(|frontier| key.timestamp_ms() <= frontier);
                             if late {
-                                Some(replay_gap("late record"))
+                                Some(replay_gap(&format!(
+                                    "late record from {source}: timestamp={} frontier={frontier:?} eof={}",
+                                    key.timestamp_ms(),
+                                    state.eof_seen,
+                                )))
                             } else {
                                 let live_frontier = matches!(mode, FeedMode::Paper | FeedMode::Live)
                                     .then(|| live_watermark(envelope.metadata().receipt_time_ms));

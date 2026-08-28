@@ -1,4 +1,4 @@
-use super::{cex, pm};
+use super::{cex, pm, pm_with_receipt};
 use crate::feed::{FeedMode, MergedFeed, SourceDefinition, SourceTaskDefinition};
 use crate::{FeedHealthSnapshot, RunMetrics};
 use pmkit_core::RunId;
@@ -33,8 +33,8 @@ async fn feed_health_retains_max_accepted_event_timestamp() -> Result<(), Box<dy
             SourceDefinition::finite(
                 "pm",
                 vec![
-                    pm(20, 1)?,
-                    pm(10, 2)?,
+                    pm_with_receipt(20, 1, 18)?,
+                    pm_with_receipt(10, 2, 19)?,
                     SourceSignal::Watermark(20),
                     SourceSignal::Eof,
                 ],
@@ -53,10 +53,10 @@ async fn feed_health_retains_max_accepted_event_timestamp() -> Result<(), Box<dy
     // When: the merge reaches the shared logical frontier.
     result?;
 
-    // Then: the reported timestamp is the maximum accepted canonical timestamp.
+    // Then: live health uses the same receipt clock as its watermark.
     let pm = health(&metrics, "pm")?;
-    assert_eq!(pm.last_event_timestamp_ms, Some(20));
-    assert_eq!(pm.logical_lag_ms, Some(0));
+    assert_eq!(pm.last_event_timestamp_ms, Some(19));
+    assert_eq!(pm.logical_lag_ms, Some(1));
     Ok(())
 }
 
