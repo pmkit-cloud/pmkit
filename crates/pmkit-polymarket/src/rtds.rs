@@ -237,7 +237,7 @@ impl PolymarketRtdsLive {
         .map_err(|error| unavailable(format!("Polymarket RTDS client failed: {error}")))?;
         let subscription = Subscription::builder()
             .topic(POLYMARKET_RTDS_TOPIC.to_owned())
-            .msg_type("update".to_owned())
+            .msg_type("*".to_owned())
             .filters(format!(r#"{{"symbol":"{}/usd"}}"#, self.asset))
             .build();
         let stream = client.subscribe_raw(subscription).map_err(|error| {
