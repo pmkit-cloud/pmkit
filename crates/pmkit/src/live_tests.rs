@@ -5,15 +5,21 @@ use crate::{
 use async_trait::async_trait;
 use pmkit_book::Side;
 use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
-use pmkit_data::{DataSourceError, LiveAccountDataSource, LiveDataSource, SourceSignal};
+use pmkit_data::{
+    DataSourceError, LiveAccountDataSource, LiveCexDataSource, LiveDataSource, SourceSignal,
+};
 use pmkit_event::{
-    Liquidity, MarketEvent, PmAccountEnvelope, PmAccountEvent, SourceEnvelope, StreamMetadata,
+    CexReferenceEnvelope, CexReferenceEvent, Liquidity, MarketEvent, PmAccountEnvelope,
+    PmAccountEvent, SourceEnvelope, StrategyFact, StreamMetadata,
 };
 use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
-use pmkit_market::Outcome;
+use pmkit_market::{Asset, Exchange, Outcome};
 use pmkit_runtime::{LiveOrderPolicy, StrategyRegistration};
 use pmkit_spec::LiveRun;
 use pmkit_store::{OwnerScope, TapeStore, TursoTapeStore};
+use pmkit_strategy::{
+    Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
+};
 use rust_decimal::Decimal;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
@@ -27,6 +33,23 @@ mod live_loss_tests;
 mod live_tape_tests;
 
 struct RecordingExec;
+
+#[derive(Default)]
+struct ReferenceExec {
+    submissions: AtomicUsize,
+}
+
+struct ReferenceLive;
+
+struct ReferenceStrategy {
+    calls: Arc<AtomicUsize>,
+    nonempty_books: Arc<AtomicUsize>,
+}
+
+struct ReferenceFactory {
+    calls: Arc<AtomicUsize>,
+    nonempty_books: Arc<AtomicUsize>,
+}
 
 #[derive(Default)]
 struct RejectedExec {
@@ -53,6 +76,64 @@ impl Executor for RecordingExec {
 
     async fn cancel_all(&self) -> Result<(), ExecError> {
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Executor for ReferenceExec {
+    async fn preflight(&self) -> Result<ExecutionSnapshot, ExecError> {
+        Ok(ExecutionSnapshot::default())
+    }
+
+    async fn reconcile(&self) -> Result<ExecutionSnapshot, ExecError> {
+        Ok(ExecutionSnapshot::default())
+    }
+
+    async fn submit(&self, _order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
+        self.submissions.fetch_add(1, Ordering::Relaxed);
+        Ok(OrderId("reference-order".to_owned()))
+    }
+
+    async fn cancel(&self, _order_id: &OrderId) -> Result<(), ExecError> {
+        Ok(())
+    }
+
+    async fn cancel_all(&self) -> Result<(), ExecError> {
+        Ok(())
+    }
+}
+
+impl Strategy for ReferenceStrategy {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        if !matches!(context.fact, StrategyFact::Reference(_)) {
+            return Ok(Actions::none());
+        }
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        if !context.book.bids.is_empty()
+            || !context.book.asks.is_empty()
+            || context.book.last_trade_price.is_some()
+            || context.book.timestamp_ms != 0
+        {
+            self.nonempty_books.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(Actions::place(PlaceOrder {
+            market: context.market.clone(),
+            outcome: Outcome::Up,
+            side: Side::Buy,
+            price: Decimal::new(46, 2),
+            qty: Decimal::ONE,
+            post_only: false,
+            tif: pmkit_exec::TimeInForce::Gtc,
+        }))
+    }
+}
+
+impl StrategyFactory for ReferenceFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(ReferenceStrategy {
+            calls: Arc::clone(&self.calls),
+            nonempty_books: Arc::clone(&self.nonempty_books),
+        }))
     }
 }
 
@@ -265,6 +346,44 @@ impl LiveAccountDataSource for MismatchedAccountSource {
 }
 
 #[async_trait]
+impl LiveCexDataSource for ReferenceLive {
+    async fn subscribe_reference(&self, sink: Sender<SourceSignal>) -> Result<(), DataSourceError> {
+        sink.send(SourceSignal::Data(Box::new(SourceEnvelope::CexReference(
+            CexReferenceEnvelope {
+                metadata: StreamMetadata {
+                    schema_version: 1,
+                    source_id: "binance-live".into(),
+                    source_time_ms: 2,
+                    canonical_source_rank: 1,
+                    receipt_time_ms: 2,
+                    connection_id: "binance-live".into(),
+                    connection_epoch: 0,
+                    frame_sequence: 7,
+                    ingest_sequence: 7,
+                },
+                fact: CexReferenceEvent::Trade {
+                    asset: Asset::Btc,
+                    exchange: Exchange::Binance,
+                    aggregate_trade_id: 7,
+                    price: Decimal::from(42),
+                    qty: Decimal::ONE,
+                    is_buyer_maker: false,
+                    timestamp_ms: 2,
+                },
+            },
+        ))))
+        .await
+        .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+#[async_trait]
 impl LiveDataSource for LiveWithFill {
     async fn subscribe(
         &self,
@@ -401,6 +520,71 @@ async fn live_run_routes_orders_and_counts_fills() -> Result<(), Box<dyn std::er
     assert_eq!(report.fills, 1);
     assert_eq!(report.rejected, 0);
     assert!(report.exposure.portfolio_notional > Decimal::ZERO);
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_run_routes_reference_facts_through_the_normal_order_pipeline()
+-> Result<(), Box<dyn std::error::Error>> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let nonempty_books = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(ReferenceExec::default());
+    let run = LiveRun::new(
+        RunId::new("live-reference")?,
+        PortfolioId::new("alice")?,
+        executor.clone(),
+        Arc::new(LiveWithBook),
+        risk()?,
+    )
+    .reference_data(Arc::new(ReferenceLive))
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("reference-buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(ReferenceFactory {
+            calls: Arc::clone(&calls),
+            nonempty_books: Arc::clone(&nonempty_books),
+        }),
+    ));
+
+    let report = live::drive(&run, &config()?).await?;
+
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(nonempty_books.load(Ordering::Relaxed), 0);
+    assert_eq!(executor.submissions.load(Ordering::Relaxed), 1);
+    assert_eq!(report.rejected, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_reference_actions_cannot_bypass_the_risk_gate()
+-> Result<(), Box<dyn std::error::Error>> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(ReferenceExec::default());
+    let mut limits = risk()?;
+    limits.max_order_notional = pmkit_money::Money::ZERO;
+    let run = LiveRun::new(
+        RunId::new("live-reference-risk")?,
+        PortfolioId::new("alice")?,
+        executor.clone(),
+        Arc::new(LiveWithBook),
+        limits,
+    )
+    .reference_data(Arc::new(ReferenceLive))
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("reference-buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(ReferenceFactory {
+            calls: Arc::clone(&calls),
+            nonempty_books: Arc::new(AtomicUsize::new(0)),
+        }),
+    ));
+
+    let report = live::drive(&run, &config()?).await?;
+
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(executor.submissions.load(Ordering::Relaxed), 0);
+    assert_eq!(report.rejected, 1);
+    assert_eq!(report.exposure.portfolio_notional, Decimal::ZERO);
     Ok(())
 }
 

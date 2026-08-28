@@ -6,7 +6,9 @@ use super::{
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_accounting::{ExposureReservation, aggregate_exposure};
 use pmkit_book::OrderBookL2;
-use pmkit_event::{FillIdentity, MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
+use pmkit_event::{
+    CexReferenceEvent, FillIdentity, MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact,
+};
 use pmkit_exec::{ExecError, Executor, OrderId, OrderStatus, PlaceOrder};
 use pmkit_market::Outcome;
 use pmkit_runtime::{LiveOrderPolicy, RuntimeConfig, StrategyRegistration};
@@ -507,6 +509,238 @@ async fn place_order(
     }
 }
 
+struct LivePipelineInput<'a> {
+    fact: &'a StrategyFact,
+    market: Option<&'a pmkit_core::MarketId>,
+    book: &'a OrderBookL2,
+    timestamp_ms: i64,
+    source_timestamp_ms: i64,
+    ingest_sequence: u64,
+    source_kind: &'static str,
+    source_id: &'a str,
+    aggregate_trade_id: Option<u64>,
+}
+
+struct LivePipelineState<'a> {
+    run: &'a LiveRun,
+    runtime: &'a RuntimeConfig,
+    store: Option<&'a dyn TapeStore>,
+    scope: &'a OwnerScope,
+    executor: &'a dyn Executor,
+    limits: &'a pmkit_runtime::RiskLimits,
+    effective_limits_by_strategy: &'a HashMap<pmkit_core::StrategyId, pmkit_runtime::RiskLimits>,
+    strategies: &'a mut [StrategyInstance],
+    risk_state: &'a LiveRiskState,
+    open_orders: &'a mut HashSet<OrderId>,
+    reservations: &'a mut HashMap<String, Reservation>,
+    order_rate_state: &'a mut OrderRateState,
+    rate_limits: OrderRateLimits,
+    metrics: &'a crate::RunMetrics,
+    tape: &'a mut LiveTape,
+    max_open_orders: usize,
+    cex_metrics: &'a crate::causal::CexTradeMetricsState,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one shared live action transaction keeps every risk and durability gate identical"
+)]
+async fn dispatch_live_pipeline(
+    input: LivePipelineInput<'_>,
+    state: LivePipelineState<'_>,
+    daily_pnl: Option<rust_decimal::Decimal>,
+) -> Result<(), StartError> {
+    let LivePipelineState {
+        run,
+        runtime,
+        store,
+        scope,
+        executor,
+        limits,
+        effective_limits_by_strategy,
+        strategies,
+        risk_state,
+        open_orders,
+        reservations,
+        order_rate_state,
+        rate_limits,
+        metrics,
+        tape,
+        max_open_orders,
+        cex_metrics,
+    } = state;
+    for instance in &mut *strategies {
+        if input
+            .market
+            .is_some_and(|market| instance.market != *market)
+        {
+            continue;
+        }
+        let market = input.market.unwrap_or(&instance.market);
+        let identity = CausalIdentity {
+            scope: scope.clone(),
+            correlation_id: strategy_event_correlation_id(
+                &instance.id,
+                market,
+                input.timestamp_ms,
+                input.source_kind,
+                input.source_id,
+                input.aggregate_trade_id,
+                input.ingest_sequence,
+            ),
+            source_timestamp_ms: input.source_timestamp_ms,
+            ingest_sequence: i64::try_from(input.ingest_sequence).unwrap_or(i64::MAX),
+        };
+        let mut verdicts = Vec::new();
+        let effective_limits = effective_limits_by_strategy
+            .get(&instance.id)
+            .unwrap_or(limits);
+        let market_positions = risk_state.positions(market);
+        let context = StrategyContext {
+            fact: input.fact,
+            market,
+            book: input.book,
+            positions: market_positions,
+            now: LogicalTimestamp::from_millis(input.timestamp_ms),
+        };
+        metrics.decision();
+        if let Ok(actions) = instance.strategy.on_event(context) {
+            for (action_index, action) in actions.as_slice().iter().enumerate() {
+                let Action::Place(order) = action else {
+                    continue;
+                };
+                let action_index = u32::try_from(action_index).unwrap_or(u32::MAX);
+                if open_orders.len() >= max_open_orders {
+                    *open_orders = reconcile_open_orders(run, runtime).await?;
+                }
+                if open_orders.len() >= max_open_orders {
+                    verdicts.push(crate::causal::ActionRiskVerdict::rejected(
+                        action_index,
+                        "open order capacity",
+                    ));
+                    metrics.reject();
+                    continue;
+                }
+                let reserved_portfolio: rust_decimal::Decimal =
+                    reservations.values().map(Reservation::notional).sum();
+                let reserved_market: rust_decimal::Decimal = reservations
+                    .values()
+                    .filter(|r| r.market == *market)
+                    .map(Reservation::notional)
+                    .sum();
+                let reserved_strategy: rust_decimal::Decimal = reservations
+                    .values()
+                    .filter(|r| r.strategy == instance.id)
+                    .map(Reservation::notional)
+                    .sum();
+                let exposure = daily_pnl.map(|daily_pnl| PortfolioRiskExposure {
+                    portfolio_notional: risk_state.portfolio_notional() + reserved_portfolio,
+                    market_notional: risk_state.market_notional(market) + reserved_market,
+                    strategy_notional: reserved_strategy,
+                    daily_pnl,
+                    open_orders: open_orders.len(),
+                });
+                if risk_state.loss_breached
+                    || exposure.is_none_or(|exposure| {
+                        !passes_aggregated_risk(order, effective_limits, market_positions, exposure)
+                    })
+                {
+                    verdicts.push(crate::causal::ActionRiskVerdict::rejected(
+                        action_index,
+                        "risk gate",
+                    ));
+                    metrics.reject();
+                    continue;
+                }
+                if !order_rate_state.try_accept(&instance.id, input.timestamp_ms, rate_limits) {
+                    verdicts.push(crate::causal::ActionRiskVerdict::rejected(
+                        action_index,
+                        "order submission rate limit",
+                    ));
+                    metrics.reject();
+                    continue;
+                }
+                verdicts.push(crate::causal::ActionRiskVerdict::accepted(action_index));
+                match place_order(
+                    store,
+                    executor,
+                    order,
+                    input.timestamp_ms,
+                    &identity,
+                    action_index,
+                )
+                .await
+                {
+                    Ok(Some(order_id)) => {
+                        reservations.insert(
+                            order_id.0.clone(),
+                            Reservation {
+                                strategy: instance.id.clone(),
+                                market: market.clone(),
+                                price: order.price,
+                                remaining_qty: order.qty,
+                            },
+                        );
+                        open_orders.insert(order_id);
+                    }
+                    Ok(None) => metrics.reject(),
+                    Err(failure) => {
+                        *open_orders = reconcile_open_orders(run, runtime).await?;
+                        tape.flush(run)?;
+                        return Err(match failure {
+                            PlaceFailure::Transport(source) => StartError::ExecutionState {
+                                run: run.id().clone(),
+                                source,
+                            },
+                            PlaceFailure::Storage(source) => StartError::Storage {
+                                run: run.id().clone(),
+                                source,
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(store) = store {
+            let mut snapshot =
+                crate::causal::DecisionSnapshot::from_book(input.book, cex_metrics.snapshot());
+            snapshot.observation_timestamp_ms = input.timestamp_ms;
+            snapshot.decision_timestamp_ms = input.timestamp_ms;
+            let decision = if verdicts.is_empty() {
+                crate::causal::DecisionKind::NoAction
+            } else {
+                crate::causal::DecisionKind::Actions(verdicts)
+            };
+            crate::causal::CausalRecorder::new(store)
+                .record_evaluation(&identity, &snapshot, decision)
+                .await
+                .map_err(|source| StartError::Storage {
+                    run: run.id().clone(),
+                    source,
+                })?;
+        }
+    }
+    Ok(())
+}
+
+fn strategy_event_correlation_id(
+    strategy: &pmkit_core::StrategyId,
+    market: &pmkit_core::MarketId,
+    timestamp_ms: i64,
+    source_kind: &str,
+    source_id: &str,
+    aggregate_trade_id: Option<u64>,
+    ingest_sequence: u64,
+) -> String {
+    let base = strategy_correlation_id(strategy, market, timestamp_ms);
+    aggregate_trade_id.map_or_else(
+        || base.clone(),
+        |aggregate_trade_id| {
+            format!("{base}:{source_kind}:{source_id}:{aggregate_trade_id}:{ingest_sequence}")
+        },
+    )
+}
+
 #[cfg(test)]
 pub async fn drive_with_store(
     run: &LiveRun,
@@ -619,6 +853,7 @@ async fn drive_with_control_and_rate_limits(
 
     let mut connection_epochs = HashMap::new();
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
+    let empty_book = OrderBookL2::default();
     control.emit(RunLifecycleEvent::Started {
         run: run.id().clone(),
     });
@@ -666,6 +901,45 @@ async fn drive_with_control_and_rate_limits(
         .await?;
         if let SourceEnvelope::CexReference(envelope) = &merged.source {
             cex_metrics.observe(&envelope.fact);
+            let CexReferenceEvent::Trade {
+                aggregate_trade_id,
+                timestamp_ms,
+                ..
+            } = &envelope.fact;
+            dispatch_live_pipeline(
+                LivePipelineInput {
+                    fact: &merged.fact,
+                    market: None,
+                    book: &empty_book,
+                    timestamp_ms: *timestamp_ms,
+                    source_timestamp_ms: envelope.metadata.source_time_ms,
+                    ingest_sequence: envelope.metadata.ingest_sequence,
+                    source_kind: "cex-trade",
+                    source_id: &envelope.metadata.source_id,
+                    aggregate_trade_id: Some(*aggregate_trade_id),
+                },
+                LivePipelineState {
+                    run,
+                    runtime,
+                    store,
+                    scope: &scope,
+                    executor: executor.as_ref(),
+                    limits: &limits,
+                    effective_limits_by_strategy: &effective_limits_by_strategy,
+                    strategies: &mut strategies,
+                    risk_state: &risk_state,
+                    open_orders: &mut open_orders,
+                    reservations: &mut reservations,
+                    order_rate_state: &mut order_rate_state,
+                    rate_limits,
+                    metrics: &metrics,
+                    tape: &mut tape,
+                    max_open_orders,
+                    cex_metrics: &cex_metrics,
+                },
+                risk_state.daily_pnl(),
+            )
+            .await?;
             continue;
         }
         if let SourceEnvelope::PmAccount(envelope) = &merged.source {
@@ -737,164 +1011,40 @@ async fn drive_with_control_and_rate_limits(
                             source,
                         })?;
                 }
-                for instance in &mut *strategies {
-                    if instance.market != *market {
-                        continue;
-                    }
-                    let identity = CausalIdentity {
-                        scope: scope.clone(),
-                        correlation_id: strategy_correlation_id(
-                            &instance.id,
-                            market,
-                            *timestamp_ms,
-                        ),
-                        source_timestamp_ms: *timestamp_ms,
-                        ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
-                            .unwrap_or(i64::MAX),
-                    };
-                    let mut verdicts: Vec<crate::causal::ActionRiskVerdict> = Vec::new();
-                    let effective_limits = effective_limits_by_strategy
-                        .get(&instance.id)
-                        .map_or(&limits, |effective_limits| effective_limits);
-                    let market_positions = risk_state.positions(market);
-                    let context = StrategyContext {
+                dispatch_live_pipeline(
+                    LivePipelineInput {
                         fact: &fact,
-                        market,
+                        market: Some(market),
                         book: &book,
-                        positions: market_positions,
-                        now: LogicalTimestamp::from_millis(*timestamp_ms),
-                    };
-                    metrics.decision();
-                    if let Ok(actions) = instance.strategy.on_event(context) {
-                        for (action_index, action) in actions.as_slice().iter().enumerate() {
-                            if let Action::Place(order) = action {
-                                let action_index = u32::try_from(action_index).unwrap_or(u32::MAX);
-                                if open_orders.len() >= max_open_orders {
-                                    open_orders = reconcile_open_orders(run, runtime).await?;
-                                }
-                                if open_orders.len() >= max_open_orders {
-                                    verdicts.push(crate::causal::ActionRiskVerdict::rejected(
-                                        action_index,
-                                        "open order capacity",
-                                    ));
-                                    metrics.reject();
-                                    continue;
-                                }
-                                let reserved_portfolio: rust_decimal::Decimal =
-                                    reservations.values().map(Reservation::notional).sum();
-                                let reserved_market: rust_decimal::Decimal = reservations
-                                    .values()
-                                    .filter(|reservation| reservation.market == *market)
-                                    .map(Reservation::notional)
-                                    .sum();
-                                let reserved_strategy: rust_decimal::Decimal = reservations
-                                    .values()
-                                    .filter(|reservation| reservation.strategy == instance.id)
-                                    .map(Reservation::notional)
-                                    .sum();
-                                let exposure =
-                                    portfolio_daily_pnl.map(|daily_pnl| PortfolioRiskExposure {
-                                        portfolio_notional: risk_state.portfolio_notional()
-                                            + reserved_portfolio,
-                                        market_notional: risk_state.market_notional(market)
-                                            + reserved_market,
-                                        strategy_notional: reserved_strategy,
-                                        daily_pnl,
-                                        open_orders: open_orders.len(),
-                                    });
-                                if risk_state.loss_breached
-                                    || exposure.is_none_or(|exposure| {
-                                        !passes_aggregated_risk(
-                                            order,
-                                            effective_limits,
-                                            market_positions,
-                                            exposure,
-                                        )
-                                    })
-                                {
-                                    verdicts.push(crate::causal::ActionRiskVerdict::rejected(
-                                        action_index,
-                                        "risk gate",
-                                    ));
-                                    metrics.reject();
-                                    continue;
-                                }
-                                if !order_rate_state.try_accept(
-                                    &instance.id,
-                                    *timestamp_ms,
-                                    rate_limits,
-                                ) {
-                                    verdicts.push(crate::causal::ActionRiskVerdict::rejected(
-                                        action_index,
-                                        "order submission rate limit",
-                                    ));
-                                    metrics.reject();
-                                    continue;
-                                }
-                                verdicts
-                                    .push(crate::causal::ActionRiskVerdict::accepted(action_index));
-                                let placement = place_order(
-                                    store,
-                                    executor.as_ref(),
-                                    order,
-                                    *timestamp_ms,
-                                    &identity,
-                                    action_index,
-                                )
-                                .await;
-                                match placement {
-                                    Ok(Some(order_id)) => {
-                                        reservations.insert(
-                                            order_id.0.clone(),
-                                            Reservation {
-                                                strategy: instance.id.clone(),
-                                                market: market.clone(),
-                                                price: order.price,
-                                                remaining_qty: order.qty,
-                                            },
-                                        );
-                                        open_orders.insert(order_id);
-                                    }
-                                    Ok(None) => metrics.reject(),
-                                    Err(failure) => {
-                                        reconcile_open_orders(run, runtime).await?;
-                                        tape.flush(run)?;
-                                        return Err(match failure {
-                                            PlaceFailure::Transport(source) => {
-                                                StartError::ExecutionState {
-                                                    run: run.id().clone(),
-                                                    source,
-                                                }
-                                            }
-                                            PlaceFailure::Storage(source) => StartError::Storage {
-                                                run: run.id().clone(),
-                                                source,
-                                            },
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(store) = store {
-                        let snapshot = crate::causal::DecisionSnapshot::from_book(
-                            &book,
-                            cex_metrics.snapshot(),
-                        );
-                        let decision = if verdicts.is_empty() {
-                            crate::causal::DecisionKind::NoAction
-                        } else {
-                            crate::causal::DecisionKind::Actions(verdicts)
-                        };
-                        crate::causal::CausalRecorder::new(store)
-                            .record_evaluation(&identity, &snapshot, decision)
-                            .await
-                            .map_err(|source| StartError::Storage {
-                                run: run.id().clone(),
-                                source,
-                            })?;
-                    }
-                }
+                        timestamp_ms: *timestamp_ms,
+                        source_timestamp_ms: envelope.metadata.source_time_ms,
+                        ingest_sequence: envelope.metadata.ingest_sequence,
+                        source_kind: "book",
+                        source_id: &envelope.metadata.source_id,
+                        aggregate_trade_id: None,
+                    },
+                    LivePipelineState {
+                        run,
+                        runtime,
+                        store,
+                        scope: &scope,
+                        executor: executor.as_ref(),
+                        limits: &limits,
+                        effective_limits_by_strategy: &effective_limits_by_strategy,
+                        strategies: &mut strategies,
+                        risk_state: &risk_state,
+                        open_orders: &mut open_orders,
+                        reservations: &mut reservations,
+                        order_rate_state: &mut order_rate_state,
+                        rate_limits,
+                        metrics: &metrics,
+                        tape: &mut tape,
+                        max_open_orders,
+                        cex_metrics: &cex_metrics,
+                    },
+                    portfolio_daily_pnl,
+                )
+                .await?;
             }
             MarketEvent::Fill { order_id, size, .. }
                 if fill_authority == DurableFillAuthority::Market
