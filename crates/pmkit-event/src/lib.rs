@@ -318,11 +318,11 @@ pub enum CexReferenceEvent {
     },
 }
 
-/// The exact Chainlink TWAP update published by Polymarket RTDS.
+/// A validated Chainlink TWAP update published by Polymarket RTDS.
 ///
 /// `value` is the display-oriented JSON number. `full_accuracy_value` is the
-/// verbatim signed E18 fixed-point integer supplied by the provider and is the
-/// value to use for settlement-sensitive comparisons.
+/// signed E18 fixed-point integer supplied by the provider and is the value to
+/// use for settlement-sensitive comparisons.
 #[derive(Debug, Clone)]
 pub struct PolymarketTwapEvent {
     /// Reference asset selected by the source subscription.
@@ -369,14 +369,12 @@ pub type PolymarketReferenceEvent = PolymarketTwapEvent;
 /// Alias emphasizing the RTDS transport that supplied the TWAP fact.
 pub type PolymarketRtdsTwap = PolymarketTwapEvent;
 
-/// A Polymarket RTDS reference frame with transport metadata and raw bytes.
+/// A Polymarket RTDS reference fact with transport metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolymarketReferenceEnvelope {
     /// Preserved transport metadata.
     pub metadata: StreamMetadata,
-    /// Exact UTF-8 frame received from RTDS.
-    pub raw_frame: Vec<u8>,
-    /// Normalized Polymarket reference fact.
+    /// Validated Polymarket reference fact.
     pub fact: PolymarketTwapEvent,
 }
 

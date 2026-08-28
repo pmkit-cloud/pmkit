@@ -165,7 +165,7 @@ pub enum SourceEnvelope {
     PmAccount(PmAccountEnvelope),
     /// A CEX reference trade with raw transport identity.
     CexReference(CexReferenceEnvelope),
-    /// A Polymarket-owned RTDS reference fact with raw transport identity.
+    /// A Polymarket-owned RTDS reference fact with transport metadata.
     PolymarketReference(PolymarketReferenceEnvelope),
 }
 
