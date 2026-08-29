@@ -23,7 +23,12 @@ use pmkit_store::{OwnerScope, PM_ENVELOPE_VERSION, PmEnvelope, StoreError, TapeS
 use polymarket_client_sdk_v2::ws::connection::ConnectionState;
 use polymarket_client_sdk_v2::{
     clob::{
-        types::Side as VenueSide,
+        Client as HttpClient,
+        types::{
+            Side as VenueSide,
+            request::OrderBookSummaryRequest,
+            response::{OrderBookSummaryResponse, OrderSummary},
+        },
         ws::{BookUpdate, ChannelType, Client, LastTradePrice, PriceChange, WsMessage},
     },
     error::Error as SdkError,
@@ -266,6 +271,7 @@ impl RawPolymarketFrameAdapter {
 #[derive(Clone)]
 pub struct PolymarketLiveData {
     client: Client,
+    http_client: HttpClient,
     tokens: MarketTokens,
     connection_epoch: Arc<AtomicI64>,
 }
@@ -280,8 +286,15 @@ impl PolymarketLiveData {
     /// Creates a live source from an SDK WebSocket client and market token map.
     #[must_use]
     pub fn new(client: Client, tokens: MarketTokens) -> Self {
+        Self::with_http_client(client, HttpClient::default(), tokens)
+    }
+
+    /// Creates a live source with explicit WebSocket and unauthenticated CLOB clients.
+    #[must_use]
+    pub fn with_http_client(client: Client, http_client: HttpClient, tokens: MarketTokens) -> Self {
         Self {
             client,
+            http_client,
             tokens,
             connection_epoch: Arc::new(AtomicI64::new(0)),
         }
@@ -404,6 +417,7 @@ impl LiveDataSource for PolymarketLiveData {
                         ) {
                             break Err(error);
                         }
+                        let recoverable_update = matches!(&update, WsMessage::PriceChange(_));
                         let event = match market_event(
                             &market,
                             outcome,
@@ -413,6 +427,22 @@ impl LiveDataSource for PolymarketLiveData {
                         ) {
                             Ok(Some(event)) => event,
                             Ok(None) => continue,
+                            Err(error)
+                                if recoverable_update
+                                    && is_recoverable_reconstruction_error(&error) =>
+                            {
+                                let request = OrderBookSummaryRequest::builder()
+                                    .token_id(token)
+                                    .build();
+                                let summary = match self.http_client.order_book(&request).await {
+                                    Ok(summary) => summary,
+                                    Err(error) => break Err(data_error(&error)),
+                                };
+                                if let Err(error) = book.replace_summary(&summary, token) {
+                                    break Err(error);
+                                }
+                                book.event(market.clone(), outcome)
+                            }
                             Err(error) => break Err(error),
                         };
                         let signal = match sequenced_market_signal(
@@ -461,6 +491,31 @@ impl TokenBook {
         self.timestamp_ms = self.timestamp_ms.max(update.timestamp);
         self.initialized = true;
         Ok(true)
+    }
+
+    fn replace_summary(
+        &mut self,
+        summary: &OrderBookSummaryResponse,
+        token: U256,
+    ) -> Result<(), DataSourceError> {
+        if summary.asset_id != token {
+            return Err(replay_gap("HTTP book snapshot token mismatch"));
+        }
+        let bids = summary_levels(&summary.bids)?;
+        let asks = summary_levels(&summary.asks)?;
+        validate_book(&bids, &asks)?;
+        let timestamp_ms = summary.timestamp.timestamp_millis();
+        if timestamp_ms < 0 {
+            return Err(replay_gap("HTTP book snapshot timestamp is negative"));
+        }
+        if self.initialized && timestamp_ms < self.timestamp_ms {
+            return Err(replay_gap("HTTP book snapshot timestamp regressed"));
+        }
+        self.bids = bids;
+        self.asks = asks;
+        self.timestamp_ms = self.timestamp_ms.max(timestamp_ms);
+        self.initialized = true;
+        Ok(())
     }
 
     fn apply(&mut self, update: &PriceChange, token: U256) -> Result<bool, DataSourceError> {
@@ -550,6 +605,25 @@ fn levels(
     Ok(result)
 }
 
+fn summary_levels(
+    levels: &[OrderSummary],
+) -> Result<BTreeMap<rust_decimal::Decimal, rust_decimal::Decimal>, DataSourceError> {
+    let mut result = BTreeMap::new();
+    for level in levels {
+        if level.price <= rust_decimal::Decimal::ZERO || level.price > rust_decimal::Decimal::ONE {
+            return Err(replay_gap("HTTP book snapshot price is outside (0, 1]"));
+        }
+        if level.size < rust_decimal::Decimal::ZERO {
+            return Err(replay_gap("HTTP book snapshot has negative size"));
+        }
+        if result.insert(level.price, level.size).is_some() {
+            return Err(replay_gap("HTTP book snapshot contains a duplicate price"));
+        }
+    }
+    result.retain(|_, size| !size.is_zero());
+    Ok(result)
+}
+
 fn reconcile_reported_top(
     bids: &mut BTreeMap<rust_decimal::Decimal, rust_decimal::Decimal>,
     asks: &mut BTreeMap<rust_decimal::Decimal, rust_decimal::Decimal>,
@@ -602,6 +676,16 @@ fn validate_book(
         )));
     }
     Ok(())
+}
+
+fn is_recoverable_reconstruction_error(error: &DataSourceError) -> bool {
+    matches!(
+        error,
+        DataSourceError::ReplayGap { message }
+            if message == "reported best bid is absent from reconstructed depth"
+                || message == "reported best ask is absent from reconstructed depth"
+                || message.starts_with("book is crossed or locked: best_bid=")
+    )
 }
 
 fn replay_gap(message: impl Into<String>) -> DataSourceError {
@@ -837,14 +921,18 @@ mod tests {
         ReplayPage, StoreError, TapeStore, TursoTapeStore,
     };
     use polymarket_client_sdk_v2::{
-        clob::ws::{BookUpdate, LastTradePrice, PriceChange, WsMessage},
+        clob::{
+            types::response::OrderBookSummaryResponse,
+            ws::{BookUpdate, LastTradePrice, PriceChange, WsMessage},
+        },
         types::U256,
     };
     use rust_decimal::Decimal;
 
     use super::{
-        RawFrameAdapterError, RawPolymarketFrameAdapter, TokenBook, book_event, market_event,
-        next_connection_epoch, observe_connected_since, sequenced_market_signal, trade_event,
+        RawFrameAdapterError, RawPolymarketFrameAdapter, TokenBook, book_event,
+        is_recoverable_reconstruction_error, market_event, next_connection_epoch,
+        observe_connected_since, replay_gap, sequenced_market_signal, trade_event,
     };
 
     fn metadata(sequence: i64) -> StreamMetadata {
@@ -1014,10 +1102,11 @@ mod tests {
             r#"{"event_type":"price_change","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"43","price_changes":[{"asset_id":"1","price":"0.50","size":"-1","side":"BUY"}]}"#,
         ] {
             let malformed: PriceChange = serde_json::from_str(malformed)?;
-            assert!(matches!(
-                book.apply(&malformed, token),
-                Err(DataSourceError::ReplayGap { .. })
-            ));
+            let Err(error) = book.apply(&malformed, token) else {
+                return Err("malformed change was accepted".into());
+            };
+            assert!(matches!(error, DataSourceError::ReplayGap { .. }));
+            assert!(!is_recoverable_reconstruction_error(&error));
             assert!(book.bids.is_empty());
             assert!(book.asks.is_empty());
         }
@@ -1064,7 +1153,10 @@ mod tests {
         let crossed: PriceChange = serde_json::from_str(
             r#"{"event_type":"price_change","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"43","price_changes":[{"asset_id":"1","price":"0.52","size":"1","side":"BUY"}]}"#,
         )?;
-        assert!(book.apply(&crossed, token).is_err());
+        let Err(crossed_error) = book.apply(&crossed, token) else {
+            return Err("crossed book was accepted".into());
+        };
+        assert!(is_recoverable_reconstruction_error(&crossed_error));
         assert_eq!(
             book.bids.last_key_value().map(|(price, _)| *price),
             Some(Decimal::new(49, 2))
@@ -1076,6 +1168,42 @@ mod tests {
         assert!(book.apply(&regressed, token)?);
         assert_eq!(book.timestamp_ms, 42);
         Ok(())
+    }
+
+    #[test]
+    fn token_book_replaces_http_summary_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+        let token = U256::from(1_u64);
+        let summary: OrderBookSummaryResponse = serde_json::from_str(
+            r#"{"market":"0x0000000000000000000000000000000000000000000000000000000000000001","asset_id":"1","timestamp":"43","bids":[{"price":"0.49","size":"2"}],"asks":[{"price":"0.51","size":"3"}],"min_order_size":"1","neg_risk":false,"tick_size":"0.01"}"#,
+        )?;
+        let mut book = TokenBook::default();
+        book.replace_summary(&summary, token)?;
+        assert_eq!(book.timestamp_ms, 43);
+        assert_eq!(book.bids.get(&Decimal::new(49, 2)), Some(&Decimal::from(2)));
+        assert_eq!(book.asks.get(&Decimal::new(51, 2)), Some(&Decimal::from(3)));
+        assert!(book.initialized);
+        Ok(())
+    }
+
+    #[test]
+    fn only_reconstruction_gaps_are_recoverable() {
+        for message in [
+            "reported best bid is absent from reconstructed depth",
+            "reported best ask is absent from reconstructed depth",
+            "book is crossed or locked: best_bid=0.52 best_ask=0.51",
+        ] {
+            assert!(is_recoverable_reconstruction_error(&replay_gap(message)));
+        }
+        for message in [
+            "price change price is outside (0, 1]",
+            "price change lacks size",
+            "price change has negative size",
+            "reported best bid is outside [0, 1]",
+            "HTTP book snapshot token mismatch",
+            "HTTP book snapshot timestamp regressed",
+        ] {
+            assert!(!is_recoverable_reconstruction_error(&replay_gap(message)));
+        }
     }
 
     #[test]
