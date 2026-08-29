@@ -372,19 +372,19 @@ impl fmt::Debug for PolymarketLiveData {
     }
 }
 
-#[async_trait]
-impl LiveDataSource for PolymarketLiveData {
-    async fn subscribe(
+impl PolymarketLiveData {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one subscription attempt keeps stream recovery and cleanup together"
+    )]
+    async fn subscribe_once(
         &self,
         market: MarketId,
         outcome: Outcome,
-        sink: Sender<SourceSignal>,
-    ) -> Result<(), DataSourceError> {
-        if &market != self.tokens.market() {
-            return Err(DataSourceError::NotAvailable);
-        }
-        let mut connection_epoch = next_connection_epoch(&self.connection_epoch)?;
-        let token = self.tokens.token(outcome);
+        sink: &Sender<SourceSignal>,
+        token: U256,
+        connection_epoch: &mut i64,
+    ) -> Result<SubscribeOutcome, DataSourceError> {
         // ponytail: isolate outcome sockets until the SDK can atomically register every
         // consumer before one multi-token subscription sends its initial snapshots.
         let client = self.client.isolated().map_err(|error| data_error(&error))?;
@@ -415,7 +415,7 @@ impl LiveDataSource for PolymarketLiveData {
                         && client.connection_state(ChannelType::Market).is_connected()
                         && sink.send(SourceSignal::Watermark(live_watermark_now())).await.is_err()
                     {
-                        break Err(DataSourceError::SinkClosed);
+                        break SubscribeOutcome::Terminal(DataSourceError::SinkClosed);
                     }
                 }
                 update = events.next() => match update {
@@ -423,12 +423,12 @@ impl LiveDataSource for PolymarketLiveData {
                         if let Err(error) = observe_connection_state(
                             &client,
                             &mut connection_since,
-                            &mut connection_epoch,
+                            connection_epoch,
                             &mut sequence,
                             &mut book,
                             &self.connection_epoch,
                         ) {
-                            break Err(error);
+                            break SubscribeOutcome::Terminal(error);
                         }
                         let recoverable_update = matches!(&update, WsMessage::PriceChange(_));
                         let event = match market_event(
@@ -447,40 +447,127 @@ impl LiveDataSource for PolymarketLiveData {
                                 let request = OrderBookSummaryRequest::builder()
                                     .token_id(token)
                                     .build();
-                                let summary = match self.http_client.order_book(&request).await {
-                                    Ok(summary) => summary,
-                                    Err(error) => break Err(data_error(&error)),
-                                };
-                                if let Err(error) = book.replace_summary(&summary, token) {
-                                    break Err(error);
+                                let summary = self
+                                    .http_client
+                                    .order_book(&request)
+                                    .await
+                                    .map_err(|error| data_error(&error));
+                                match recover_summary(&mut book, summary, token) {
+                                    SummaryRecovery::Emit => book.event(market.clone(), outcome),
+                                    SummaryRecovery::Resubscribe => {
+                                        break SubscribeOutcome::Resubscribe;
+                                    }
+                                    SummaryRecovery::Terminal(error) => {
+                                        break SubscribeOutcome::Terminal(error);
+                                    }
                                 }
-                                book.event(market.clone(), outcome)
                             }
-                            Err(error) => break Err(error),
+                            Err(error) => break SubscribeOutcome::Terminal(error),
                         };
                         let signal = match sequenced_market_signal(
                             &mut sequence,
-                            connection_epoch,
+                            *connection_epoch,
                             event,
                         ) {
                             Ok(signal) => signal,
-                            Err(error) => break Err(error),
+                            Err(error) => break SubscribeOutcome::Terminal(error),
                         };
                         if sink.send(signal).await.is_err() {
-                            break Err(DataSourceError::SinkClosed);
+                            break SubscribeOutcome::Terminal(DataSourceError::SinkClosed);
                         }
                     }
-                    Some(Err(error)) => break Err(data_error(&error)),
-                    None => break Err(unavailable("Polymarket market stream ended")),
+                    Some(Err(error)) => {
+                        break SubscribeOutcome::Terminal(data_error(&error));
+                    }
+                    None => {
+                        break SubscribeOutcome::Terminal(unavailable("Polymarket market stream ended"));
+                    }
                 },
             }
         };
 
         drop(events);
         let cleanup = subscription.close().await;
-        result?;
-        cleanup
+        match result {
+            SubscribeOutcome::Terminal(error) => Err(error),
+            SubscribeOutcome::Resubscribe => {
+                cleanup?;
+                Ok(SubscribeOutcome::Resubscribe)
+            }
+        }
     }
+}
+
+#[async_trait]
+impl LiveDataSource for PolymarketLiveData {
+    async fn subscribe(
+        &self,
+        market: MarketId,
+        outcome: Outcome,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        if &market != self.tokens.market() {
+            return Err(DataSourceError::NotAvailable);
+        }
+        let mut connection_epoch = next_connection_epoch(&self.connection_epoch)?;
+        let token = self.tokens.token(outcome);
+
+        loop {
+            if sink.is_closed() {
+                return Err(DataSourceError::SinkClosed);
+            }
+            match self
+                .subscribe_once(market.clone(), outcome, &sink, token, &mut connection_epoch)
+                .await?
+            {
+                SubscribeOutcome::Resubscribe => {
+                    if sink.is_closed() {
+                        return Err(DataSourceError::SinkClosed);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    if sink.is_closed() {
+                        return Err(DataSourceError::SinkClosed);
+                    }
+                    connection_epoch = next_connection_epoch(&self.connection_epoch)?;
+                }
+                SubscribeOutcome::Terminal(error) => return Err(error),
+            }
+        }
+    }
+}
+
+enum SubscribeOutcome {
+    Resubscribe,
+    Terminal(DataSourceError),
+}
+
+enum SummaryRecovery {
+    Emit,
+    Resubscribe,
+    Terminal(DataSourceError),
+}
+
+fn recover_summary(
+    book: &mut TokenBook,
+    summary: Result<OrderBookSummaryResponse, DataSourceError>,
+    token: U256,
+) -> SummaryRecovery {
+    let Ok(summary) = summary else {
+        return SummaryRecovery::Resubscribe;
+    };
+    match book.replace_summary(&summary, token) {
+        Ok(()) => SummaryRecovery::Emit,
+        Err(error) if is_stale_summary_error(&error) => SummaryRecovery::Resubscribe,
+        Err(error) => SummaryRecovery::Terminal(error),
+    }
+}
+
+fn is_stale_summary_error(error: &DataSourceError) -> bool {
+    matches!(
+        error,
+        DataSourceError::ReplayGap { message }
+            if message == "HTTP book snapshot timestamp regressed"
+    )
 }
 
 #[derive(Debug, Default)]
@@ -943,9 +1030,9 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::{
-        RawFrameAdapterError, RawPolymarketFrameAdapter, TokenBook, book_event,
+        RawFrameAdapterError, RawPolymarketFrameAdapter, SummaryRecovery, TokenBook, book_event,
         is_recoverable_reconstruction_error, market_event, next_connection_epoch,
-        observe_connected_since, replay_gap, sequenced_market_signal, trade_event,
+        observe_connected_since, recover_summary, replay_gap, sequenced_market_signal, trade_event,
     };
 
     fn metadata(sequence: i64) -> StreamMetadata {
@@ -1195,6 +1282,54 @@ mod tests {
         assert_eq!(book.bids.get(&Decimal::new(49, 2)), Some(&Decimal::from(2)));
         assert_eq!(book.asks.get(&Decimal::new(51, 2)), Some(&Decimal::from(3)));
         assert!(book.initialized);
+        Ok(())
+    }
+
+    #[test]
+    fn http_summary_recovery_resubscribes_only_for_stale_or_unavailable_data()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let token = U256::from(1_u64);
+        let initial: BookUpdate = serde_json::from_str(
+            r#"{"asset_id":"1","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"43","bids":[{"price":"0.49","size":"2"}],"asks":[{"price":"0.51","size":"3"}]}"#,
+        )?;
+        let mut book = TokenBook::default();
+        book.replace(&initial, token)?;
+
+        let stale: OrderBookSummaryResponse = serde_json::from_str(
+            r#"{"market":"0x0000000000000000000000000000000000000000000000000000000000000001","asset_id":"1","timestamp":"42","bids":[{"price":"0.48","size":"2"}],"asks":[{"price":"0.52","size":"3"}],"min_order_size":"1","neg_risk":false,"tick_size":"0.01"}"#,
+        )?;
+        assert!(matches!(
+            recover_summary(&mut book, Ok(stale), token),
+            SummaryRecovery::Resubscribe
+        ));
+        assert_eq!(book.timestamp_ms, 43);
+
+        assert!(matches!(
+            recover_summary(
+                &mut book,
+                Err(super::unavailable("HTTP transport unavailable")),
+                token,
+            ),
+            SummaryRecovery::Resubscribe
+        ));
+
+        let fresh: OrderBookSummaryResponse = serde_json::from_str(
+            r#"{"market":"0x0000000000000000000000000000000000000000000000000000000000000001","asset_id":"1","timestamp":"44","bids":[{"price":"0.48","size":"2"}],"asks":[{"price":"0.52","size":"3"}],"min_order_size":"1","neg_risk":false,"tick_size":"0.01"}"#,
+        )?;
+        assert!(matches!(
+            recover_summary(&mut book, Ok(fresh), token),
+            SummaryRecovery::Emit
+        ));
+        assert_eq!(book.timestamp_ms, 44);
+
+        let malformed: OrderBookSummaryResponse = serde_json::from_str(
+            r#"{"market":"0x0000000000000000000000000000000000000000000000000000000000000001","asset_id":"1","timestamp":"45","bids":[{"price":"0.48","size":"2"},{"price":"0.48","size":"1"}],"asks":[{"price":"0.52","size":"3"}],"min_order_size":"1","neg_risk":false,"tick_size":"0.01"}"#,
+        )?;
+        assert!(matches!(
+            recover_summary(&mut book, Ok(malformed), token),
+            SummaryRecovery::Terminal(DataSourceError::ReplayGap { message })
+                if message == "HTTP book snapshot contains a duplicate price"
+        ));
         Ok(())
     }
 
