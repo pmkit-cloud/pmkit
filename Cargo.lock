@@ -3651,18 +3651,21 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures-util",
+ "pmkit-book",
  "pmkit-core",
  "pmkit-event",
  "pmkit-market",
  "pmkit-run",
  "reqwest",
  "rust_decimal",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror",
  "tokio",
  "tokio-tungstenite",
  "zip",
+ "zstd",
 ]
 
 [[package]]

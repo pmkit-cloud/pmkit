@@ -397,7 +397,7 @@ async fn finalized_raw_batch_is_decoded_and_ingested_transactionally()
         topics: vec![
             "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a8df523b3ef".into(),
             "0x0000000000000000000000000000000000000000000000000000000000000001".into(),
-            format!("0x00000000000000000000000000000000000000000000000000000000000000aa"),
+            "0x00000000000000000000000000000000000000000000000000000000000000aa".into(),
         ],
         data: format!("0x{:064x}", 42),
     };

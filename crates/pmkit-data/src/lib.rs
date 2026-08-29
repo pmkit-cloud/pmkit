@@ -26,6 +26,7 @@ mod binance;
 mod binance_cache;
 mod binance_history;
 mod binance_live;
+mod cloud;
 
 #[cfg(test)]
 /// Test-only Binance archive cache fixtures and local HTTP server.
@@ -40,6 +41,11 @@ pub use binance::{
 pub use binance_cache::{BinanceArchiveLimits, CachePolicy, VerifiedBinanceArchiveCache};
 pub use binance_history::BinanceVisionHistory;
 pub use binance_live::BinanceAggTradeLive;
+pub use cloud::{
+    CloudApiKey, CloudCoverage, CloudCoverageInterval, CloudCoverageStatus, CloudMarketInstance,
+    CloudOutcomeToken, CloudReplayError, CloudReplayQuery, CloudReplaySelector,
+    PmKitCloudDataSource, RetrievalState,
+};
 
 /// An unmodified PM public-market frame plus the metadata needed to audit it.
 #[derive(Debug, Clone)]

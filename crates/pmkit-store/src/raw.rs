@@ -251,7 +251,7 @@ pub fn agree_on_finalized_heads(
         .iter()
         .map(agreement_count)
         .max()
-        .map_or(0, |count| count);
+        .unwrap_or(0);
     if let Some(agreed) = provider_heads
         .iter()
         .find(|candidate| agreement_count(candidate) >= required_provider_count)
