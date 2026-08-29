@@ -40,6 +40,7 @@ use tokio::sync::mpsc::Sender;
 use crate::{MarketTokens, from_venue_side};
 
 const MARKET_SOURCE_ID: &str = "polymarket:market-ws";
+const CLOB_HTTP_ENDPOINT: &str = "https://clob.polymarket.com";
 
 /// Adapts raw Polymarket frames into typed PM stream envelopes.
 pub trait PolymarketFrameAdapter {
@@ -277,10 +278,22 @@ pub struct PolymarketLiveData {
 }
 
 impl PolymarketLiveData {
-    /// Creates a credential-free source with the official SDK's default public endpoint.
-    #[must_use]
-    pub fn public(tokens: MarketTokens) -> Self {
-        Self::new(Client::default(), tokens)
+    /// Creates a credential-free source with the official public WebSocket and CLOB endpoints.
+    ///
+    /// # Errors
+    ///
+    /// Returns an unavailable data-source error when the official HTTP client cannot initialize.
+    pub fn public(tokens: MarketTokens) -> Result<Self, DataSourceError> {
+        let http_client = HttpClient::new(
+            CLOB_HTTP_ENDPOINT,
+            polymarket_client_sdk_v2::clob::Config::default(),
+        )
+        .map_err(|error| unavailable(&format!("Polymarket CLOB client failed: {error}")))?;
+        Ok(Self::with_http_client(
+            Client::default(),
+            http_client,
+            tokens,
+        ))
     }
 
     /// Creates a live source from an SDK WebSocket client and market token map.
