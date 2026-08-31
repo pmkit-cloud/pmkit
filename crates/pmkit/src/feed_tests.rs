@@ -331,7 +331,16 @@ async fn paper_and_live_accept_late_event_time_after_inferred_frontier()
         )
         .collect()
         .await?;
-        assert_eq!(facts.len(), 2);
+        let timestamps = facts
+            .iter()
+            .map(|fact| match fact {
+                StrategyFact::Market(MarketEvent::BookUpdate { timestamp_ms, .. }) => {
+                    Some(*timestamp_ms)
+                }
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>();
+        assert_eq!(timestamps, Some(vec![1_788_128_198_574, 1_788_128_198_575]));
     }
     Ok(())
 }
@@ -349,6 +358,33 @@ async fn paper_and_live_reject_data_older_than_emitted_watermark()
                     pm_with_receipt(1_788_128_198_575, 1, 1_788_128_198_575)?,
                     SourceSignal::Watermark(1_788_128_198_575),
                     pm_with_receipt(1_788_128_198_574, 2, 1_788_128_198_574)?,
+                    SourceSignal::Eof,
+                ],
+            )],
+            None,
+        )
+        .collect()
+        .await;
+        assert!(
+            matches!(result, Err(DataSourceError::ReplayGap { message }) if message.starts_with("late record from pm:"))
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn paper_and_live_reject_fact_older_than_already_released_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    for mode in [FeedMode::Paper, FeedMode::Live] {
+        let result = MergedFeed::from_fixture(
+            mode,
+            vec![SourceDefinition::finite(
+                "pm",
+                vec![
+                    pm_with_receipt(100, 1, 100)?,
+                    pm_with_receipt(102, 2, 102)?,
+                    pm_with_receipt(99, 3, 99)?,
+                    SourceSignal::Watermark(102),
                     SourceSignal::Eof,
                 ],
             )],

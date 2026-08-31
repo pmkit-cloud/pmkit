@@ -85,7 +85,7 @@ pub struct MergedFact {
     pub account_portfolio: Option<pmkit_core::PortfolioId>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct QueuedFact {
     source: String,
     key: CanonicalSourceKey,
@@ -392,6 +392,7 @@ impl MergedFeed {
         let source_count = states.len();
         let mut completed = 0_usize;
         let mut queued = BinaryHeap::new();
+        let mut last_released: Option<QueuedFact> = None;
         // A joined source may have already placed signals in the merge channel;
         // drain those before treating the source set as terminal.
         while completed < source_count || !queued.is_empty() || !rx.is_empty() {
@@ -413,23 +414,35 @@ impl MergedFeed {
                             } else {
                                 envelope.canonical_key()
                             };
-                            // Evaluate against the frontier established before this
-                            // frame. A frame must not reject itself merely because
-                            // its receipt-time bound is derived while handling it.
-                            let frontier = state.frontier(mode);
+                            let candidate = QueuedFact {
+                                source: source.clone(),
+                                key,
+                                fact: merged_fact(envelope),
+                            };
+                            // Evaluate explicit watermarks and the released ordering
+                            // bound established before this frame. A frame must not
+                            // reject itself merely because its receipt-time bound is
+                            // derived while handling it; inferred bounds only release.
+                            let watermark = state.watermark;
+                            let released_timestamp = last_released
+                                .as_ref()
+                                .map(|released| released.key.timestamp_ms());
                             let late = state.eof_seen
-                                || state
-                                    .watermark
-                                    .is_some_and(|watermark| key.timestamp_ms() <= watermark);
+                                || watermark.is_some_and(|watermark| {
+                                    candidate.key.timestamp_ms() <= watermark
+                                })
+                                || last_released
+                                    .as_ref()
+                                    .is_some_and(|released| candidate.cmp(released).is_lt());
                             if late {
                                 Some(replay_gap(&format!(
-                                    "late record from {source}: timestamp={} frontier={frontier:?} eof={}",
-                                    key.timestamp_ms(),
+                                    "late record from {source}: timestamp={} watermark={watermark:?} released_timestamp={released_timestamp:?} eof={}",
+                                    candidate.key.timestamp_ms(),
                                     state.eof_seen,
                                 )))
                             } else {
                                 let live_frontier = matches!(mode, FeedMode::Paper | FeedMode::Live)
-                                    .then(|| live_watermark(envelope.metadata().receipt_time_ms));
+                                    .then(|| live_watermark(candidate.fact.metadata.receipt_time_ms));
                                 state.bounded_frontier_ms = state
                                     .bounded_frontier_ms
                                     .max(live_frontier);
@@ -437,15 +450,13 @@ impl MergedFeed {
                                     state
                                         .last_event_timestamp_ms
                                         .map_or_else(
-                                            || key.timestamp_ms(),
-                                            |previous| previous.max(key.timestamp_ms()),
+                                            || candidate.key.timestamp_ms(),
+                                            |previous| {
+                                                previous.max(candidate.key.timestamp_ms())
+                                            },
                                         ),
                                 );
-                                queued.push(Reverse(QueuedFact {
-                                    source: source.clone(),
-                                    key,
-                                    fact: merged_fact(envelope),
-                                }));
+                                queued.push(Reverse(candidate));
                                 None
                             }
                         }
@@ -476,7 +487,15 @@ impl MergedFeed {
                     }
                     report_health(metrics.as_ref(), &states, mode);
                     let cancelled = match
-                        release_safe(&mut queued, &states, &output, mode, cancellation.as_ref()).await
+                        release_safe(
+                            &mut queued,
+                            &mut last_released,
+                            &states,
+                            &output,
+                            mode,
+                            cancellation.as_ref(),
+                        )
+                        .await
                     {
                         Ok(cancelled) => cancelled,
                         Err(DataSourceError::SinkClosed)
@@ -531,7 +550,15 @@ impl MergedFeed {
                     }
                     completed += 1;
                     let cancelled = match
-                        release_safe(&mut queued, &states, &output, mode, cancellation.as_ref()).await
+                        release_safe(
+                            &mut queued,
+                            &mut last_released,
+                            &states,
+                            &output,
+                            mode,
+                            cancellation.as_ref(),
+                        )
+                        .await
                     {
                         Ok(cancelled) => cancelled,
                         Err(DataSourceError::SinkClosed)
@@ -612,6 +639,7 @@ fn merged_fact(envelope: SourceEnvelope) -> MergedFact {
 
 async fn release_safe(
     queued: &mut BinaryHeap<Reverse<QueuedFact>>,
+    last_released: &mut Option<QueuedFact>,
     states: &HashMap<String, SourceState>,
     output: &mpsc::Sender<MergedFact>,
     mode: FeedMode,
@@ -624,10 +652,12 @@ async fn release_safe(
             .is_some_and(|next| next.0.key.timestamp_ms() <= watermark)
     }) {
         if let Some(Reverse(next)) = queued.pop() {
+            let released = next.clone();
             if let Some(cancellation) = cancellation {
                 tokio::select! {
                     result = output.send(next.fact) => {
                         result.map_err(|_| DataSourceError::SinkClosed)?;
+                        *last_released = Some(released);
                     }
                     () = cancellation.wait() => return Ok(true),
                 }
@@ -636,6 +666,7 @@ async fn release_safe(
                     .send(next.fact)
                     .await
                     .map_err(|_| DataSourceError::SinkClosed)?;
+                *last_released = Some(released);
             }
         }
     }
