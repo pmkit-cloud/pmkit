@@ -310,26 +310,56 @@ async fn live_frame_is_checked_before_its_receipt_frontier()
 }
 
 #[tokio::test]
-async fn live_rejects_data_older_than_emitted_watermark() -> Result<(), Box<dyn std::error::Error>>
-{
-    let result = MergedFeed::from_fixture(
-        FeedMode::Live,
-        vec![SourceDefinition::finite(
-            "pm",
-            vec![
-                pm(10, 1)?,
-                SourceSignal::Watermark(20),
-                pm(15, 2)?,
-                SourceSignal::Eof,
-            ],
-        )],
-        None,
-    )
-    .collect()
-    .await;
-    assert!(
-        matches!(result, Err(DataSourceError::ReplayGap { message }) if message.starts_with("late record from pm:"))
-    );
+async fn paper_and_live_accept_late_event_time_after_inferred_frontier()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The event times step from 1788128198575 to 1788128198574, while the
+    // first receipt only infers a frontier of 1788128198575. No declared
+    // watermark precedes the late receipt; the final watermark closes both.
+    for mode in [FeedMode::Paper, FeedMode::Live] {
+        let facts = MergedFeed::from_fixture(
+            mode,
+            vec![SourceDefinition::finite(
+                "pm",
+                vec![
+                    pm_with_receipt(1_788_128_198_575, 1, 1_788_128_198_576)?,
+                    pm_with_receipt(1_788_128_198_574, 2, 1_788_128_198_574)?,
+                    SourceSignal::Watermark(1_788_128_198_576),
+                    SourceSignal::Eof,
+                ],
+            )],
+            None,
+        )
+        .collect()
+        .await?;
+        assert_eq!(facts.len(), 2);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn paper_and_live_reject_data_older_than_emitted_watermark()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The same 1788128198575 -> 1788128198574 pair is a gap once 8575 is declared.
+    for mode in [FeedMode::Paper, FeedMode::Live] {
+        let result = MergedFeed::from_fixture(
+            mode,
+            vec![SourceDefinition::finite(
+                "pm",
+                vec![
+                    pm_with_receipt(1_788_128_198_575, 1, 1_788_128_198_575)?,
+                    SourceSignal::Watermark(1_788_128_198_575),
+                    pm_with_receipt(1_788_128_198_574, 2, 1_788_128_198_574)?,
+                    SourceSignal::Eof,
+                ],
+            )],
+            None,
+        )
+        .collect()
+        .await;
+        assert!(
+            matches!(result, Err(DataSourceError::ReplayGap { message }) if message.starts_with("late record from pm:"))
+        );
+    }
     Ok(())
 }
 

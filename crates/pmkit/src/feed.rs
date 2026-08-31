@@ -418,7 +418,9 @@ impl MergedFeed {
                             // its receipt-time bound is derived while handling it.
                             let frontier = state.frontier(mode);
                             let late = state.eof_seen
-                                || frontier.is_some_and(|frontier| key.timestamp_ms() <= frontier);
+                                || state
+                                    .watermark
+                                    .is_some_and(|watermark| key.timestamp_ms() <= watermark);
                             if late {
                                 Some(replay_gap(&format!(
                                     "late record from {source}: timestamp={} frontier={frontier:?} eof={}",
