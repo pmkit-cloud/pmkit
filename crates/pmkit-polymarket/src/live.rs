@@ -41,6 +41,9 @@ use crate::{MarketTokens, from_venue_side};
 
 const MARKET_SOURCE_ID: &str = "polymarket:market-ws";
 const CLOB_HTTP_ENDPOINT: &str = "https://clob.polymarket.com";
+const CLOB_WS_ENDPOINT: &str = "wss://ws-subscriptions-clob.polymarket.com";
+// Keep the SDK default conservative; this recorder opts into extra headroom for its durable sink.
+const MARKET_EVENT_BUFFER_CAPACITY: usize = 65_536;
 
 /// Adapts raw Polymarket frames into typed PM stream envelopes.
 pub trait PolymarketFrameAdapter {
@@ -289,11 +292,12 @@ impl PolymarketLiveData {
             polymarket_client_sdk_v2::clob::Config::default(),
         )
         .map_err(|error| unavailable(&format!("Polymarket CLOB client failed: {error}")))?;
-        Ok(Self::with_http_client(
-            Client::default(),
-            http_client,
-            tokens,
-        ))
+        let ws_config = polymarket_client_sdk_v2::ws::config::Config::default()
+            .with_event_buffer_capacity(MARKET_EVENT_BUFFER_CAPACITY);
+        let client = Client::new(CLOB_WS_ENDPOINT, ws_config).map_err(|error| {
+            unavailable(&format!("Polymarket WebSocket client failed: {error}"))
+        })?;
+        Ok(Self::with_http_client(client, http_client, tokens))
     }
 
     /// Creates a live source from an SDK WebSocket client and market token map.
