@@ -14,7 +14,9 @@ use crate::{
 };
 
 const BINANCE_WS_BASE: &str = "wss://stream.binance.com:9443/ws";
-const BINANCE_CONNECT_TIMEOUT_MS: u64 = 1_000;
+// Public TLS/WebSocket setup can exceed one second during normal network jitter;
+// keep the timeout bounded without failing healthy first connections.
+const BINANCE_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const BINANCE_MAX_RECONNECT_ATTEMPTS: usize = 3;
 const BINANCE_RECONNECT_DELAY_MS: u64 = 100;
 
@@ -490,7 +492,7 @@ mod tests {
         let (sink, mut events) = mpsc::channel(8);
 
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(6),
+            std::time::Duration::from_secs(22),
             source.subscribe_reference(sink),
         )
         .await;
