@@ -14,6 +14,7 @@ use crate::{
 };
 
 const BINANCE_WS_BASE: &str = "wss://stream.binance.com:9443/ws";
+const BINANCE_CONNECT_TIMEOUT_MS: u64 = 1_000;
 const BINANCE_MAX_RECONNECT_ATTEMPTS: usize = 3;
 const BINANCE_RECONNECT_DELAY_MS: u64 = 100;
 
@@ -54,7 +55,16 @@ impl LiveCexDataSource for BinanceAggTradeLive {
         let mut last_aggregate_trade_id: Option<u64> = None;
 
         loop {
-            let (mut socket, _) = match connect_async(self.endpoint.as_ref()).await {
+            let connection = tokio::time::timeout(
+                std::time::Duration::from_millis(BINANCE_CONNECT_TIMEOUT_MS),
+                connect_async(self.endpoint.as_ref()),
+            )
+            .await
+            .map_err(|_| "Binance aggTrade connection timed out".to_owned())
+            .and_then(|connection| {
+                connection.map_err(|error| format!("Binance aggTrade connection failed: {error}"))
+            });
+            let (mut socket, _) = match connection {
                 Ok(connection) => {
                     if had_connection {
                         connection_epoch = connection_epoch.checked_add(1).ok_or_else(|| {
@@ -66,10 +76,8 @@ impl LiveCexDataSource for BinanceAggTradeLive {
                     had_connection = true;
                     connection
                 }
-                Err(error) => {
-                    let error = DataSourceError::Unavailable {
-                        message: format!("Binance aggTrade connection failed: {error}"),
-                    };
+                Err(message) => {
+                    let error = DataSourceError::Unavailable { message };
                     if reconnect_attempts >= BINANCE_MAX_RECONNECT_ATTEMPTS {
                         return Err(error);
                     }
@@ -158,6 +166,7 @@ impl LiveCexDataSource for BinanceAggTradeLive {
                 ))))
                 .await
                 .map_err(|_| DataSourceError::SinkClosed)?;
+                reconnect_attempts = 0;
             };
             if reconnect_attempts >= BINANCE_MAX_RECONNECT_ATTEMPTS {
                 return Err(disconnect);
@@ -176,7 +185,7 @@ mod tests {
     use pmkit_event::{CexReferenceEvent, SourceEnvelope};
     use pmkit_market::Asset;
     use tokio::net::TcpListener;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
     #[tokio::test]
@@ -254,6 +263,99 @@ mod tests {
             "receipt ordering must survive reconnect"
         );
         server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_attempts_reset_after_data_delivery()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let mut accepted = 0;
+            for _ in 0..(BINANCE_MAX_RECONNECT_ATTEMPTS - 1) {
+                let (stream, _) = listener.accept().await?;
+                let socket = accept_async(stream).await?;
+                drop(socket);
+                accepted += 1;
+            }
+            let (stream, _) = listener.accept().await?;
+            let mut socket = accept_async(stream).await?;
+            socket
+                .send(Message::Text(
+                    r#"{"e":"aggTrade","a":7,"p":"0.42","q":"1","T":1735689600123,"m":false}"#
+                        .into(),
+                ))
+                .await?;
+            drop(socket);
+            accepted += 1;
+            for _ in 0..BINANCE_MAX_RECONNECT_ATTEMPTS {
+                let (stream, _) = listener.accept().await?;
+                let socket = accept_async(stream).await?;
+                drop(socket);
+                accepted += 1;
+            }
+            Ok::<usize, Box<dyn std::error::Error + Send + Sync>>(accepted)
+        });
+        let source = BinanceAggTradeLive::with_endpoint(Asset::Btc, &format!("ws://{address}"));
+        let (sink, mut events) = mpsc::channel(8);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            source.subscribe_reference(sink),
+        )
+        .await?;
+        assert!(matches!(result, Err(DataSourceError::Unavailable { .. })));
+        let Some(SourceSignal::Data(envelope)) = events.recv().await else {
+            return Err("expected one normalized CEX event".into());
+        };
+        let SourceEnvelope::CexReference(envelope) = *envelope else {
+            return Err("expected CEX envelope".into());
+        };
+        let CexReferenceEvent::Trade {
+            aggregate_trade_id, ..
+        } = envelope.fact;
+        assert_eq!(aggregate_trade_id, 7);
+        assert!(events.recv().await.is_none());
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(1), server).await??;
+        assert_eq!(accepted?, BINANCE_MAX_RECONNECT_ATTEMPTS * 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connect_handshake_timeout_is_bounded_and_unavailable()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (release, wait) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let mut streams = Vec::new();
+            for _ in 0..=BINANCE_MAX_RECONNECT_ATTEMPTS {
+                let (stream, _) = listener.accept().await?;
+                streams.push(stream);
+            }
+            let accepted = streams.len();
+            let _ = wait.await;
+            Ok::<usize, Box<dyn std::error::Error + Send + Sync>>(accepted)
+        });
+        let source = BinanceAggTradeLive::with_endpoint(Asset::Btc, &format!("ws://{address}"));
+        let (sink, mut events) = mpsc::channel(8);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            source.subscribe_reference(sink),
+        )
+        .await;
+        drop(release);
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(1), server).await??;
+        let result = result?;
+        assert!(matches!(
+            result,
+            Err(DataSourceError::Unavailable { message })
+                if message == "Binance aggTrade connection timed out"
+        ));
+        assert!(events.recv().await.is_none());
+        assert_eq!(accepted?, BINANCE_MAX_RECONNECT_ATTEMPTS + 1);
         Ok(())
     }
 
