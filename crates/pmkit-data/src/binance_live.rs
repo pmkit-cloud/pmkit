@@ -15,7 +15,7 @@ use crate::{
 
 const BINANCE_WS_BASE: &str = "wss://stream.binance.com:9443/ws";
 const BINANCE_MAX_RECONNECT_ATTEMPTS: usize = 3;
-const BINANCE_RECONNECT_BACKOFF_MS: u64 = 100;
+const BINANCE_RECONNECT_DELAY_MS: u64 = 100;
 
 /// A live Binance `@aggTrade` source paired with Vision archive replay.
 #[derive(Debug, Clone)]
@@ -75,7 +75,7 @@ impl LiveCexDataSource for BinanceAggTradeLive {
                     }
                     reconnect_attempts += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(
-                        BINANCE_RECONNECT_BACKOFF_MS,
+                        BINANCE_RECONNECT_DELAY_MS,
                     ))
                     .await;
                     continue;
@@ -163,10 +163,7 @@ impl LiveCexDataSource for BinanceAggTradeLive {
                 return Err(disconnect);
             }
             reconnect_attempts += 1;
-            tokio::time::sleep(std::time::Duration::from_millis(
-                BINANCE_RECONNECT_BACKOFF_MS,
-            ))
-            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(BINANCE_RECONNECT_DELAY_MS)).await;
         }
     }
 }
@@ -256,6 +253,52 @@ mod tests {
             envelopes[0].metadata.receipt_time_ms <= envelopes[1].metadata.receipt_time_ms,
             "receipt ordering must survive reconnect"
         );
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_rejects_non_consecutive_aggregate_trade_before_emitting_it()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            for payload in [
+                r#"{"e":"aggTrade","a":7,"p":"0.42","q":"1","T":1735689600123,"m":false}"#,
+                r#"{"e":"aggTrade","a":9,"p":"0.43","q":"1","T":1735689601123,"m":false}"#,
+            ] {
+                let (stream, _) = listener.accept().await?;
+                let mut socket = accept_async(stream).await?;
+                socket.send(Message::Text(payload.into())).await?;
+                socket.close(None).await?;
+            }
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        let source = BinanceAggTradeLive::with_endpoint(Asset::Btc, &format!("ws://{address}"));
+        let (sink, mut events) = mpsc::channel(8);
+
+        let result = source.subscribe_reference(sink).await;
+        assert!(matches!(
+            result,
+            Err(DataSourceError::ReplayGap { message })
+                if message == "Binance aggregate trade gap: expected 8, got 9"
+        ));
+        let mut envelopes = Vec::new();
+        while let Some(signal) = events.recv().await {
+            let SourceSignal::Data(envelope) = signal else {
+                return Err("reconnect must not synthesize a lifecycle signal".into());
+            };
+            let SourceEnvelope::CexReference(envelope) = *envelope else {
+                return Err("expected CEX envelope".into());
+            };
+            envelopes.push(envelope);
+        }
+
+        assert_eq!(envelopes.len(), 1);
+        let CexReferenceEvent::Trade {
+            aggregate_trade_id, ..
+        } = &envelopes[0].fact;
+        assert_eq!(*aggregate_trade_id, 7);
         server.await??;
         Ok(())
     }
