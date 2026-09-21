@@ -745,7 +745,6 @@ impl LiveRiskState {
         self.realized_pnl
     }
 
-    #[cfg(test)]
     pub(super) fn daily_pnl(&self) -> Option<Decimal> {
         let mut unrealized_pnl = Decimal::ZERO;
         for (market, positions) in &self.positions_by_market {

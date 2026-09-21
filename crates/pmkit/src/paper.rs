@@ -1,13 +1,13 @@
 use super::{
-    PaperReport, RunControl, RunLifecycleEvent, StartError, instantiate_strategies,
-    observe_reconnect, store_signal, validate_account_owner,
+    PaperReport, RunControl, RunLifecycleEvent, StartError, StrategyInstance,
+    instantiate_strategies, observe_reconnect, store_signal, validate_account_owner,
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_accounting::{
     ExposureReservation, PortfolioExposure, PositionExposure, aggregate_exposure,
 };
 use pmkit_book::OrderBookL2;
-use pmkit_event::{MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
+use pmkit_event::{CexReferenceEvent, MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
 use pmkit_exec::ExecError;
 use pmkit_market::Outcome;
 use pmkit_paper::{PaperExecutor, PaperLedgerEntry, PaperLedgerError};
@@ -208,6 +208,7 @@ pub async fn drive_with_control(
     let mut fills = paper.fill_count();
     metrics.set_fills(fills);
     let mut marks = HashMap::new();
+    let empty_book = OrderBookL2::default();
     let mut connection_epochs = HashMap::new();
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     control.emit(RunLifecycleEvent::Started {
@@ -257,6 +258,68 @@ pub async fn drive_with_control(
         })?;
         if let SourceEnvelope::CexReference(envelope) = &merged.source {
             cex_metrics.observe(&envelope.fact);
+            let CexReferenceEvent::Trade {
+                aggregate_trade_id,
+                timestamp_ms,
+                ..
+            } = &envelope.fact;
+            // CEX facts have no PM outcome, so fan them out once with an
+            // explicitly empty book in stable registration order.
+            for instance in &mut *strategies {
+                let positions = paper.positions_for_market(&instance.market);
+                let evaluation = dispatch_strategy(
+                    instance,
+                    &merged.fact,
+                    &empty_book,
+                    &positions,
+                    *timestamp_ms,
+                    &paper,
+                    &mut fill_rx,
+                    &metrics,
+                    store,
+                    &scope,
+                    run.id(),
+                )
+                .await?;
+                if let Some(store) = store {
+                    let identity = CausalIdentity {
+                        scope: scope.clone(),
+                        correlation_id: crate::live::strategy_event_correlation_id(
+                            &instance.id,
+                            &instance.market,
+                            *timestamp_ms,
+                            "cex-trade",
+                            &envelope.metadata.source_id,
+                            Some(*aggregate_trade_id),
+                            envelope.metadata.ingest_sequence,
+                        ),
+                        source_timestamp_ms: envelope.metadata.source_time_ms,
+                        ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
+                            .unwrap_or(i64::MAX),
+                    };
+                    let mut snapshot = crate::causal::DecisionSnapshot::from_book(
+                        &empty_book,
+                        cex_metrics.snapshot(),
+                    )
+                    .with_simulation(simulation_config);
+                    snapshot.observation_timestamp_ms = *timestamp_ms;
+                    snapshot.decision_timestamp_ms = *timestamp_ms;
+                    let decision = if let Some(message) = evaluation.strategy_error {
+                        crate::causal::DecisionKind::StrategyError { message }
+                    } else if evaluation.verdicts.is_empty() {
+                        crate::causal::DecisionKind::NoAction
+                    } else {
+                        crate::causal::DecisionKind::Actions(evaluation.verdicts)
+                    };
+                    crate::causal::CausalRecorder::new(store)
+                        .record_evaluation(&identity, &snapshot, decision)
+                        .await
+                        .map_err(|source| StartError::Storage {
+                            run: run.id().clone(),
+                            source,
+                        })?;
+                }
+            }
             continue;
         }
         if let SourceEnvelope::PmAccount(envelope) = &merged.source {
@@ -344,53 +407,26 @@ pub async fn drive_with_control(
                     continue;
                 }
                 let positions = paper.positions_for_market(market);
-                let context = StrategyContext {
-                    fact: &fact,
-                    market,
-                    book: &book,
-                    positions: &positions,
-                    now: LogicalTimestamp::from_millis(*timestamp_ms),
-                };
-                metrics.decision();
-                if let Ok(actions) = instance.strategy.on_event(context) {
-                    for action in actions.as_slice() {
-                        if let Action::Place(order) = action {
-                            let submit_result = paper
-                                .submit_for_strategy(order, instance.id.clone(), *timestamp_ms)
-                                .await;
-                            metrics.set_fills(paper.fill_count());
-                            if matches!(&submit_result, Err(ExecError::Rejected { .. })) {
-                                metrics.reject();
-                            }
-                            if let Some(store) = store {
-                                persist_paper_ledger(store, &scope, &paper).await.map_err(
-                                    |source| StartError::Storage {
-                                        run: run.id().clone(),
-                                        source,
-                                    },
-                                )?;
-                            } else {
-                                paper.drain_ledger();
-                            }
-                            match submit_result {
-                                Ok(_) => {
-                                    actions_placed = actions_placed.saturating_add(1);
-                                }
-                                Err(ExecError::Rejected { .. }) => {}
-                                Err(source) => {
-                                    return Err(StartError::ExecutionState {
-                                        run: run.id().clone(),
-                                        source,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-                drain_fills(&mut fill_rx);
-                fills = paper.fill_count();
-                metrics.set_fills(fills);
+                actions_placed = actions_placed.saturating_add(
+                    dispatch_strategy(
+                        instance,
+                        &fact,
+                        &book,
+                        &positions,
+                        *timestamp_ms,
+                        &paper,
+                        &mut fill_rx,
+                        &metrics,
+                        store,
+                        &scope,
+                        run.id(),
+                    )
+                    .await?
+                    .actions_placed,
+                );
             }
+            fills = paper.fill_count();
+            metrics.set_fills(fills);
             if let Some(store) = store {
                 let identity = CausalIdentity {
                     scope: scope.clone(),
@@ -441,6 +477,95 @@ pub async fn drive_with_control(
         fills: metrics.fills,
         metrics,
         exposure: report_exposure(&paper.account_state(), &marks),
+    })
+}
+
+struct StrategyDispatchResult {
+    actions_placed: u32,
+    verdicts: Vec<crate::causal::ActionRiskVerdict>,
+    strategy_error: Option<String>,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shared dispatch carries the paper driver state without changing its ownership"
+)]
+async fn dispatch_strategy(
+    instance: &mut StrategyInstance,
+    fact: &StrategyFact,
+    book: &OrderBookL2,
+    positions: &[pmkit_book::Position],
+    timestamp_ms: i64,
+    paper: &PaperExecutor,
+    fill_rx: &mut tokio::sync::mpsc::Receiver<MarketEvent>,
+    metrics: &crate::RunMetrics,
+    store: Option<&dyn TapeStore>,
+    scope: &OwnerScope,
+    run: &pmkit_core::RunId,
+) -> Result<StrategyDispatchResult, StartError> {
+    let strategy_id = instance.id.clone();
+    let context = StrategyContext {
+        fact,
+        market: &instance.market,
+        book,
+        positions,
+        now: LogicalTimestamp::from_millis(timestamp_ms),
+    };
+    metrics.decision();
+    let mut actions_placed = 0_u32;
+    let mut verdicts = Vec::new();
+    let strategy_error = match instance.strategy.on_event(context) {
+        Ok(actions) => {
+            for (action_index, action) in actions.as_slice().iter().enumerate() {
+                if let Action::Place(order) = action {
+                    let action_index = u32::try_from(action_index).unwrap_or(u32::MAX);
+                    let submit_result = paper
+                        .submit_for_strategy(order, strategy_id.clone(), timestamp_ms)
+                        .await;
+                    metrics.set_fills(paper.fill_count());
+                    if matches!(&submit_result, Err(ExecError::Rejected { .. })) {
+                        metrics.reject();
+                    }
+                    if let Some(store) = store {
+                        persist_paper_ledger(store, scope, paper)
+                            .await
+                            .map_err(|source| StartError::Storage {
+                                run: run.clone(),
+                                source,
+                            })?;
+                    } else {
+                        paper.drain_ledger();
+                    }
+                    match submit_result {
+                        Ok(_) => {
+                            actions_placed = actions_placed.saturating_add(1);
+                            verdicts.push(crate::causal::ActionRiskVerdict::accepted(action_index));
+                        }
+                        Err(ExecError::Rejected { reason }) => {
+                            verdicts.push(crate::causal::ActionRiskVerdict::rejected(
+                                action_index,
+                                reason,
+                            ));
+                        }
+                        Err(source) => {
+                            return Err(StartError::ExecutionState {
+                                run: run.clone(),
+                                source,
+                            });
+                        }
+                    }
+                }
+            }
+            None
+        }
+        Err(error) => Some(error.to_string()),
+    };
+    drain_fills(fill_rx);
+    metrics.set_fills(paper.fill_count());
+    Ok(StrategyDispatchResult {
+        actions_placed,
+        verdicts,
+        strategy_error,
     })
 }
 

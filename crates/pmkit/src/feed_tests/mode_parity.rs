@@ -5,11 +5,15 @@ use crate::{
 use async_trait::async_trait;
 use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
 use pmkit_data::{
-    DataSourceError, HistoricalDataSource, LiveDataSource, ReplayQuery, SourceSignal,
+    DataSourceError, HistoricalDataSource, LiveCexDataSource, LiveDataSource, ReplayQuery,
+    SourceSignal,
 };
-use pmkit_event::{MarketEvent, StrategyFact};
+use pmkit_event::{
+    CexReferenceEnvelope, CexReferenceEvent, MarketEvent, SourceEnvelope, StrategyFact,
+    StreamMetadata,
+};
 use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
-use pmkit_market::Outcome;
+use pmkit_market::{Asset, Exchange, Outcome};
 use pmkit_money::Money;
 use pmkit_run::{EvidenceRequirement, RetrievalWait};
 use pmkit_runtime::StrategyRegistration;
@@ -25,6 +29,8 @@ use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
 struct ParitySource;
+
+struct ParityReference;
 
 async fn emit_market(
     market: MarketId,
@@ -75,6 +81,61 @@ impl LiveDataSource for ParitySource {
         sink: Sender<SourceSignal>,
     ) -> Result<(), DataSourceError> {
         emit_market(market, outcome, sink).await
+    }
+}
+
+async fn emit_reference(sink: Sender<SourceSignal>) -> Result<(), DataSourceError> {
+    for (aggregate_trade_id, price, sequence) in [(9, 42, 9_u64), (10, 43, 10_u64)] {
+        sink.send(SourceSignal::Data(Box::new(SourceEnvelope::CexReference(
+            CexReferenceEnvelope {
+                metadata: StreamMetadata {
+                    schema_version: 1,
+                    source_id: "binance-parity".into(),
+                    source_time_ms: 2_000,
+                    canonical_source_rank: 1,
+                    receipt_time_ms: 2_000,
+                    connection_id: "binance-parity".into(),
+                    connection_epoch: 0,
+                    frame_sequence: i64::try_from(sequence).unwrap_or(i64::MAX),
+                    ingest_sequence: sequence,
+                },
+                fact: CexReferenceEvent::Trade {
+                    asset: Asset::Btc,
+                    exchange: Exchange::Binance,
+                    aggregate_trade_id,
+                    price: Decimal::from(price),
+                    qty: Decimal::ONE,
+                    is_buyer_maker: false,
+                    timestamp_ms: 2_000,
+                },
+            },
+        ))))
+        .await
+        .map_err(|_| DataSourceError::SinkClosed)?;
+    }
+    sink.send(SourceSignal::Watermark(i64::MAX))
+        .await
+        .map_err(|_| DataSourceError::SinkClosed)?;
+    sink.send(SourceSignal::Eof)
+        .await
+        .map_err(|_| DataSourceError::SinkClosed)
+}
+
+#[async_trait]
+impl HistoricalDataSource for ParityReference {
+    async fn replay(
+        &self,
+        _query: ReplayQuery,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        emit_reference(sink).await
+    }
+}
+
+#[async_trait]
+impl LiveCexDataSource for ParityReference {
+    async fn subscribe_reference(&self, sink: Sender<SourceSignal>) -> Result<(), DataSourceError> {
+        emit_reference(sink).await
     }
 }
 
@@ -177,7 +238,8 @@ async fn actual_modes_observe_identical_facts_and_portable_decisions()
             "2026-02-01T00:00:00Z".parse()?,
             EvidenceRequirement::CorroboratedOnly,
             RetrievalWait::ReturnPending,
-        );
+        )
+        .reference_source(Arc::new(ParityReference));
         let backtest_run = BacktestRun::new(
             RunId::new("parity-backtest")?,
             portfolio.clone(),
@@ -195,6 +257,7 @@ async fn actual_modes_observe_identical_facts_and_portable_decisions()
             Arc::new(ParitySource),
             simulation(),
         )
+        .reference_data(Arc::new(ParityReference))
         .strategy(registration(&paper_facts)?);
         let live_run = LiveRun::new(
             RunId::new("parity-live")?,
@@ -203,6 +266,7 @@ async fn actual_modes_observe_identical_facts_and_portable_decisions()
             Arc::new(ParitySource),
             risk()?,
         )
+        .reference_data(Arc::new(ParityReference))
         .strategy(registration(&live_facts)?);
 
         // When: each driver persists the fact and its causal decision.
@@ -213,15 +277,21 @@ async fn actual_modes_observe_identical_facts_and_portable_decisions()
         let live_report =
             live::drive_with_control(&live_run, &config()?, Some(&store), &control).await?;
         let mut decisions = Vec::new();
+        let mut reference_decisions = Vec::new();
         for run in ["parity-backtest", "parity-paper", "parity-live"] {
             let scope = OwnerScope::new(portfolio.clone(), RunId::new(run)?);
-            let decision = store
-                .read_decisions(&scope)
-                .await?
-                .into_iter()
+            let run_decisions = store.read_decisions(&scope).await?;
+            let decision = run_decisions
+                .iter()
                 .find(|decision| decision.payload["snapshot"].is_object())
                 .ok_or("missing parity decision")?;
-            decisions.push(portable_decision(&decision));
+            decisions.push(portable_decision(decision));
+            let references = run_decisions
+                .iter()
+                .filter(|decision| decision.identity.correlation_id.contains(":cex-trade:"))
+                .map(portable_decision)
+                .collect::<Vec<_>>();
+            reference_decisions.push(references);
         }
 
         // Then: every driver exposes the same fact and mode-independent decision.
@@ -238,8 +308,15 @@ async fn actual_modes_observe_identical_facts_and_portable_decisions()
         assert_eq!(captured(&live_facts), expected_facts);
         assert!(matches!(
             expected_facts.as_slice(),
-            [StrategyFact::Market(_)]
+            [
+                StrategyFact::Market(_),
+                StrategyFact::Reference(_),
+                StrategyFact::Reference(_)
+            ]
         ));
+        assert_eq!(reference_decisions[0].len(), 2);
+        assert_eq!(reference_decisions[1], reference_decisions[0]);
+        assert_eq!(reference_decisions[2], reference_decisions[0]);
         assert_eq!(decisions[1], decisions[0]);
         assert_eq!(decisions[2], decisions[0]);
         store.delete_database()?;
