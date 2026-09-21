@@ -304,7 +304,9 @@ pub async fn drive_with_control(
                     .with_simulation(simulation_config);
                     snapshot.observation_timestamp_ms = *timestamp_ms;
                     snapshot.decision_timestamp_ms = *timestamp_ms;
-                    let decision = if evaluation.verdicts.is_empty() {
+                    let decision = if let Some(message) = evaluation.strategy_error {
+                        crate::causal::DecisionKind::StrategyError { message }
+                    } else if evaluation.verdicts.is_empty() {
                         crate::causal::DecisionKind::NoAction
                     } else {
                         crate::causal::DecisionKind::Actions(evaluation.verdicts)
@@ -481,6 +483,7 @@ pub async fn drive_with_control(
 struct StrategyDispatchResult {
     actions_placed: u32,
     verdicts: Vec<crate::causal::ActionRiskVerdict>,
+    strategy_error: Option<String>,
 }
 
 #[expect(
@@ -511,53 +514,58 @@ async fn dispatch_strategy(
     metrics.decision();
     let mut actions_placed = 0_u32;
     let mut verdicts = Vec::new();
-    if let Ok(actions) = instance.strategy.on_event(context) {
-        for (action_index, action) in actions.as_slice().iter().enumerate() {
-            if let Action::Place(order) = action {
-                let action_index = u32::try_from(action_index).unwrap_or(u32::MAX);
-                let submit_result = paper
-                    .submit_for_strategy(order, strategy_id.clone(), timestamp_ms)
-                    .await;
-                metrics.set_fills(paper.fill_count());
-                if matches!(&submit_result, Err(ExecError::Rejected { .. })) {
-                    metrics.reject();
-                }
-                if let Some(store) = store {
-                    persist_paper_ledger(store, scope, paper)
-                        .await
-                        .map_err(|source| StartError::Storage {
-                            run: run.clone(),
-                            source,
-                        })?;
-                } else {
-                    paper.drain_ledger();
-                }
-                match submit_result {
-                    Ok(_) => {
-                        actions_placed = actions_placed.saturating_add(1);
-                        verdicts.push(crate::causal::ActionRiskVerdict::accepted(action_index));
+    let strategy_error = match instance.strategy.on_event(context) {
+        Ok(actions) => {
+            for (action_index, action) in actions.as_slice().iter().enumerate() {
+                if let Action::Place(order) = action {
+                    let action_index = u32::try_from(action_index).unwrap_or(u32::MAX);
+                    let submit_result = paper
+                        .submit_for_strategy(order, strategy_id.clone(), timestamp_ms)
+                        .await;
+                    metrics.set_fills(paper.fill_count());
+                    if matches!(&submit_result, Err(ExecError::Rejected { .. })) {
+                        metrics.reject();
                     }
-                    Err(ExecError::Rejected { reason }) => {
-                        verdicts.push(crate::causal::ActionRiskVerdict::rejected(
-                            action_index,
-                            reason,
-                        ));
+                    if let Some(store) = store {
+                        persist_paper_ledger(store, scope, paper)
+                            .await
+                            .map_err(|source| StartError::Storage {
+                                run: run.clone(),
+                                source,
+                            })?;
+                    } else {
+                        paper.drain_ledger();
                     }
-                    Err(source) => {
-                        return Err(StartError::ExecutionState {
-                            run: run.clone(),
-                            source,
-                        });
+                    match submit_result {
+                        Ok(_) => {
+                            actions_placed = actions_placed.saturating_add(1);
+                            verdicts.push(crate::causal::ActionRiskVerdict::accepted(action_index));
+                        }
+                        Err(ExecError::Rejected { reason }) => {
+                            verdicts.push(crate::causal::ActionRiskVerdict::rejected(
+                                action_index,
+                                reason,
+                            ));
+                        }
+                        Err(source) => {
+                            return Err(StartError::ExecutionState {
+                                run: run.clone(),
+                                source,
+                            });
+                        }
                     }
                 }
             }
+            None
         }
-    }
+        Err(error) => Some(error.to_string()),
+    };
     drain_fills(fill_rx);
     metrics.set_fills(paper.fill_count());
     Ok(StrategyDispatchResult {
         actions_placed,
         verdicts,
+        strategy_error,
     })
 }
 

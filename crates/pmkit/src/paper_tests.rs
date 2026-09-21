@@ -317,6 +317,9 @@ async fn paper_run_delivers_reference_facts_once_in_causal_order()
     let failing_calls = Arc::new(AtomicUsize::new(0));
     let recording_facts = Arc::new(Mutex::new(Vec::new()));
     let nonempty_reference_books = Arc::new(AtomicUsize::new(0));
+    let directory = tempfile::tempdir()?;
+    let store =
+        Arc::new(TursoTapeStore::open_local(directory.path().join("paper-reference.db")).await?);
     let reference = FiniteReferenceSource {
         events: vec![
             reference_trade(3, 4, 103),
@@ -360,7 +363,11 @@ async fn paper_run_delivers_reference_facts_once_in_causal_order()
     ));
 
     // When: the public paper run consumes both PM and reference sources.
-    let app = Pmkit::builder(config()?).run(run).start().await?;
+    let app = Pmkit::builder(config()?)
+        .storage(store.clone())
+        .run(run)
+        .start()
+        .await?;
     let RunReport::Paper(report) = app
         .report(&RunId::new("paper-reference")?)
         .ok_or("missing report")?
@@ -391,6 +398,25 @@ async fn paper_run_delivers_reference_facts_once_in_causal_order()
     assert_eq!(report.events_processed, 1);
     assert_eq!(report.fills, 1);
     assert_eq!(report.exposure.portfolio_notional, Decimal::new(45, 1));
+
+    let scope = OwnerScope::new(PortfolioId::new("alice")?, RunId::new("paper-reference")?);
+    let decisions = store.read_decisions(&scope).await?;
+    let reference_decisions = decisions
+        .iter()
+        .filter(|decision| {
+            decision.identity.correlation_id.contains("failing")
+                && decision.identity.correlation_id.contains(":cex-trade:")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reference_decisions.len(), 3);
+    for decision in reference_decisions {
+        assert_eq!(decision.payload["decision"]["kind"], "strategy_error");
+        assert_eq!(
+            decision.payload["decision"]["message"],
+            "strategy error: injected paper strategy failure"
+        );
+    }
+    drop(store);
     Ok(())
 }
 

@@ -176,7 +176,9 @@ pub async fn drive_with_control(
                     .with_simulation(simulation_config);
                     snapshot.observation_timestamp_ms = *timestamp_ms;
                     snapshot.decision_timestamp_ms = *timestamp_ms;
-                    let decision = if evaluation.verdicts.is_empty() {
+                    let decision = if let Some(message) = evaluation.strategy_error {
+                        crate::causal::DecisionKind::StrategyError { message }
+                    } else if evaluation.verdicts.is_empty() {
                         crate::causal::DecisionKind::NoAction
                     } else {
                         crate::causal::DecisionKind::Actions(evaluation.verdicts)
@@ -351,6 +353,7 @@ struct StrategyEvaluation {
     strategy: StrategyId,
     market: MarketId,
     verdicts: Vec<crate::causal::ActionRiskVerdict>,
+    strategy_error: Option<String>,
 }
 
 fn run_strategies(
@@ -381,36 +384,41 @@ fn run_strategies(
         };
         decisions += 1;
         let mut verdicts = Vec::new();
-        if let Ok(actions) = instance.strategy.on_event(context) {
-            for (action_index, action) in actions.as_slice().iter().enumerate() {
-                if let Action::Place(order) = action {
-                    let action_index = u32::try_from(action_index).unwrap_or(u32::MAX);
-                    // The engine returns None for orders it refuses — venue
-                    // limit violations, expired GTDs, unfillable takers.
-                    // Counting them as placed would move the optimistic bias
-                    // off the fill and onto the report: N placements, zero
-                    // fills, and no reason why.
-                    if inputs
-                        .sim
-                        .submit_for_strategy(order, instance.id.clone(), inputs.timestamp_ms)
-                        .is_some()
-                    {
-                        actions_placed = actions_placed.saturating_add(1);
-                        verdicts.push(crate::causal::ActionRiskVerdict::accepted(action_index));
-                    } else {
-                        rejected += 1;
-                        verdicts.push(crate::causal::ActionRiskVerdict::rejected(
-                            action_index,
-                            "simulation rejected",
-                        ));
+        let strategy_error = match instance.strategy.on_event(context) {
+            Ok(actions) => {
+                for (action_index, action) in actions.as_slice().iter().enumerate() {
+                    if let Action::Place(order) = action {
+                        let action_index = u32::try_from(action_index).unwrap_or(u32::MAX);
+                        // The engine returns None for orders it refuses — venue
+                        // limit violations, expired GTDs, unfillable takers.
+                        // Counting them as placed would move the optimistic bias
+                        // off the fill and onto the report: N placements, zero
+                        // fills, and no reason why.
+                        if inputs
+                            .sim
+                            .submit_for_strategy(order, instance.id.clone(), inputs.timestamp_ms)
+                            .is_some()
+                        {
+                            actions_placed = actions_placed.saturating_add(1);
+                            verdicts.push(crate::causal::ActionRiskVerdict::accepted(action_index));
+                        } else {
+                            rejected += 1;
+                            verdicts.push(crate::causal::ActionRiskVerdict::rejected(
+                                action_index,
+                                "simulation rejected",
+                            ));
+                        }
                     }
                 }
+                None
             }
-        }
+            Err(error) => Some(error.to_string()),
+        };
         evaluations.push(StrategyEvaluation {
             strategy: instance.id.clone(),
             market: instance.market.clone(),
             verdicts,
+            strategy_error,
         });
         let drained = inputs.sim.drain_fills();
         fills += absorb_market_fills(&drained, inputs.positions_by_market);
