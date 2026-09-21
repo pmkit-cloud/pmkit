@@ -51,6 +51,10 @@ struct ReferenceFactory {
     nonempty_books: Arc<AtomicUsize>,
 }
 
+struct ReferenceErrorStrategy;
+
+struct ReferenceErrorFactory;
+
 #[derive(Default)]
 struct RejectedExec {
     submissions: AtomicUsize,
@@ -134,6 +138,23 @@ impl StrategyFactory for ReferenceFactory {
             calls: Arc::clone(&self.calls),
             nonempty_books: Arc::clone(&self.nonempty_books),
         }))
+    }
+}
+
+impl Strategy for ReferenceErrorStrategy {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        if matches!(context.fact, StrategyFact::Reference(_)) {
+            return Err(StrategyError {
+                message: "reference unavailable".to_owned(),
+            });
+        }
+        Ok(Actions::none())
+    }
+}
+
+impl StrategyFactory for ReferenceErrorFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(ReferenceErrorStrategy))
     }
 }
 
@@ -552,6 +573,43 @@ async fn live_run_routes_reference_facts_through_the_normal_order_pipeline()
     assert_eq!(nonempty_books.load(Ordering::Relaxed), 0);
     assert_eq!(executor.submissions.load(Ordering::Relaxed), 1);
     assert_eq!(report.rejected, 0);
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
+async fn live_reference_strategy_errors_are_persisted() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let store =
+        TursoTapeStore::open_local(directory.path().join("live-reference-error.db")).await?;
+    let run = LiveRun::new(
+        RunId::new("live-reference-error")?,
+        PortfolioId::new("alice")?,
+        Arc::new(ReferenceExec::default()),
+        Arc::new(LiveWithBook),
+        risk()?,
+    )
+    .reference_data(Arc::new(ReferenceLive))
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("reference-error")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(ReferenceErrorFactory),
+    ));
+
+    live::drive_with_store(&run, &config()?, Some(&store)).await?;
+
+    let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
+    let decisions = store.read_decisions(&scope).await?;
+    let cex_decision = decisions
+        .iter()
+        .find(|decision| decision.identity.correlation_id.contains(":cex-trade:"))
+        .ok_or("missing CEX decision")?;
+    assert_eq!(cex_decision.payload["decision"]["kind"], "strategy_error");
+    assert_eq!(
+        cex_decision.payload["decision"]["message"],
+        "strategy error: reference unavailable"
+    );
+    store.delete_database()?;
     Ok(())
 }
 

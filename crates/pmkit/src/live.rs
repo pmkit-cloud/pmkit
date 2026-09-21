@@ -604,112 +604,121 @@ async fn dispatch_live_pipeline(
             now: LogicalTimestamp::from_millis(input.timestamp_ms),
         };
         metrics.decision();
-        if let Ok(actions) = instance.strategy.on_event(context) {
-            for (action_index, action) in actions.as_slice().iter().enumerate() {
-                let Action::Place(order) = action else {
-                    continue;
-                };
-                let action_index = u32::try_from(action_index).unwrap_or(u32::MAX);
-                if open_orders.len() >= max_open_orders {
-                    *open_orders = reconcile_open_orders(run, runtime).await?;
-                }
-                if open_orders.len() >= max_open_orders {
-                    verdicts.push(crate::causal::ActionRiskVerdict::rejected(
-                        action_index,
-                        "open order capacity",
-                    ));
-                    metrics.reject();
-                    continue;
-                }
-                let reserved_portfolio: rust_decimal::Decimal =
-                    reservations.values().map(Reservation::notional).sum();
-                let reserved_market: rust_decimal::Decimal = reservations
-                    .values()
-                    .filter(|r| r.market == *market)
-                    .map(Reservation::notional)
-                    .sum();
-                let reserved_strategy: rust_decimal::Decimal = reservations
-                    .values()
-                    .filter(|r| r.strategy == instance.id)
-                    .map(Reservation::notional)
-                    .sum();
-                let exposure = daily_pnl.map(|daily_pnl| PortfolioRiskExposure {
-                    portfolio_notional: risk_state.portfolio_notional() + reserved_portfolio,
-                    market_notional: risk_state.market_notional(market) + reserved_market,
-                    strategy_notional: reserved_strategy,
-                    daily_pnl,
-                    open_orders: open_orders.len(),
-                });
-                if risk_state.loss_breached
-                    || exposure.is_none_or(|exposure| {
-                        !passes_aggregated_risk(order, effective_limits, market_positions, exposure)
-                    })
-                {
-                    verdicts.push(crate::causal::ActionRiskVerdict::rejected(
-                        action_index,
-                        "risk gate",
-                    ));
-                    metrics.reject();
-                    continue;
-                }
-                if !order_rate_state.try_accept(&instance.id, input.timestamp_ms, rate_limits) {
-                    verdicts.push(crate::causal::ActionRiskVerdict::rejected(
-                        action_index,
-                        "order submission rate limit",
-                    ));
-                    metrics.reject();
-                    continue;
-                }
-                verdicts.push(crate::causal::ActionRiskVerdict::accepted(action_index));
-                match place_order(
-                    store,
-                    executor,
-                    order,
-                    input.timestamp_ms,
-                    &identity,
-                    action_index,
-                )
-                .await
-                {
-                    Ok(Some(order_id)) => {
-                        reservations.insert(
-                            order_id.0.clone(),
-                            Reservation {
-                                strategy: instance.id.clone(),
-                                market: market.clone(),
-                                price: order.price,
-                                remaining_qty: order.qty,
-                            },
-                        );
-                        open_orders.insert(order_id);
-                    }
-                    Ok(None) => metrics.reject(),
-                    Err(failure) => {
+        let strategy_error = match instance.strategy.on_event(context) {
+            Ok(actions) => {
+                for (action_index, action) in actions.as_slice().iter().enumerate() {
+                    let Action::Place(order) = action else {
+                        continue;
+                    };
+                    let action_index = u32::try_from(action_index).unwrap_or(u32::MAX);
+                    if open_orders.len() >= max_open_orders {
                         *open_orders = reconcile_open_orders(run, runtime).await?;
-                        tape.flush(run)?;
-                        return Err(match failure {
-                            PlaceFailure::Transport(source) => StartError::ExecutionState {
-                                run: run.id().clone(),
-                                source,
-                            },
-                            PlaceFailure::Storage(source) => StartError::Storage {
-                                run: run.id().clone(),
-                                source,
-                            },
-                        });
+                    }
+                    if open_orders.len() >= max_open_orders {
+                        verdicts.push(crate::causal::ActionRiskVerdict::rejected(
+                            action_index,
+                            "open order capacity",
+                        ));
+                        metrics.reject();
+                        continue;
+                    }
+                    let reserved_portfolio: rust_decimal::Decimal =
+                        reservations.values().map(Reservation::notional).sum();
+                    let reserved_market: rust_decimal::Decimal = reservations
+                        .values()
+                        .filter(|r| r.market == *market)
+                        .map(Reservation::notional)
+                        .sum();
+                    let reserved_strategy: rust_decimal::Decimal = reservations
+                        .values()
+                        .filter(|r| r.strategy == instance.id)
+                        .map(Reservation::notional)
+                        .sum();
+                    let exposure = daily_pnl.map(|daily_pnl| PortfolioRiskExposure {
+                        portfolio_notional: risk_state.portfolio_notional() + reserved_portfolio,
+                        market_notional: risk_state.market_notional(market) + reserved_market,
+                        strategy_notional: reserved_strategy,
+                        daily_pnl,
+                        open_orders: open_orders.len(),
+                    });
+                    if risk_state.loss_breached
+                        || exposure.is_none_or(|exposure| {
+                            !passes_aggregated_risk(
+                                order,
+                                effective_limits,
+                                market_positions,
+                                exposure,
+                            )
+                        })
+                    {
+                        verdicts.push(crate::causal::ActionRiskVerdict::rejected(
+                            action_index,
+                            "risk gate",
+                        ));
+                        metrics.reject();
+                        continue;
+                    }
+                    if !order_rate_state.try_accept(&instance.id, input.timestamp_ms, rate_limits) {
+                        verdicts.push(crate::causal::ActionRiskVerdict::rejected(
+                            action_index,
+                            "order submission rate limit",
+                        ));
+                        metrics.reject();
+                        continue;
+                    }
+                    verdicts.push(crate::causal::ActionRiskVerdict::accepted(action_index));
+                    match place_order(
+                        store,
+                        executor,
+                        order,
+                        input.timestamp_ms,
+                        &identity,
+                        action_index,
+                    )
+                    .await
+                    {
+                        Ok(Some(order_id)) => {
+                            reservations.insert(
+                                order_id.0.clone(),
+                                Reservation {
+                                    strategy: instance.id.clone(),
+                                    market: market.clone(),
+                                    price: order.price,
+                                    remaining_qty: order.qty,
+                                },
+                            );
+                            open_orders.insert(order_id);
+                        }
+                        Ok(None) => metrics.reject(),
+                        Err(failure) => {
+                            *open_orders = reconcile_open_orders(run, runtime).await?;
+                            tape.flush(run)?;
+                            return Err(match failure {
+                                PlaceFailure::Transport(source) => StartError::ExecutionState {
+                                    run: run.id().clone(),
+                                    source,
+                                },
+                                PlaceFailure::Storage(source) => StartError::Storage {
+                                    run: run.id().clone(),
+                                    source,
+                                },
+                            });
+                        }
                     }
                 }
+                None
             }
-        }
+            Err(error) => Some(error.to_string()),
+        };
         if let Some(store) = store {
             let mut snapshot =
                 crate::causal::DecisionSnapshot::from_book(input.book, cex_metrics.snapshot());
             snapshot.observation_timestamp_ms = input.timestamp_ms;
             snapshot.decision_timestamp_ms = input.timestamp_ms;
-            let decision = if verdicts.is_empty() {
-                crate::causal::DecisionKind::NoAction
-            } else {
-                crate::causal::DecisionKind::Actions(verdicts)
+            let decision = match strategy_error {
+                Some(message) => crate::causal::DecisionKind::StrategyError { message },
+                None if verdicts.is_empty() => crate::causal::DecisionKind::NoAction,
+                None => crate::causal::DecisionKind::Actions(verdicts),
             };
             crate::causal::CausalRecorder::new(store)
                 .record_evaluation(&identity, &snapshot, decision)
