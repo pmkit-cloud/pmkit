@@ -13,7 +13,7 @@ use pmkit_event::{CexReferenceEvent, MarketEvent, SourceEnvelope, StrategyFact};
 use pmkit_market::Outcome;
 use pmkit_sim::{SimEngine, SimulationConfig};
 use pmkit_spec::BacktestRun;
-use pmkit_store::{CausalIdentity, OwnerScope, TapeStore};
+use pmkit_store::{OwnerScope, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -130,41 +130,44 @@ pub async fn drive_with_control(
             let timestamp_ms = match &envelope.fact {
                 CexReferenceEvent::Trade { timestamp_ms, .. } => *timestamp_ms,
             };
-            let (added, rejected, decisions, verdicts) = run_strategies(&mut RunStrategiesInputs {
-                strategies: &mut strategies,
-                fact: &merged.fact,
-                market: None,
-                book: None,
-                strategy_books: &mut strategy_books,
-                positions_by_market: &mut positions_by_market,
-                timestamp_ms,
-                sim: &mut sim,
-            });
+            let (added, rejected, decisions, evaluations) =
+                run_strategies(&mut RunStrategiesInputs {
+                    strategies: &mut strategies,
+                    fact: &merged.fact,
+                    market: None,
+                    book: None,
+                    strategy_books: &mut strategy_books,
+                    positions_by_market: &mut positions_by_market,
+                    timestamp_ms,
+                    sim: &mut sim,
+                });
             metrics.add_fills(added);
             metrics.add_rejected(rejected);
             metrics.add_decisions(decisions);
             if let Some(store) = store {
-                let book = strategy_books.first().cloned().unwrap_or_default();
-                let identity = CausalIdentity {
-                    scope: scope.clone(),
-                    correlation_id: format!("cex:{}:{timestamp_ms}", envelope.metadata.source_id),
-                    source_timestamp_ms: envelope.metadata.source_time_ms,
-                    ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
-                        .unwrap_or(i64::MAX),
-                };
-                crate::causal::record_book_decision(
-                    store,
-                    &identity,
-                    &book,
-                    cex_metrics.snapshot(),
-                    verdicts,
-                    Some(simulation_config),
-                )
-                .await
-                .map_err(|source| StartError::Storage {
-                    run: run.id().clone(),
-                    source,
-                })?;
+                for evaluation in evaluations {
+                    let identity = crate::causal::strategy_decision_identity(
+                        &scope,
+                        "backtest-reference",
+                        &evaluation.strategy,
+                        &evaluation.market,
+                        timestamp_ms,
+                        &envelope.metadata,
+                    );
+                    crate::causal::record_book_decision(
+                        store,
+                        &identity,
+                        &evaluation.book,
+                        cex_metrics.snapshot(),
+                        evaluation.verdicts,
+                        Some(simulation_config),
+                    )
+                    .await
+                    .map_err(|source| StartError::Storage {
+                        run: run.id().clone(),
+                        source,
+                    })?;
+                }
             }
             continue;
         }
@@ -196,40 +199,44 @@ pub async fn drive_with_control(
             let drained = sim.drain_fills();
             metrics.add_fills(absorb_market_fills(&drained, &mut positions_by_market));
             let fact = StrategyFact::Market(event.clone());
-            let (added, rejected, decisions, verdicts) = run_strategies(&mut RunStrategiesInputs {
-                strategies: &mut strategies,
-                fact: &fact,
-                market: Some(market),
-                book: Some(&book),
-                strategy_books: &mut strategy_books,
-                positions_by_market: &mut positions_by_market,
-                timestamp_ms: *timestamp_ms,
-                sim: &mut sim,
-            });
+            let (added, rejected, decisions, evaluations) =
+                run_strategies(&mut RunStrategiesInputs {
+                    strategies: &mut strategies,
+                    fact: &fact,
+                    market: Some(market),
+                    book: Some(&book),
+                    strategy_books: &mut strategy_books,
+                    positions_by_market: &mut positions_by_market,
+                    timestamp_ms: *timestamp_ms,
+                    sim: &mut sim,
+                });
             metrics.add_fills(added);
             metrics.add_rejected(rejected);
             metrics.add_decisions(decisions);
             if let Some(store) = store {
-                let identity = CausalIdentity {
-                    scope: scope.clone(),
-                    correlation_id: format!("{market:?}:{timestamp_ms}"),
-                    source_timestamp_ms: envelope.metadata.source_time_ms,
-                    ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
-                        .unwrap_or(i64::MAX),
-                };
-                crate::causal::record_book_decision(
-                    store,
-                    &identity,
-                    &book,
-                    cex_metrics.snapshot(),
-                    verdicts,
-                    Some(simulation_config),
-                )
-                .await
-                .map_err(|source| StartError::Storage {
-                    run: run.id().clone(),
-                    source,
-                })?;
+                for evaluation in evaluations {
+                    let identity = crate::causal::strategy_decision_identity(
+                        &scope,
+                        "backtest-market",
+                        &evaluation.strategy,
+                        &evaluation.market,
+                        *timestamp_ms,
+                        &envelope.metadata,
+                    );
+                    crate::causal::record_book_decision(
+                        store,
+                        &identity,
+                        &evaluation.book,
+                        cex_metrics.snapshot(),
+                        evaluation.verdicts,
+                        Some(simulation_config),
+                    )
+                    .await
+                    .map_err(|source| StartError::Storage {
+                        run: run.id().clone(),
+                        source,
+                    })?;
+                }
             }
         }
     }
@@ -324,13 +331,20 @@ struct RunStrategiesInputs<'a> {
     sim: &'a mut SimEngine,
 }
 
+struct StrategyEvaluation {
+    strategy: pmkit_core::StrategyId,
+    market: MarketId,
+    book: OrderBookL2,
+    verdicts: Vec<crate::causal::ActionRiskVerdict>,
+}
+
 fn run_strategies(
     inputs: &mut RunStrategiesInputs<'_>,
-) -> (usize, usize, usize, Vec<crate::causal::ActionRiskVerdict>) {
+) -> (usize, usize, usize, Vec<StrategyEvaluation>) {
     let mut fills = 0;
     let mut rejected = 0_usize;
     let mut decisions = 0;
-    let mut verdicts = Vec::new();
+    let mut evaluations = Vec::new();
     for (index, instance) in inputs.strategies.iter_mut().enumerate() {
         if inputs
             .market
@@ -354,16 +368,15 @@ fn run_strategies(
             now: LogicalTimestamp::from_millis(inputs.timestamp_ms),
         };
         decisions += 1;
+        let mut verdicts = Vec::new();
         if let Ok(actions) = instance.strategy.on_event(context) {
-            for (action_index, action) in actions.as_slice().iter().enumerate() {
-                let action_index = u32::try_from(action_index).unwrap_or(u32::MAX);
+            for action in actions.as_slice() {
                 match action {
                     Action::Place(order) => submit_sim_order(
                         inputs.sim,
                         &instance.id,
                         order,
                         inputs.timestamp_ms,
-                        action_index,
                         &mut verdicts,
                         &mut rejected,
                     ),
@@ -380,7 +393,6 @@ fn run_strategies(
                                 &instance.id,
                                 order,
                                 inputs.timestamp_ms,
-                                action_index,
                                 &mut verdicts,
                                 &mut rejected,
                             );
@@ -394,8 +406,14 @@ fn run_strategies(
         }
         let drained = inputs.sim.drain_fills();
         fills += absorb_market_fills(&drained, inputs.positions_by_market);
+        evaluations.push(StrategyEvaluation {
+            strategy: instance.id.clone(),
+            market: instance.market.clone(),
+            book: book.clone(),
+            verdicts,
+        });
     }
-    (fills, rejected, decisions, verdicts)
+    (fills, rejected, decisions, evaluations)
 }
 
 fn submit_sim_order(
@@ -403,10 +421,10 @@ fn submit_sim_order(
     strategy: &pmkit_core::StrategyId,
     order: &pmkit_exec::PlaceOrder,
     timestamp_ms: i64,
-    action_index: u32,
     verdicts: &mut Vec<crate::causal::ActionRiskVerdict>,
     rejected: &mut usize,
 ) {
+    let action_index = u32::try_from(verdicts.len()).unwrap_or(u32::MAX);
     if sim
         .submit_for_strategy(order, strategy.clone(), timestamp_ms)
         .is_some()

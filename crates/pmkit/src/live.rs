@@ -522,16 +522,31 @@ async fn submit_live_order(
             daily_pnl,
             open_orders: context.open_orders.len(),
         });
-    if context.risk_state.loss_breached
-        || exposure.is_none_or(|exposure| {
-            !passes_aggregated_risk(
-                order,
-                context.effective_limits,
-                context.market_positions,
-                exposure,
-            )
-        })
-    {
+    let risk_rejection = if context.risk_state.loss_breached {
+        Some("risk gate")
+    } else {
+        match exposure {
+            None => Some("risk data unavailable"),
+            Some(exposure)
+                if !passes_aggregated_risk(
+                    order,
+                    context.effective_limits,
+                    context.market_positions,
+                    exposure,
+                ) =>
+            {
+                Some("risk gate")
+            }
+            Some(_) => None,
+        }
+    };
+    if let Some(reason) = risk_rejection {
+        context
+            .verdicts
+            .push(crate::causal::ActionRiskVerdict::rejected(
+                action_index,
+                reason,
+            ));
         context.metrics.reject();
         return Ok(());
     }
@@ -540,6 +555,12 @@ async fn submit_live_order(
         context.timestamp_ms,
         context.rate_limits,
     ) {
+        context
+            .verdicts
+            .push(crate::causal::ActionRiskVerdict::rejected(
+                action_index,
+                "rate limit",
+            ));
         context.metrics.reject();
         return Ok(());
     }
@@ -816,7 +837,6 @@ async fn drive_with_control_and_rate_limits(
 
     let mut connection_epochs = HashMap::new();
     let mut strategy_books = vec![OrderBookL2::default(); strategies.len()];
-    let mut portfolio_daily_pnl = None;
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     control.emit(RunLifecycleEvent::Started {
         run: run.id().clone(),
@@ -865,6 +885,7 @@ async fn drive_with_control_and_rate_limits(
         .await?;
         if let SourceEnvelope::CexReference(envelope) = &merged.source {
             cex_metrics.observe(&envelope.fact);
+            let portfolio_daily_pnl = risk_state.daily_pnl();
             let timestamp_ms = match &envelope.fact {
                 CexReferenceEvent::Trade { timestamp_ms, .. } => *timestamp_ms,
             };
@@ -1015,7 +1036,7 @@ async fn drive_with_control_and_rate_limits(
                     last_trade_price: None,
                 };
                 let fact = StrategyFact::Market(event.clone());
-                portfolio_daily_pnl = risk_state.update_book(market, *outcome, &book, &limits);
+                let portfolio_daily_pnl = risk_state.update_book(market, *outcome, &book, &limits);
                 if risk_state.loss_breached
                     && let Some(store) = store
                 {
@@ -1995,6 +2016,37 @@ mod rate_limit_tests {
         assert_eq!(first_executor.submissions.load(Ordering::Relaxed), 2);
         assert_eq!(restarted_executor.submissions.load(Ordering::Relaxed), 1);
         assert_eq!(report.rejected, 1);
+        let scope = OwnerScope::new(
+            PortfolioId::new("rate-portfolio")?,
+            RunId::new("rate-restart")?,
+        );
+        let decisions = store.read_decisions(&scope).await?;
+        let rejected = decisions
+            .iter()
+            .filter(|decision| {
+                decision.payload["decision"]["risk"]
+                    .as_array()
+                    .is_some_and(|risk| {
+                        risk.iter().any(|entry| {
+                            entry["verdict"]["kind"] == "rejected"
+                                && entry["verdict"]["reason"] == "rate limit"
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].payload["decision"]["kind"], "actions");
+        let verdicts = rejected[0].payload["decision"]["risk"]
+            .as_array()
+            .ok_or("missing rate-limit verdicts")?;
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0]["action_index"], 0);
+        assert_eq!(
+            decisions,
+            store.read_decisions(&scope).await?,
+            "a rejected verdict must remain stable when read back"
+        );
+        assert!(store.read_rejected_intents(&scope).await?.is_empty());
         store.delete_database()?;
         Ok(())
     }

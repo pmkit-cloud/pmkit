@@ -18,7 +18,7 @@ use pmkit_runtime::StrategyRegistration;
 use pmkit_spec::{BacktestRun, ConservativeV1Config, ReplaySpec};
 use pmkit_store::{OwnerScope, TapeStore, TursoTapeStore};
 use pmkit_strategy::{
-    Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
+    Action, Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
 };
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -44,6 +44,10 @@ struct FailingHistory;
 struct Taker;
 
 struct TakerFactory;
+
+struct MultiQuote;
+
+struct MultiQuoteFactory;
 
 struct ReferenceBuyer {
     calls: Arc<AtomicUsize>,
@@ -85,6 +89,42 @@ impl Strategy for Taker {
 impl StrategyFactory for TakerFactory {
     fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
         Ok(Box::new(Taker))
+    }
+}
+
+impl Strategy for MultiQuote {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        let mut actions = Actions::none();
+        actions.push(Action::ReplaceQuotes {
+            cancel: Vec::new(),
+            place: vec![
+                pmkit_exec::PlaceOrder {
+                    market: context.market.clone(),
+                    outcome: Outcome::Up,
+                    side: pmkit_book::Side::Buy,
+                    price: Decimal::new(40, 2),
+                    qty: Decimal::ONE,
+                    post_only: true,
+                    tif: pmkit_exec::TimeInForce::Gtc,
+                },
+                pmkit_exec::PlaceOrder {
+                    market: context.market.clone(),
+                    outcome: Outcome::Up,
+                    side: pmkit_book::Side::Buy,
+                    price: Decimal::new(41, 2),
+                    qty: Decimal::ONE,
+                    post_only: true,
+                    tif: pmkit_exec::TimeInForce::Gtc,
+                },
+            ],
+        });
+        Ok(actions)
+    }
+}
+
+impl StrategyFactory for MultiQuoteFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(MultiQuote))
     }
 }
 
@@ -844,6 +884,109 @@ async fn backtest_records_one_decision_per_book_event() -> Result<(), Box<dyn st
     );
     drop(store);
     let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
+async fn backtest_multi_strategy_replace_quotes_persist_strategy_and_suborder_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(
+        TursoTapeStore::open_local(directory.path().join("backtest-multi-identities.db")).await?,
+    );
+    let replay = ReplaySpec::new(
+        Arc::new(ScriptedHistory { ticks: vec![1] }),
+        "2026-01-01T00:00:00Z".parse()?,
+        "2026-02-01T00:00:00Z".parse()?,
+        EvidenceRequirement::CorroboratedOnly,
+        RetrievalWait::ReturnPending,
+    );
+    let run = BacktestRun::new(
+        RunId::new("backtest-multi-identities")?,
+        PortfolioId::new("research")?,
+        replay,
+        Money::usdc(1_000),
+        risk()?,
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("alpha")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(MultiQuoteFactory),
+    ))
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("beta")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(MultiQuoteFactory),
+    ));
+
+    let app = Pmkit::builder(config()?)
+        .storage(store.clone())
+        .run(run)
+        .start()
+        .await?;
+    let RunReport::Backtest(report) = app
+        .wait_for(RunId::new("backtest-multi-identities")?)
+        .await?
+    else {
+        return Err("expected a backtest report".into());
+    };
+    assert_eq!(report.metrics.rejected, 0);
+
+    let scope = OwnerScope::new(
+        PortfolioId::new("research")?,
+        RunId::new("backtest-multi-identities")?,
+    );
+    let decisions = store.read_decisions(&scope).await?;
+    assert_eq!(decisions.len(), 2);
+    let mut decision_ids = decisions
+        .iter()
+        .map(|decision| decision.identity.correlation_id.clone())
+        .collect::<Vec<_>>();
+    decision_ids.sort_unstable();
+    assert!(decision_ids.windows(2).all(|pair| pair[0] != pair[1]));
+
+    let mut suborder_ids = Vec::new();
+    for strategy in ["alpha", "beta"] {
+        let decision = decisions
+            .iter()
+            .find(|decision| {
+                decision
+                    .identity
+                    .correlation_id
+                    .contains(&format!(":{strategy}:market:"))
+            })
+            .ok_or("missing strategy-scoped decision")?;
+        let verdicts = decision.payload["decision"]["risk"]
+            .as_array()
+            .ok_or("missing backtest risk verdicts")?;
+        assert_eq!(verdicts.len(), 2);
+        assert_eq!(verdicts[0]["action_index"], 0);
+        assert_eq!(verdicts[1]["action_index"], 1);
+        assert!(
+            verdicts
+                .iter()
+                .all(|verdict| verdict["verdict"]["kind"] == "accepted")
+        );
+        suborder_ids.extend(verdicts.iter().map(|verdict| {
+            format!(
+                "{}:{}",
+                decision.identity.correlation_id, verdict["action_index"]
+            )
+        }));
+    }
+    suborder_ids.sort_unstable();
+    assert_eq!(suborder_ids.len(), 4);
+    assert!(suborder_ids.windows(2).all(|pair| pair[0] != pair[1]));
+    drop(store);
     Ok(())
 }
 

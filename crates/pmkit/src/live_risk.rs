@@ -817,7 +817,6 @@ impl LiveRiskState {
         self.realized_pnl
     }
 
-    #[cfg(test)]
     pub(super) fn daily_pnl(&self) -> Option<Decimal> {
         let mut positions_by_market = self.positions_by_market.clone();
         marked_daily_pnl(

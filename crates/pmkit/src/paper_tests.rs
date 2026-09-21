@@ -17,7 +17,7 @@ use pmkit_runtime::{PartialRiskLimits, RiskLimitOverrides, StrategyRegistration}
 use pmkit_spec::{ConservativeV1Config, PaperRun};
 use pmkit_store::{OwnerScope, TapeStore, TursoTapeStore};
 use pmkit_strategy::{
-    Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
+    Action, Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
 };
 use rust_decimal::Decimal;
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -66,6 +66,10 @@ struct RepeatPlace {
 
 struct RepeatPlaceFactory;
 
+struct MultiQuote;
+
+struct MultiQuoteFactory;
+
 struct RepeatTaker;
 
 struct RepeatTakerFactory;
@@ -108,6 +112,42 @@ impl Strategy for RepeatPlace {
 impl StrategyFactory for RepeatPlaceFactory {
     fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
         Ok(Box::new(RepeatPlace { seen: 0 }))
+    }
+}
+
+impl Strategy for MultiQuote {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        let mut actions = Actions::none();
+        actions.push(Action::ReplaceQuotes {
+            cancel: Vec::new(),
+            place: vec![
+                pmkit_exec::PlaceOrder {
+                    market: context.market.clone(),
+                    outcome: Outcome::Up,
+                    side: pmkit_book::Side::Buy,
+                    price: Decimal::new(40, 2),
+                    qty: Decimal::ONE,
+                    post_only: true,
+                    tif: pmkit_exec::TimeInForce::Gtc,
+                },
+                pmkit_exec::PlaceOrder {
+                    market: context.market.clone(),
+                    outcome: Outcome::Up,
+                    side: pmkit_book::Side::Buy,
+                    price: Decimal::new(41, 2),
+                    qty: Decimal::ONE,
+                    post_only: true,
+                    tif: pmkit_exec::TimeInForce::Gtc,
+                },
+            ],
+        });
+        Ok(actions)
+    }
+}
+
+impl StrategyFactory for MultiQuoteFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(MultiQuote))
     }
 }
 
@@ -607,6 +647,122 @@ async fn paper_risk_gate_rejects_before_ledger_submission() -> Result<(), Box<dy
             .iter()
             .all(|decision| decision.payload["event"]["kind"] != "placement")
     );
+    drop(store);
+    Ok(())
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "durable strategy and sub-order identity assertions stay together"
+)]
+#[allow(clippy::significant_drop_tightening)]
+async fn paper_multi_strategy_replace_quotes_persist_strategy_and_suborder_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(
+        TursoTapeStore::open_local(directory.path().join("paper-multi-identities.db")).await?,
+    );
+    let run = PaperRun::new(
+        RunId::new("paper-multi-identities")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        risk()?,
+        Arc::new(ScriptedLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("alpha")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(MultiQuoteFactory),
+    ))
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("beta")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(MultiQuoteFactory),
+    ));
+
+    let app = Pmkit::builder(config()?)
+        .storage(store.clone())
+        .run(run)
+        .start()
+        .await?;
+    let RunReport::Paper(report) = app
+        .report(&RunId::new("paper-multi-identities")?)
+        .ok_or("missing report")?
+    else {
+        return Err("expected a paper report".into());
+    };
+    assert_eq!(report.metrics.rejected, 0);
+
+    let scope = OwnerScope::new(
+        PortfolioId::new("alice")?,
+        RunId::new("paper-multi-identities")?,
+    );
+    let decisions = store.read_decisions(&scope).await?;
+    let snapshots = decisions
+        .iter()
+        .filter(|decision| decision.payload["snapshot"].is_object())
+        .collect::<Vec<_>>();
+    assert_eq!(snapshots.len(), 2);
+    let mut decision_ids = snapshots
+        .iter()
+        .map(|decision| decision.identity.correlation_id.clone())
+        .collect::<Vec<_>>();
+    decision_ids.sort_unstable();
+    assert!(decision_ids.windows(2).all(|pair| pair[0] != pair[1]));
+    for strategy in ["alpha", "beta"] {
+        let decision = snapshots
+            .iter()
+            .find(|decision| decision.identity.correlation_id.contains(strategy))
+            .ok_or("missing strategy-scoped decision")?;
+        let verdicts = decision.payload["decision"]["risk"]
+            .as_array()
+            .ok_or("missing paper risk verdicts")?;
+        assert_eq!(verdicts.len(), 2);
+        assert_eq!(verdicts[0]["action_index"], 0);
+        assert_eq!(verdicts[1]["action_index"], 1);
+        assert!(
+            verdicts
+                .iter()
+                .all(|verdict| verdict["verdict"]["kind"] == "accepted")
+        );
+    }
+
+    let placements = decisions
+        .iter()
+        .filter(|decision| {
+            decision.payload["record_type"] == "paper_ledger"
+                && decision.payload["event"]["kind"] == "order_placed"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(placements.len(), 4);
+    let mut placement_ids = placements
+        .iter()
+        .map(|decision| decision.identity.correlation_id.clone())
+        .collect::<Vec<_>>();
+    placement_ids.sort_unstable();
+    assert!(placement_ids.windows(2).all(|pair| pair[0] != pair[1]));
+    for strategy in ["alpha", "beta"] {
+        let strategy_placements = placements
+            .iter()
+            .filter(|decision| decision.payload["event"]["order"]["strategy"] == strategy)
+            .collect::<Vec<_>>();
+        assert_eq!(strategy_placements.len(), 2);
+        let prices = strategy_placements
+            .iter()
+            .map(|decision| decision.payload["event"]["order"]["price"].clone())
+            .collect::<Vec<_>>();
+        assert!(prices.contains(&serde_json::json!("0.40")));
+        assert!(prices.contains(&serde_json::json!("0.41")));
+    }
     drop(store);
     Ok(())
 }

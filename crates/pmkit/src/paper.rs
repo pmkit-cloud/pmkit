@@ -270,7 +270,6 @@ async fn submit_risk_checked_paper_order(
     context: &PaperActionContext<'_>,
     strategy_market: &pmkit_core::MarketId,
     order: &pmkit_exec::PlaceOrder,
-    action_index: u32,
     marks: &HashMap<(pmkit_core::MarketId, Outcome), Decimal>,
     limits: &pmkit_runtime::RiskLimits,
     loss_limit: Decimal,
@@ -278,6 +277,7 @@ async fn submit_risk_checked_paper_order(
     loss_breached: &mut bool,
     verdicts: &mut Vec<crate::causal::ActionRiskVerdict>,
 ) -> Result<(), StartError> {
+    let action_index = u32::try_from(verdicts.len()).unwrap_or(u32::MAX);
     update_loss_breach(
         context.paper,
         marks,
@@ -531,15 +531,13 @@ async fn dispatch_paper_strategy(
             timestamp_ms,
             metrics,
         };
-        for (action_index, action) in actions.as_slice().iter().enumerate() {
-            let action_index = u32::try_from(action_index).unwrap_or(u32::MAX);
+        for action in actions.as_slice() {
             match action {
                 Action::Place(order) => {
                     submit_risk_checked_paper_order(
                         &action_context,
                         &instance.market,
                         order,
-                        action_index,
                         marks,
                         limits,
                         loss_limit,
@@ -562,7 +560,6 @@ async fn dispatch_paper_strategy(
                             &action_context,
                             &instance.market,
                             order,
-                            action_index,
                             marks,
                             limits,
                             loss_limit,
@@ -759,53 +756,61 @@ pub async fn drive_with_control(
             let timestamp_ms = match &envelope.fact {
                 CexReferenceEvent::Trade { timestamp_ms, .. } => *timestamp_ms,
             };
-            let mut verdicts = Vec::new();
+            update_loss_breach(
+                &paper,
+                &marks,
+                loss_limit,
+                &mut loss_breached,
+                store,
+                &scope,
+                run.id(),
+                timestamp_ms,
+            )
+            .await?;
             for (index, instance) in strategies.iter_mut().enumerate() {
                 let positions = paper.positions_for_market(&instance.market);
-                verdicts.extend(
-                    dispatch_paper_strategy(
-                        run,
-                        &paper,
-                        store,
-                        &scope,
-                        instance,
-                        &merged.fact,
-                        &strategy_books[index],
-                        &positions,
-                        timestamp_ms,
-                        &marks,
-                        &limits,
-                        loss_limit,
-                        &effective_limits_by_strategy,
-                        &mut loss_breached,
-                        &mut fill_rx,
-                        &metrics,
-                    )
-                    .await?,
-                );
-            }
-            if let Some(store) = store {
-                let book = strategy_books.first().cloned().unwrap_or_default();
-                let identity = CausalIdentity {
-                    scope: scope.clone(),
-                    correlation_id: format!("cex:{}:{timestamp_ms}", envelope.metadata.source_id),
-                    source_timestamp_ms: envelope.metadata.source_time_ms,
-                    ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
-                        .unwrap_or(i64::MAX),
-                };
-                crate::causal::record_book_decision(
+                let verdicts = dispatch_paper_strategy(
+                    run,
+                    &paper,
                     store,
-                    &identity,
-                    &book,
-                    cex_metrics.snapshot(),
-                    verdicts,
-                    Some(simulation_config),
+                    &scope,
+                    instance,
+                    &merged.fact,
+                    &strategy_books[index],
+                    &positions,
+                    timestamp_ms,
+                    &marks,
+                    &limits,
+                    loss_limit,
+                    &effective_limits_by_strategy,
+                    &mut loss_breached,
+                    &mut fill_rx,
+                    &metrics,
                 )
-                .await
-                .map_err(|source| StartError::Storage {
-                    run: run.id().clone(),
-                    source,
-                })?;
+                .await?;
+                if let Some(store) = store {
+                    let identity = crate::causal::strategy_decision_identity(
+                        &scope,
+                        "paper-reference",
+                        &instance.id,
+                        &instance.market,
+                        timestamp_ms,
+                        &envelope.metadata,
+                    );
+                    crate::causal::record_book_decision(
+                        store,
+                        &identity,
+                        &strategy_books[index],
+                        cex_metrics.snapshot(),
+                        verdicts,
+                        Some(simulation_config),
+                    )
+                    .await
+                    .map_err(|source| StartError::Storage {
+                        run: run.id().clone(),
+                        source,
+                    })?;
+                }
             }
             continue;
         }
@@ -910,56 +915,54 @@ pub async fn drive_with_control(
             drain_fills(&mut fill_rx);
             fills = paper.fill_count();
             metrics.set_fills(fills);
-            let mut verdicts = Vec::new();
             for (index, instance) in strategies.iter_mut().enumerate() {
                 if instance.market != *market {
                     continue;
                 }
                 strategy_books[index] = book.clone();
                 let positions = paper.positions_for_market(market);
-                verdicts.extend(
-                    dispatch_paper_strategy(
-                        run,
-                        &paper,
-                        store,
-                        &scope,
-                        instance,
-                        &fact,
-                        &strategy_books[index],
-                        &positions,
-                        *timestamp_ms,
-                        &marks,
-                        &limits,
-                        loss_limit,
-                        &effective_limits_by_strategy,
-                        &mut loss_breached,
-                        &mut fill_rx,
-                        &metrics,
-                    )
-                    .await?,
-                );
-            }
-            if let Some(store) = store {
-                let identity = CausalIdentity {
-                    scope: scope.clone(),
-                    correlation_id: format!("{market:?}:{timestamp_ms}"),
-                    source_timestamp_ms: envelope.metadata.source_time_ms,
-                    ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
-                        .unwrap_or(i64::MAX),
-                };
-                crate::causal::record_book_decision(
+                let verdicts = dispatch_paper_strategy(
+                    run,
+                    &paper,
                     store,
-                    &identity,
-                    &book,
-                    cex_metrics.snapshot(),
-                    verdicts,
-                    Some(simulation_config),
+                    &scope,
+                    instance,
+                    &fact,
+                    &strategy_books[index],
+                    &positions,
+                    *timestamp_ms,
+                    &marks,
+                    &limits,
+                    loss_limit,
+                    &effective_limits_by_strategy,
+                    &mut loss_breached,
+                    &mut fill_rx,
+                    &metrics,
                 )
-                .await
-                .map_err(|source| StartError::Storage {
-                    run: run.id().clone(),
-                    source,
-                })?;
+                .await?;
+                if let Some(store) = store {
+                    let identity = crate::causal::strategy_decision_identity(
+                        &scope,
+                        "paper-market",
+                        &instance.id,
+                        market,
+                        *timestamp_ms,
+                        &envelope.metadata,
+                    );
+                    crate::causal::record_book_decision(
+                        store,
+                        &identity,
+                        &strategy_books[index],
+                        cex_metrics.snapshot(),
+                        verdicts,
+                        Some(simulation_config),
+                    )
+                    .await
+                    .map_err(|source| StartError::Storage {
+                        run: run.id().clone(),
+                        source,
+                    })?;
+                }
             }
         }
     }

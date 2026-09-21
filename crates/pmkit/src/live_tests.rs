@@ -14,11 +14,12 @@ use pmkit_event::{
 };
 use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
 use pmkit_market::{Asset, Exchange, Outcome};
+use pmkit_money::Money;
 use pmkit_runtime::{LiveOrderPolicy, StrategyRegistration};
 use pmkit_spec::LiveRun;
 use pmkit_store::{OwnerScope, TapeStore, TursoTapeStore};
 use pmkit_strategy::{
-    Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
+    Action, Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
 };
 use rust_decimal::Decimal;
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -265,9 +266,17 @@ struct ReferenceBuyerFactory {
 
 struct LiveWithDuplicatePartialFill;
 
+struct AccountFillSource;
+
+struct LateReferenceLive;
+
 struct MismatchedAccountSource;
 
 struct LiveWithCancel;
+
+struct RejectThenAccept;
+
+struct RejectThenAcceptFactory;
 
 struct CancelAfterPlace {
     seen: usize,
@@ -297,6 +306,42 @@ impl Strategy for CancelAfterPlace {
 impl StrategyFactory for CancelAfterPlaceFactory {
     fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
         Ok(Box::new(CancelAfterPlace { seen: 0 }))
+    }
+}
+
+impl Strategy for RejectThenAccept {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        let mut actions = Actions::none();
+        actions.push(Action::ReplaceQuotes {
+            cancel: Vec::new(),
+            place: vec![
+                PlaceOrder {
+                    market: context.market.clone(),
+                    outcome: Outcome::Up,
+                    side: Side::Buy,
+                    price: Decimal::new(50, 2),
+                    qty: Decimal::from(10),
+                    post_only: false,
+                    tif: pmkit_exec::TimeInForce::Gtc,
+                },
+                PlaceOrder {
+                    market: context.market.clone(),
+                    outcome: Outcome::Up,
+                    side: Side::Buy,
+                    price: Decimal::new(50, 2),
+                    qty: Decimal::ONE,
+                    post_only: false,
+                    tif: pmkit_exec::TimeInForce::Gtc,
+                },
+            ],
+        });
+        Ok(actions)
+    }
+}
+
+impl StrategyFactory for RejectThenAcceptFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(RejectThenAccept))
     }
 }
 
@@ -358,6 +403,96 @@ impl LiveDataSource for LiveWithCancel {
                 .map_err(|_| DataSourceError::SinkClosed)?;
             }
         }
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+#[async_trait]
+impl LiveCexDataSource for LateReferenceLive {
+    async fn subscribe_reference(&self, sink: Sender<SourceSignal>) -> Result<(), DataSourceError> {
+        sink.send(SourceSignal::Data(Box::new(SourceEnvelope::CexReference(
+            CexReferenceEnvelope {
+                metadata: StreamMetadata {
+                    schema_version: 1,
+                    source_id: "binance-late".into(),
+                    source_time_ms: 3,
+                    canonical_source_rank: 1,
+                    receipt_time_ms: 3,
+                    connection_id: "reference".into(),
+                    connection_epoch: 0,
+                    frame_sequence: 3,
+                    ingest_sequence: 3,
+                },
+                fact: CexReferenceEvent::Trade {
+                    asset: Asset::Btc,
+                    exchange: Exchange::Binance,
+                    aggregate_trade_id: 3,
+                    price: Decimal::new(42, 2),
+                    qty: Decimal::ONE,
+                    is_buyer_maker: false,
+                    timestamp_ms: 3,
+                },
+            },
+        ))))
+        .await
+        .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+#[async_trait]
+impl LiveAccountDataSource for AccountFillSource {
+    async fn subscribe_account(
+        &self,
+        portfolio: PortfolioId,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        sink.send(SourceSignal::Data(Box::new(SourceEnvelope::PmAccount(
+            PmAccountEnvelope {
+                portfolio,
+                metadata: StreamMetadata {
+                    schema_version: 4,
+                    source_id: "account-fill".into(),
+                    source_time_ms: 2,
+                    canonical_source_rank: 0,
+                    receipt_time_ms: 2,
+                    connection_id: "account".into(),
+                    connection_epoch: 0,
+                    frame_sequence: 2,
+                    ingest_sequence: 2,
+                },
+                raw_frame: Vec::new(),
+                fact: PmAccountEvent::Fill {
+                    identity: pmkit_event::FillIdentity::Venue("fill-1".into()),
+                    strategy: None,
+                    order_id: "venue-1".into(),
+                    market: MarketId::new("btc-5m").map_err(|error| {
+                        DataSourceError::ReplayGap {
+                            message: error.to_string(),
+                        }
+                    })?,
+                    outcome: Outcome::Up,
+                    price: Decimal::new(60, 2),
+                    size: Decimal::from(10),
+                    side: Side::Buy,
+                    fee: Decimal::ZERO,
+                    liquidity: pmkit_event::Liquidity::Taker,
+                    timestamp_ms: 2,
+                },
+            },
+        ))))
+        .await
+        .map_err(|_| DataSourceError::SinkClosed)?;
         sink.send(SourceSignal::Watermark(i64::MAX))
             .await
             .map_err(|_| DataSourceError::SinkClosed)?;
@@ -635,6 +770,148 @@ async fn live_delivers_reference_facts_with_latest_market_context()
     assert_eq!(nonempty_books.load(Ordering::Relaxed), 1);
     assert_eq!(executor.submissions.load(Ordering::Relaxed), 1);
     assert_eq!(report.rejected, 0);
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
+async fn live_risk_rejection_persists_one_stable_action_verdict()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let store = TursoTapeStore::open_local(directory.path().join("live-risk-verdict.db")).await?;
+    let executor = Arc::new(CountingExec::default());
+    let mut limits = risk()?;
+    limits.max_order_notional = Money::ZERO;
+    let run = LiveRun::new(
+        RunId::new("live-risk-verdict")?,
+        PortfolioId::new("alice")?,
+        executor.clone(),
+        Arc::new(LiveWithBook),
+        limits,
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(BuyFactory),
+    ));
+
+    let report = live::drive_with_store(&run, &config()?, Some(&store)).await?;
+    assert_eq!(executor.submissions.load(Ordering::Relaxed), 0);
+    assert_eq!(report.rejected, 1);
+
+    let scope = OwnerScope::new(PortfolioId::new("alice")?, RunId::new("live-risk-verdict")?);
+    let decisions = store.read_decisions(&scope).await?;
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions, store.read_decisions(&scope).await?);
+    let decision = &decisions[0];
+    assert_eq!(decision.payload["decision"]["kind"], "actions");
+    let verdicts = decision.payload["decision"]["risk"]
+        .as_array()
+        .ok_or("missing risk verdicts")?;
+    assert_eq!(verdicts.len(), 1);
+    assert_eq!(verdicts[0]["action_index"], 0);
+    assert_eq!(verdicts[0]["verdict"]["kind"], "rejected");
+    assert_eq!(verdicts[0]["verdict"]["reason"], "risk gate");
+    assert!(store.read_pending_intents(&scope).await?.is_empty());
+    assert!(store.read_rejected_intents(&scope).await?.is_empty());
+    store.delete_database()?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
+async fn live_rejected_then_accepted_preserves_indices_and_intent_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let store = TursoTapeStore::open_local(directory.path().join("live-verdict-order.db")).await?;
+    let executor = Arc::new(CountingExec::default());
+    let mut limits = risk()?;
+    limits.max_order_notional = Money::usdc(1);
+    let run = LiveRun::new(
+        RunId::new("live-verdict-order")?,
+        PortfolioId::new("alice")?,
+        executor.clone(),
+        Arc::new(LiveWithBook),
+        limits,
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(RejectThenAcceptFactory),
+    ));
+
+    let report = live::drive_with_store(&run, &config()?, Some(&store)).await?;
+    assert_eq!(executor.submissions.load(Ordering::Relaxed), 1);
+    assert_eq!(report.rejected, 1);
+
+    let scope = OwnerScope::new(
+        PortfolioId::new("alice")?,
+        RunId::new("live-verdict-order")?,
+    );
+    let decisions = store.read_decisions(&scope).await?;
+    assert_eq!(decisions.len(), 1);
+    let decision = &decisions[0];
+    let verdicts = decision.payload["decision"]["risk"]
+        .as_array()
+        .ok_or("missing risk verdicts")?;
+    assert_eq!(verdicts.len(), 2);
+    assert_eq!(verdicts[0]["action_index"], 0);
+    assert_eq!(verdicts[0]["verdict"]["kind"], "rejected");
+    assert_eq!(verdicts[0]["verdict"]["reason"], "risk gate");
+    assert_eq!(verdicts[1]["action_index"], 1);
+    assert_eq!(verdicts[1]["verdict"]["kind"], "accepted");
+
+    let intents = store.read_accepted_intents(&scope).await?;
+    assert_eq!(intents.len(), 1);
+    assert_eq!(
+        intents[0].identity.correlation_id,
+        format!("{}:1", decision.identity.correlation_id)
+    );
+    assert_eq!(
+        intents[0].identity.source_timestamp_ms,
+        decision.identity.source_timestamp_ms
+    );
+    assert_eq!(
+        intents[0].identity.ingest_sequence,
+        decision.identity.ingest_sequence
+    );
+    assert_eq!(intents[0].payload["action_index"], 1);
+    assert_eq!(intents[0].payload["order"]["qty"], "1");
+    assert!(store.read_rejected_intents(&scope).await?.is_empty());
+    store.delete_database()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_reference_risk_uses_account_fill_pnl_before_admission()
+-> Result<(), Box<dyn std::error::Error>> {
+    let executor = Arc::new(CountingExec::default());
+    let mut limits = risk()?;
+    limits.max_daily_loss = Money::from_decimal(Decimal::new(5, 1));
+    let run = LiveRun::new(
+        RunId::new("live-reference-fill-pnl")?,
+        PortfolioId::new("alice")?,
+        executor.clone(),
+        Arc::new(LiveWithBook),
+        limits,
+    )
+    .account_data(Arc::new(AccountFillSource))
+    .reference_data(Arc::new(LateReferenceLive))
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("reference-buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(ReferenceBuyerFactory {
+            calls: Arc::new(AtomicUsize::new(0)),
+            nonempty_books: Arc::new(AtomicUsize::new(0)),
+        }),
+    ));
+    let mut runtime = config()?;
+    runtime.shutdown.live_orders = LiveOrderPolicy::Leave;
+
+    let report = live::drive(&run, &runtime).await?;
+
+    assert_eq!(executor.submissions.load(Ordering::Relaxed), 0);
+    assert_eq!(report.rejected, 1);
     Ok(())
 }
 

@@ -3,7 +3,8 @@
 use std::future::Future;
 
 use pmkit_book::OrderBookL2;
-use pmkit_event::CexReferenceEvent;
+use pmkit_core::{MarketId, StrategyId};
+use pmkit_event::{CexReferenceEvent, StreamMetadata};
 use pmkit_exec::{ExecError, OrderId, PlaceOrder};
 use pmkit_sim::SimulationConfig;
 use pmkit_store::{
@@ -116,6 +117,41 @@ impl DecisionSnapshot {
     pub const fn with_simulation(mut self, simulation: SimulationConfig) -> Self {
         self.simulation = Some(simulation);
         self
+    }
+}
+
+/// Builds a strategy-scoped identity for one paper or backtest evaluation.
+///
+/// The transport coordinates keep same-timestamp source frames distinct, while
+/// the strategy and market fields keep one event's persisted verdicts scoped to
+/// the evaluation that produced them.
+#[must_use]
+pub(crate) fn strategy_decision_identity(
+    scope: &OwnerScope,
+    mode: &str,
+    strategy: &StrategyId,
+    market: &MarketId,
+    event_timestamp_ms: i64,
+    metadata: &StreamMetadata,
+) -> CausalIdentity {
+    let strategy = strategy.to_string();
+    let market = market.to_string();
+    let source_id = &metadata.source_id;
+    let connection_id = &metadata.connection_id;
+    CausalIdentity {
+        scope: scope.clone(),
+        correlation_id: format!(
+            "{mode}:strategy:{}:{strategy}:market:{}:{market}:source:{}:{source_id}:connection:{}:{connection_id}:epoch:{}:frame:{}:ingest:{}:event:{event_timestamp_ms}",
+            strategy.len(),
+            market.len(),
+            source_id.len(),
+            connection_id.len(),
+            metadata.connection_epoch,
+            metadata.frame_sequence,
+            metadata.ingest_sequence,
+        ),
+        source_timestamp_ms: metadata.source_time_ms,
+        ingest_sequence: i64::try_from(metadata.ingest_sequence).unwrap_or(i64::MAX),
     }
 }
 
