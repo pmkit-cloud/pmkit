@@ -744,16 +744,6 @@ pub async fn drive_with_control(
             let fact = StrategyFact::Market(event.clone());
             let update_result = paper.update_book(market, *outcome, book.clone()).await;
             metrics.set_fills(paper.fill_count());
-            if let Some(store) = store {
-                persist_paper_ledger(store, &scope, &paper)
-                    .await
-                    .map_err(|source| StartError::Storage {
-                        run: run.id().clone(),
-                        source,
-                    })?;
-            } else {
-                paper.drain_ledger();
-            }
             update_result.map_err(|source| StartError::ExecutionState {
                 run: run.id().clone(),
                 source,
@@ -769,6 +759,16 @@ pub async fn drive_with_control(
                 *timestamp_ms,
             )
             .await?;
+            if let Some(store) = store {
+                persist_paper_ledger(store, &scope, &paper)
+                    .await
+                    .map_err(|source| StartError::Storage {
+                        run: run.id().clone(),
+                        source,
+                    })?;
+            } else {
+                paper.drain_ledger();
+            }
             drain_fills(&mut fill_rx);
             fills = paper.fill_count();
             metrics.set_fills(fills);
