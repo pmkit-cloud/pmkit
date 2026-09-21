@@ -161,7 +161,7 @@ async fn submit_paper_order(
     order: &pmkit_exec::PlaceOrder,
     action_index: u32,
     marks: &HashMap<(pmkit_core::MarketId, Outcome), Decimal>,
-    limits: &pmkit_runtime::RiskLimits,
+    loss_limit: Decimal,
     loss_breached: &mut bool,
     verdicts: &mut Vec<crate::causal::ActionRiskVerdict>,
 ) -> Result<(), StartError> {
@@ -180,7 +180,7 @@ async fn submit_paper_order(
     update_loss_breach(
         context.paper,
         marks,
-        limits,
+        loss_limit,
         loss_breached,
         context.store,
         context.scope,
@@ -245,6 +245,7 @@ fn paper_order_rejection_reason(
         marks,
         strategy_market,
         strategy,
+        order.outcome,
         daily_pnl,
     );
     if loss_breached
@@ -272,6 +273,7 @@ async fn submit_risk_checked_paper_order(
     action_index: u32,
     marks: &HashMap<(pmkit_core::MarketId, Outcome), Decimal>,
     limits: &pmkit_runtime::RiskLimits,
+    loss_limit: Decimal,
     effective_limits_by_strategy: &HashMap<pmkit_core::StrategyId, pmkit_runtime::RiskLimits>,
     loss_breached: &mut bool,
     verdicts: &mut Vec<crate::causal::ActionRiskVerdict>,
@@ -279,7 +281,7 @@ async fn submit_risk_checked_paper_order(
     update_loss_breach(
         context.paper,
         marks,
-        limits,
+        loss_limit,
         loss_breached,
         context.store,
         context.scope,
@@ -309,7 +311,7 @@ async fn submit_risk_checked_paper_order(
         order,
         action_index,
         marks,
-        limits,
+        loss_limit,
         loss_breached,
         verdicts,
     )
@@ -360,11 +362,13 @@ fn paper_risk_exposure(
     marks: &HashMap<(pmkit_core::MarketId, Outcome), Decimal>,
     market: &pmkit_core::MarketId,
     strategy: &pmkit_core::StrategyId,
+    outcome: Outcome,
     daily_pnl: Decimal,
 ) -> crate::live::live_risk::PortfolioRiskExposure {
     let mut reserved_portfolio = Decimal::ZERO;
     let mut reserved_market = Decimal::ZERO;
     let mut reserved_strategy = Decimal::ZERO;
+    let mut pending_position_notional = Decimal::ZERO;
     for order in account
         .resting_orders
         .iter()
@@ -374,6 +378,9 @@ fn paper_risk_exposure(
         reserved_portfolio += notional;
         if order.market == *market {
             reserved_market += notional;
+            if order.outcome == outcome {
+                pending_position_notional += notional;
+            }
         }
         if order.strategy.as_ref() == Some(strategy) {
             reserved_strategy += notional;
@@ -391,6 +398,7 @@ fn paper_risk_exposure(
             })
             + reserved_market,
         strategy_notional: reserved_strategy,
+        pending_position_notional,
         daily_pnl,
         open_orders: account.resting_orders.len() + account.delayed_orders.len(),
     }
@@ -412,6 +420,22 @@ async fn paper_loss_breached(
     }))
 }
 
+fn effective_max_loss(
+    limits: &pmkit_runtime::RiskLimits,
+    effective_limits_by_strategy: &HashMap<pmkit_core::StrategyId, pmkit_runtime::RiskLimits>,
+) -> Decimal {
+    effective_limits_by_strategy
+        .values()
+        .map(|effective| effective.max_loss.as_decimal())
+        .fold(limits.max_loss.as_decimal(), |current, candidate| {
+            if candidate < current {
+                candidate
+            } else {
+                current
+            }
+        })
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "durable paper loss latching carries the storage identity context"
@@ -419,7 +443,7 @@ async fn paper_loss_breached(
 async fn update_loss_breach(
     paper: &PaperExecutor,
     marks: &HashMap<(pmkit_core::MarketId, Outcome), Decimal>,
-    limits: &pmkit_runtime::RiskLimits,
+    loss_limit: Decimal,
     loss_breached: &mut bool,
     store: Option<&dyn TapeStore>,
     scope: &OwnerScope,
@@ -439,7 +463,7 @@ async fn update_loss_breach(
     ) else {
         return Ok(());
     };
-    if daily_pnl > -limits.max_loss.as_decimal() {
+    if daily_pnl > -loss_limit {
         return Ok(());
     }
     *loss_breached = true;
@@ -482,6 +506,7 @@ async fn dispatch_paper_strategy(
     timestamp_ms: i64,
     marks: &HashMap<(pmkit_core::MarketId, Outcome), Decimal>,
     limits: &pmkit_runtime::RiskLimits,
+    loss_limit: Decimal,
     effective_limits_by_strategy: &HashMap<pmkit_core::StrategyId, pmkit_runtime::RiskLimits>,
     loss_breached: &mut bool,
     fill_rx: &mut tokio::sync::mpsc::Receiver<MarketEvent>,
@@ -517,6 +542,7 @@ async fn dispatch_paper_strategy(
                         action_index,
                         marks,
                         limits,
+                        loss_limit,
                         effective_limits_by_strategy,
                         loss_breached,
                         &mut verdicts,
@@ -539,6 +565,7 @@ async fn dispatch_paper_strategy(
                             action_index,
                             marks,
                             limits,
+                            loss_limit,
                             effective_limits_by_strategy,
                             loss_breached,
                             &mut verdicts,
@@ -585,6 +612,7 @@ pub async fn drive_with_control(
         })
         .collect();
     let limits = run.risk().clone();
+    let loss_limit = effective_max_loss(&limits, &effective_limits_by_strategy);
     let metrics = control.metrics_for(run.id());
 
     let (fill_tx, mut fill_rx) = tokio::sync::mpsc::channel(1024);
@@ -747,6 +775,7 @@ pub async fn drive_with_control(
                         timestamp_ms,
                         &marks,
                         &limits,
+                        loss_limit,
                         &effective_limits_by_strategy,
                         &mut loss_breached,
                         &mut fill_rx,
@@ -805,7 +834,7 @@ pub async fn drive_with_control(
                 update_loss_breach(
                     &paper,
                     &marks,
-                    &limits,
+                    loss_limit,
                     &mut loss_breached,
                     store,
                     &scope,
@@ -860,7 +889,7 @@ pub async fn drive_with_control(
             update_loss_breach(
                 &paper,
                 &marks,
-                &limits,
+                loss_limit,
                 &mut loss_breached,
                 store,
                 &scope,
@@ -901,6 +930,7 @@ pub async fn drive_with_control(
                         *timestamp_ms,
                         &marks,
                         &limits,
+                        loss_limit,
                         &effective_limits_by_strategy,
                         &mut loss_breached,
                         &mut fill_rx,

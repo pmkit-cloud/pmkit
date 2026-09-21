@@ -13,7 +13,7 @@ use pmkit_event::{
 };
 use pmkit_market::{Asset, Exchange, Outcome};
 use pmkit_money::Money;
-use pmkit_runtime::StrategyRegistration;
+use pmkit_runtime::{PartialRiskLimits, RiskLimitOverrides, StrategyRegistration};
 use pmkit_spec::{ConservativeV1Config, PaperRun};
 use pmkit_store::{OwnerScope, TapeStore, TursoTapeStore};
 use pmkit_strategy::{
@@ -695,6 +695,205 @@ async fn paper_max_loss_breach_survives_restart() -> Result<(), Box<dyn std::err
     assert_eq!(second_report.metrics.rejected, 1);
     drop(second_app);
     drop(store);
+    Ok(())
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "restart regression keeps both runs and durable assertions together"
+)]
+async fn paper_strategy_max_loss_latch_survives_recovery_and_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let store =
+        Arc::new(TursoTapeStore::open_local(directory.path().join("override-loss.db")).await?);
+    let strategy = StrategyId::new("override-buyer")?;
+    let market = MarketId::new("btc-5m")?;
+    let mut overrides = RiskLimitOverrides::default();
+    overrides.per_strategy.insert(
+        strategy.clone(),
+        PartialRiskLimits {
+            max_loss: Some(Money::usdc(1)),
+            ..PartialRiskLimits::default()
+        },
+    );
+    let limits = risk()?;
+    let first_run = PaperRun::new(
+        RunId::new("paper-override-loss-latch")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        limits.clone(),
+        Arc::new(RiskSequenceLive {
+            books: vec![
+                (Decimal::new(44, 2), Decimal::new(46, 2), 1),
+                (Decimal::new(4, 2), Decimal::new(6, 2), 2),
+                (Decimal::new(49, 2), Decimal::new(50, 2), 3),
+            ],
+        }),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(
+        StrategyRegistration::new(
+            strategy.clone(),
+            market.clone(),
+            Arc::new(RepeatTakerFactory),
+        )
+        .risk_overrides(overrides.clone()),
+    );
+    let first_app = Pmkit::builder(config()?)
+        .storage(store.clone())
+        .run(first_run)
+        .start()
+        .await?;
+    let RunReport::Paper(first_report) = first_app
+        .report(&RunId::new("paper-override-loss-latch")?)
+        .ok_or("missing first report")?
+    else {
+        return Err("expected a paper report".into());
+    };
+    assert_eq!(first_report.fills, 1);
+    assert_eq!(first_report.metrics.rejected, 2);
+    let scope = OwnerScope::new(
+        PortfolioId::new("alice")?,
+        RunId::new("paper-override-loss-latch")?,
+    );
+    let decisions = store.read_decisions(&scope).await?;
+    assert_eq!(
+        decisions
+            .iter()
+            .filter(|decision| decision.payload["kind"] == "paper-risk-breach")
+            .count(),
+        1
+    );
+    drop(first_app);
+
+    let second_run = PaperRun::new(
+        RunId::new("paper-override-loss-latch")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        limits,
+        Arc::new(RiskSequenceLive {
+            books: vec![(Decimal::new(49, 2), Decimal::new(50, 2), 4)],
+        }),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(
+        StrategyRegistration::new(strategy, market, Arc::new(RepeatTakerFactory))
+            .risk_overrides(overrides),
+    );
+    let second_app = Pmkit::builder(config()?)
+        .storage(store.clone())
+        .run(second_run)
+        .start()
+        .await?;
+    let RunReport::Paper(second_report) = second_app
+        .report(&RunId::new("paper-override-loss-latch")?)
+        .ok_or("missing second report")?
+    else {
+        return Err("expected a paper report".into());
+    };
+    assert_eq!(second_report.fills, 1);
+    assert_eq!(second_report.metrics.rejected, 1);
+    drop(second_app);
+    drop(store);
+    Ok(())
+}
+
+#[tokio::test]
+async fn paper_risk_gate_counts_resting_position_reservation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut limits = risk()?;
+    limits.max_position_notional = Money::from_decimal(Decimal::new(75, 2));
+    let run = PaperRun::new(
+        RunId::new("paper-resting-position-limit")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        limits,
+        Arc::new(CancelLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("maker")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(RepeatPlaceFactory),
+    ));
+
+    let app = Pmkit::builder(config()?).run(run).start().await?;
+    let RunReport::Paper(report) = app
+        .report(&RunId::new("paper-resting-position-limit")?)
+        .ok_or("missing report")?
+    else {
+        return Err("expected a paper report".into());
+    };
+    assert_eq!(report.fills, 0);
+    assert_eq!(report.metrics.rejected, 1);
+    assert_eq!(report.exposure.portfolio_notional, Decimal::new(45, 2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn paper_risk_gate_counts_delayed_position_reservation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut limits = risk()?;
+    limits.max_position_notional = Money::usdc(8);
+    let run = PaperRun::new(
+        RunId::new("paper-delayed-position-limit")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        limits,
+        Arc::new(RiskSequenceLive {
+            books: vec![
+                (Decimal::new(44, 2), Decimal::new(46, 2), 1),
+                (Decimal::new(4, 2), Decimal::new(6, 2), 2),
+            ],
+        }),
+        ConservativeV1Config {
+            activation_latency: Duration::from_millis(100),
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("taker")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(RepeatTakerFactory),
+    ));
+
+    let app = Pmkit::builder(config()?).run(run).start().await?;
+    let RunReport::Paper(report) = app
+        .report(&RunId::new("paper-delayed-position-limit")?)
+        .ok_or("missing report")?
+    else {
+        return Err("expected a paper report".into());
+    };
+    assert_eq!(report.fills, 0);
+    assert_eq!(report.metrics.rejected, 1);
+    assert_eq!(report.exposure.portfolio_notional, Decimal::from(5));
     Ok(())
 }
 
