@@ -1520,7 +1520,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn live_adapter_propagates_buffer_through_isolated_and_fails_closed_on_lag()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Given: a loopback WebSocket server and an adapter client whose bounded event buffer is
