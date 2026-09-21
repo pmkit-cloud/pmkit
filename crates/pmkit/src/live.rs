@@ -37,20 +37,23 @@ impl DurableFillAuthority {
 #[path = "live_recovery.rs"]
 mod live_recovery;
 #[path = "live_risk.rs"]
-mod live_risk;
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) mod live_risk;
 #[path = "live_tape.rs"]
 mod live_tape;
 #[cfg(test)]
 use live_recovery::{DurableOrder, apply_status_fill};
 use live_recovery::{accepted_submissions, corrupt_order, reconstruct_accepted_orders};
 #[cfg(test)]
-pub use live_risk::mark_positions;
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) use live_risk::mark_positions;
 use live_risk::{
     LiveRiskState, OrderRateLimits, OrderRateState, PortfolioRiskExposure, RiskStateError,
     passes_aggregated_risk,
 };
 #[cfg(test)]
-pub use live_risk::{
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) use live_risk::{
     PortfolioRiskExposure as TestRiskExposure,
     passes_aggregated_risk as test_passes_aggregated_risk, passes_risk,
 };
