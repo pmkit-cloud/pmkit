@@ -17,7 +17,7 @@ use pmkit_runtime::{PartialRiskLimits, RiskLimitOverrides, StrategyRegistration}
 use pmkit_spec::{ConservativeV1Config, PaperRun};
 use pmkit_store::{OwnerScope, TapeStore, TursoTapeStore};
 use pmkit_strategy::{
-    Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
+    Action, Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
 };
 use rust_decimal::Decimal;
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -79,6 +79,25 @@ struct RepeatBuyFactory;
 
 struct MismatchedMarket;
 struct MismatchedMarketFactory;
+
+#[derive(Debug, Clone, Copy)]
+enum ReferenceCancellationAction {
+    Cancel,
+    CancelAll,
+    ReplaceQuotes,
+}
+
+struct ReferenceCancellationLive;
+struct ReferenceCancellationCex;
+
+struct ReferenceCancellationStrategy {
+    action: ReferenceCancellationAction,
+    placed: bool,
+}
+
+struct ReferenceCancellationFactory {
+    action: ReferenceCancellationAction,
+}
 
 fn record_fact(facts: &Mutex<Vec<StrategyFact>>, fact: &StrategyFact) {
     match facts.lock() {
@@ -366,6 +385,112 @@ impl LiveDataSource for ScriptedLive {
             .await
             .map_err(|_| DataSourceError::SinkClosed)?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl LiveDataSource for ReferenceCancellationLive {
+    async fn subscribe(
+        &self,
+        market: MarketId,
+        outcome: Outcome,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        if outcome == Outcome::Up {
+            sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
+                market,
+                outcome,
+                bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+                asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
+                timestamp_ms: 100,
+            }))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        }
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+#[async_trait]
+impl LiveCexDataSource for ReferenceCancellationCex {
+    async fn subscribe_reference(&self, sink: Sender<SourceSignal>) -> Result<(), DataSourceError> {
+        sink.send(SourceSignal::Data(Box::new(SourceEnvelope::CexReference(
+            CexReferenceEnvelope {
+                metadata: StreamMetadata {
+                    schema_version: 1,
+                    source_id: "test-reference-cancel".into(),
+                    source_time_ms: 200,
+                    canonical_source_rank: 1,
+                    receipt_time_ms: 200,
+                    connection_id: "test-reference-cancel".into(),
+                    connection_epoch: 0,
+                    frame_sequence: 0,
+                    ingest_sequence: 0,
+                },
+                fact: reference_trade(1, 200, 100),
+            },
+        ))))
+        .await
+        .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+impl Strategy for ReferenceCancellationStrategy {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        if !self.placed
+            && matches!(
+                context.fact,
+                StrategyFact::Market(MarketEvent::BookUpdate { .. })
+            )
+        {
+            self.placed = true;
+            return Ok(Actions::place(pmkit_exec::PlaceOrder {
+                market: context.market.clone(),
+                outcome: Outcome::Up,
+                side: pmkit_book::Side::Buy,
+                price: Decimal::new(45, 2),
+                qty: Decimal::ONE,
+                post_only: true,
+                tif: pmkit_exec::TimeInForce::Gtc,
+            }));
+        }
+        if matches!(context.fact, StrategyFact::Reference(_)) {
+            let mut actions = Actions::none();
+            match self.action {
+                ReferenceCancellationAction::Cancel => {
+                    actions.push(Action::Cancel(pmkit_exec::OrderId("paper-0".into())));
+                }
+                ReferenceCancellationAction::CancelAll => actions.push(Action::CancelAll),
+                ReferenceCancellationAction::ReplaceQuotes => {
+                    actions.push(Action::ReplaceQuotes {
+                        cancel: vec![pmkit_exec::OrderId("paper-0".into())],
+                        place: Vec::new(),
+                    });
+                }
+            }
+            return Ok(actions);
+        }
+        Ok(Actions::none())
+    }
+}
+
+impl StrategyFactory for ReferenceCancellationFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(ReferenceCancellationStrategy {
+            action: self.action,
+            placed: false,
+        }))
     }
 }
 
@@ -682,6 +807,73 @@ async fn paper_risk_gate_counts_resting_order_reservation() -> Result<(), Box<dy
     assert_eq!(report.fills, 0);
     assert_eq!(report.metrics.rejected, 1);
     assert_eq!(report.exposure.portfolio_notional, Decimal::new(45, 2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn paper_reference_cancellations_use_event_timestamp()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (action, name) in [
+        (ReferenceCancellationAction::Cancel, "cancel"),
+        (ReferenceCancellationAction::CancelAll, "cancel-all"),
+        (ReferenceCancellationAction::ReplaceQuotes, "replace-quotes"),
+    ] {
+        let directory = tempfile::tempdir()?;
+        let run_id = RunId::new(format!("paper-reference-{name}"))?;
+        let portfolio = PortfolioId::new("alice")?;
+        let market = MarketId::new("btc-5m")?;
+        let store = Arc::new(
+            TursoTapeStore::open_local(directory.path().join(format!("{name}.db"))).await?,
+        );
+        let run = PaperRun::new(
+            run_id.clone(),
+            portfolio.clone(),
+            Money::usdc(10_000),
+            risk()?,
+            Arc::new(ReferenceCancellationLive),
+            ConservativeV1Config {
+                activation_latency: Duration::ZERO,
+                maker_queue_ahead_bps: 0,
+                slippage_bps: 0,
+                market_impact_bps: 0,
+                fee_model: None,
+                market_limits: None,
+            },
+        )
+        .reference_data(Arc::new(ReferenceCancellationCex))
+        .strategy(StrategyRegistration::new(
+            StrategyId::new("canceller")?,
+            market,
+            Arc::new(ReferenceCancellationFactory { action }),
+        ));
+
+        let app = Pmkit::builder(config()?)
+            .storage(store.clone())
+            .run(run)
+            .start()
+            .await?;
+        let RunReport::Paper(report) = app.report(&run_id).ok_or("missing report")? else {
+            return Err("expected a paper report".into());
+        };
+        assert_eq!(report.fills, 0, "{name}");
+        drop(app);
+        let decisions = store
+            .read_decisions(&OwnerScope::new(portfolio, run_id))
+            .await?;
+        let ledger_timestamps = decisions
+            .iter()
+            .filter(|decision| decision.payload["record_type"] == "paper_ledger")
+            .map(|decision| decision.identity.source_timestamp_ms)
+            .collect::<Vec<_>>();
+        assert_eq!(ledger_timestamps, vec![0, 100, 100, 200], "{name}");
+        let cancellation = decisions
+            .iter()
+            .find(|decision| decision.payload["event"]["kind"] == "order_cancelled")
+            .ok_or_else(|| format!("missing {name} cancellation"))?;
+        assert_eq!(cancellation.identity.source_timestamp_ms, 200, "{name}");
+        assert_eq!(cancellation.payload["timestamp_ms"], 200, "{name}");
+        drop(store);
+    }
     Ok(())
 }
 

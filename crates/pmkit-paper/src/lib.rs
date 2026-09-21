@@ -295,6 +295,16 @@ impl PaperExecutor {
             .acknowledge_pending(event_id)
     }
 
+    /// Cancels one order at the supplied logical timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError`] when the ledger transition fails.
+    pub fn cancel_at(&self, order_id: &OrderId, timestamp_ms: i64) -> Result<(), ExecError> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        cancel_at_timestamp(&mut state, order_id, timestamp_ms)
+    }
+
     /// Submits an order while retaining its strategy ownership in the ledger.
     ///
     /// # Errors
@@ -485,14 +495,9 @@ impl Executor for PaperExecutor {
     async fn cancel(&self, order_id: &OrderId) -> Result<(), ExecError> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let timestamp_ms = state.last_timestamp_ms;
-        if state.engine.cancel(order_id).is_some() {
-            state
-                .ledger
-                .cancel(order_id, timestamp_ms)
-                .map_err(|error| execution_error(&error))?;
-        }
+        let result = cancel_at_timestamp(&mut state, order_id, timestamp_ms);
         drop(state);
-        Ok(())
+        result
     }
 
     async fn cancel_all(&self) -> Result<(), ExecError> {
@@ -528,6 +533,21 @@ impl PaperExecutor {
         open_orders.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         ExecutionSnapshot { open_orders }
     }
+}
+
+fn cancel_at_timestamp(
+    state: &mut ExecutorState,
+    order_id: &OrderId,
+    timestamp_ms: i64,
+) -> Result<(), ExecError> {
+    if state.engine.cancel(order_id).is_some() {
+        state
+            .ledger
+            .cancel(order_id, timestamp_ms)
+            .map_err(|error| execution_error(&error))?;
+        state.last_timestamp_ms = timestamp_ms;
+    }
+    Ok(())
 }
 
 fn execution_error(error: &PaperLedgerError) -> ExecError {

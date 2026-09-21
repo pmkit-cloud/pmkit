@@ -8,7 +8,7 @@ use pmkit_accounting::{
 };
 use pmkit_book::{OrderBookL2, Position};
 use pmkit_event::{CexReferenceEvent, MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
-use pmkit_exec::{ExecError, Executor, OrderId};
+use pmkit_exec::{ExecError, OrderId};
 use pmkit_market::Outcome;
 use pmkit_paper::{PaperExecutor, PaperLedgerEntry, PaperLedgerError};
 use pmkit_sim::SimulationConfig;
@@ -132,11 +132,11 @@ async fn cancel_paper_order(
     scope: &OwnerScope,
     strategy: &pmkit_core::StrategyId,
     order_id: &OrderId,
+    timestamp_ms: i64,
 ) -> Result<(), StartError> {
     if owned_paper_orders(paper, strategy).contains(order_id) {
         paper
-            .cancel(order_id)
-            .await
+            .cancel_at(order_id, timestamp_ms)
             .map_err(|source| StartError::ExecutionState {
                 run: run.id().clone(),
                 source,
@@ -940,12 +940,29 @@ async fn dispatch_strategy(
                     .await?;
                 }
                 Action::Cancel(order_id) => {
-                    cancel_paper_order(run, paper, store, scope, &instance.id, order_id).await?;
+                    cancel_paper_order(
+                        run,
+                        paper,
+                        store,
+                        scope,
+                        &instance.id,
+                        order_id,
+                        timestamp_ms,
+                    )
+                    .await?;
                 }
                 Action::ReplaceQuotes { cancel, place } => {
                     for order_id in cancel {
-                        cancel_paper_order(run, paper, store, scope, &instance.id, order_id)
-                            .await?;
+                        cancel_paper_order(
+                            run,
+                            paper,
+                            store,
+                            scope,
+                            &instance.id,
+                            order_id,
+                            timestamp_ms,
+                        )
+                        .await?;
                     }
                     for order in place {
                         submit_risk_checked_paper_order(
@@ -965,8 +982,16 @@ async fn dispatch_strategy(
                 }
                 Action::CancelAll => {
                     for order_id in owned_paper_orders(paper, &instance.id) {
-                        cancel_paper_order(run, paper, store, scope, &instance.id, &order_id)
-                            .await?;
+                        cancel_paper_order(
+                            run,
+                            paper,
+                            store,
+                            scope,
+                            &instance.id,
+                            &order_id,
+                            timestamp_ms,
+                        )
+                        .await?;
                     }
                 }
             }
