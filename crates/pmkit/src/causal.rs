@@ -122,15 +122,16 @@ impl DecisionSnapshot {
 
 /// Builds a strategy-scoped identity for one paper or backtest evaluation.
 ///
-/// The transport coordinates keep same-timestamp source frames distinct, while
-/// the strategy and market fields keep one event's persisted verdicts scoped to
-/// the evaluation that produced them.
+/// The transport coordinates and canonical event stream keep same-timestamp
+/// source frames distinct, while the strategy and market fields keep one
+/// event's persisted verdicts scoped to the evaluation that produced them.
 #[must_use]
 pub(crate) fn strategy_decision_identity(
     scope: &OwnerScope,
     mode: &str,
     strategy: &StrategyId,
     market: &MarketId,
+    event_stream: &str,
     event_timestamp_ms: i64,
     metadata: &StreamMetadata,
 ) -> CausalIdentity {
@@ -141,7 +142,7 @@ pub(crate) fn strategy_decision_identity(
     CausalIdentity {
         scope: scope.clone(),
         correlation_id: format!(
-            "{mode}:strategy:{}:{strategy}:market:{}:{market}:source:{}:{source_id}:connection:{}:{connection_id}:epoch:{}:frame:{}:ingest:{}:event:{event_timestamp_ms}",
+            "{mode}:strategy:{}:{strategy}:market:{}:{market}:source:{}:{source_id}:connection:{}:{connection_id}:epoch:{}:frame:{}:ingest:{}:stream:{}:{}:event:{event_timestamp_ms}",
             strategy.len(),
             market.len(),
             source_id.len(),
@@ -149,6 +150,8 @@ pub(crate) fn strategy_decision_identity(
             metadata.connection_epoch,
             metadata.frame_sequence,
             metadata.ingest_sequence,
+            event_stream.len(),
+            event_stream,
         ),
         source_timestamp_ms: metadata.source_time_ms,
         ingest_sequence: i64::try_from(metadata.ingest_sequence).unwrap_or(i64::MAX),

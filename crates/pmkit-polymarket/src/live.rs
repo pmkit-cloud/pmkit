@@ -542,14 +542,6 @@ impl TokenBook {
         Ok(!matching.is_empty())
     }
 
-    fn level_keys(&self) -> BTreeSet<(rust_decimal::Decimal, u8)> {
-        self.bids
-            .keys()
-            .map(|price| (*price, 0))
-            .chain(self.asks.keys().map(|price| (*price, 1)))
-            .collect()
-    }
-
     fn event(&self, market: MarketId, outcome: Outcome) -> MarketEvent {
         MarketEvent::BookUpdate {
             market,
@@ -578,7 +570,6 @@ fn drain_pending_price_changes(
     outcome: Outcome,
 ) -> Result<Vec<MarketEvent>, DataSourceError> {
     let snapshot_timestamp = book.timestamp_ms;
-    let snapshot_levels = book.level_keys();
     let mut buffered = std::mem::take(pending)
         .into_iter()
         .enumerate()
@@ -589,12 +580,18 @@ fn drain_pending_price_changes(
         if update.timestamp < snapshot_timestamp {
             continue;
         }
-        let mut update_levels = BTreeSet::new();
-        for change in update
+        let matching = update
             .price_changes
             .iter()
             .filter(|change| change.asset_id == token)
-        {
+            .collect::<Vec<_>>();
+        if update.timestamp == snapshot_timestamp && !matching.is_empty() {
+            return Err(replay_gap(
+                "buffered price change overlaps book snapshot at the same timestamp",
+            ));
+        }
+        let mut update_levels = BTreeSet::new();
+        for change in matching {
             let size = change
                 .size
                 .ok_or_else(|| replay_gap("price change lacks size"))?;
@@ -609,11 +606,6 @@ fn drain_pending_price_changes(
             let level = (change.price, side_code);
             if !update_levels.insert(level) {
                 return Err(replay_gap("price change contains duplicate levels"));
-            }
-            if update.timestamp == snapshot_timestamp && snapshot_levels.contains(&level) {
-                return Err(replay_gap(
-                    "buffered price change overlaps book snapshot at the same timestamp",
-                ));
             }
             if !seen_levels.insert((update.timestamp, level.0, level.1)) {
                 return Err(replay_gap(
@@ -988,6 +980,24 @@ mod tests {
         let mut unchanged = TokenBook::default();
         unchanged.replace(&snapshot, token)?;
         let mut pending = VecDeque::from([snapshot_overlap]);
+        assert!(matches!(
+            drain_pending_price_changes(
+                &mut unchanged,
+                &mut pending,
+                token,
+                &MarketId::new("btc-5m")?,
+                Outcome::Up,
+            ),
+            Err(DataSourceError::ReplayGap { message })
+                if message == "buffered price change overlaps book snapshot at the same timestamp"
+        ));
+
+        let snapshot_absent_level: PriceChange = serde_json::from_str(
+            r#"{"event_type":"price_change","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"42","price_changes":[{"asset_id":"1","price":"0.48","size":"1","side":"BUY"}]}"#,
+        )?;
+        let mut unchanged = TokenBook::default();
+        unchanged.replace(&snapshot, token)?;
+        let mut pending = VecDeque::from([snapshot_absent_level]);
         assert!(matches!(
             drain_pending_price_changes(
                 &mut unchanged,

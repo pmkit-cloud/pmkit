@@ -33,6 +33,8 @@ struct ScriptedHistory {
     ticks: Vec<i64>,
 }
 
+struct BothOutcomesHistory;
+
 struct ScriptedReference;
 
 struct TwoMarketHistory;
@@ -280,6 +282,34 @@ impl HistoricalDataSource for TwoMarketHistory {
 }
 
 #[async_trait]
+impl HistoricalDataSource for BothOutcomesHistory {
+    async fn replay(
+        &self,
+        _query: ReplayQuery,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        let market = MarketId::new("btc-5m").map_err(|_| DataSourceError::NotAvailable)?;
+        for outcome in [Outcome::Up, Outcome::Down] {
+            sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
+                market: market.clone(),
+                outcome,
+                bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+                asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
+                timestamp_ms: 1,
+            }))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        }
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+#[async_trait]
 impl HistoricalDataSource for StaleMarkHistory {
     async fn replay(
         &self,
@@ -420,6 +450,66 @@ async fn backtest_drives_replay_through_strategy_to_fill() -> Result<(), Box<dyn
     let manifest = app.manifest(&RunId::new("bt")?).ok_or("missing manifest")?;
     assert_eq!(manifest["mode"], "backtest");
     assert_eq!(manifest["run"], "bt");
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
+async fn backtest_same_timestamp_outcomes_have_distinct_decision_identities()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(TursoTapeStore::open_local(directory.path().join("outcomes.db")).await?);
+    let replay = ReplaySpec::new(
+        Arc::new(BothOutcomesHistory),
+        "2026-01-01T00:00:00Z".parse()?,
+        "2026-02-01T00:00:00Z".parse()?,
+        EvidenceRequirement::CorroboratedOnly,
+        RetrievalWait::ReturnPending,
+    );
+    let run = BacktestRun::new(
+        RunId::new("backtest-outcomes")?,
+        PortfolioId::new("research")?,
+        replay,
+        Money::usdc(1_000),
+        risk()?,
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("observer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(BuyFactory),
+    ));
+
+    let app = Pmkit::builder(config()?)
+        .storage(store.clone())
+        .run(run)
+        .start()
+        .await?;
+    let RunReport::Backtest(report) = app.wait_for(RunId::new("backtest-outcomes")?).await? else {
+        return Err("expected a backtest report".into());
+    };
+    assert_eq!(report.events_processed, 2);
+
+    let scope = OwnerScope::new(
+        PortfolioId::new("research")?,
+        RunId::new("backtest-outcomes")?,
+    );
+    let decisions = store.read_decisions(&scope).await?;
+    let mut ids = decisions
+        .iter()
+        .filter(|decision| decision.payload["snapshot"].is_object())
+        .map(|decision| decision.identity.correlation_id.clone())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.windows(2).all(|pair| pair[0] != pair[1]), "{ids:?}");
     Ok(())
 }
 

@@ -30,6 +30,8 @@ use tokio::sync::mpsc::Sender;
 
 struct ScriptedLive;
 
+struct BothOutcomesLive;
+
 struct ScriptedReferenceLive;
 
 struct ReferenceBuyer {
@@ -355,6 +357,32 @@ impl LiveDataSource for ScriptedLive {
 }
 
 #[async_trait]
+impl LiveDataSource for BothOutcomesLive {
+    async fn subscribe(
+        &self,
+        market: MarketId,
+        outcome: Outcome,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
+            market,
+            outcome,
+            bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+            asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
+            timestamp_ms: 1,
+        }))
+        .await
+        .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+#[async_trait]
 impl LiveDataSource for RiskSequenceLive {
     async fn subscribe(
         &self,
@@ -546,6 +574,56 @@ async fn paper_delivers_reference_facts_with_latest_market_context()
         report.fills, 1,
         "reference actions should reach paper execution"
     );
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
+async fn paper_same_timestamp_outcomes_have_distinct_decision_identities()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(TursoTapeStore::open_local(directory.path().join("outcomes.db")).await?);
+    let run = PaperRun::new(
+        RunId::new("paper-outcomes")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        risk()?,
+        Arc::new(BothOutcomesLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("observer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(BuyFactory),
+    ));
+
+    let app = Pmkit::builder(config()?)
+        .storage(store.clone())
+        .run(run)
+        .start()
+        .await?;
+    let RunReport::Paper(report) = app.wait_for(RunId::new("paper-outcomes")?).await? else {
+        return Err("expected a paper report".into());
+    };
+    assert_eq!(report.events_processed, 2);
+
+    let scope = OwnerScope::new(PortfolioId::new("alice")?, RunId::new("paper-outcomes")?);
+    let decisions = store.read_decisions(&scope).await?;
+    let mut ids = decisions
+        .iter()
+        .filter(|decision| decision.payload["snapshot"].is_object())
+        .map(|decision| decision.identity.correlation_id.clone())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.windows(2).all(|pair| pair[0] != pair[1]), "{ids:?}");
     Ok(())
 }
 

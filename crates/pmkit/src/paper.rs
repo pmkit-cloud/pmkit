@@ -794,6 +794,7 @@ pub async fn drive_with_control(
                         "paper-reference",
                         &instance.id,
                         &instance.market,
+                        "reference",
                         timestamp_ms,
                         &envelope.metadata,
                     );
@@ -946,6 +947,7 @@ pub async fn drive_with_control(
                         "paper-market",
                         &instance.id,
                         market,
+                        &format!("market:{market}:{}", outcome.to_string().to_lowercase()),
                         *timestamp_ms,
                         &envelope.metadata,
                     );

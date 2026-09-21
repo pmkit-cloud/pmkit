@@ -136,6 +136,7 @@ pub async fn drive_with_control(
                     fact: &merged.fact,
                     market: None,
                     book: None,
+                    event_stream: "reference",
                     strategy_books: &mut strategy_books,
                     positions_by_market: &mut positions_by_market,
                     timestamp_ms,
@@ -151,6 +152,7 @@ pub async fn drive_with_control(
                         "backtest-reference",
                         &evaluation.strategy,
                         &evaluation.market,
+                        &evaluation.event_stream,
                         timestamp_ms,
                         &envelope.metadata,
                     );
@@ -199,12 +201,14 @@ pub async fn drive_with_control(
             let drained = sim.drain_fills();
             metrics.add_fills(absorb_market_fills(&drained, &mut positions_by_market));
             let fact = StrategyFact::Market(event.clone());
+            let event_stream = format!("market:{market}:{}", outcome.to_string().to_lowercase());
             let (added, rejected, decisions, evaluations) =
                 run_strategies(&mut RunStrategiesInputs {
                     strategies: &mut strategies,
                     fact: &fact,
                     market: Some(market),
                     book: Some(&book),
+                    event_stream: &event_stream,
                     strategy_books: &mut strategy_books,
                     positions_by_market: &mut positions_by_market,
                     timestamp_ms: *timestamp_ms,
@@ -220,6 +224,7 @@ pub async fn drive_with_control(
                         "backtest-market",
                         &evaluation.strategy,
                         &evaluation.market,
+                        &evaluation.event_stream,
                         *timestamp_ms,
                         &envelope.metadata,
                     );
@@ -325,6 +330,7 @@ struct RunStrategiesInputs<'a> {
     fact: &'a StrategyFact,
     market: Option<&'a pmkit_core::MarketId>,
     book: Option<&'a OrderBookL2>,
+    event_stream: &'a str,
     strategy_books: &'a mut [OrderBookL2],
     positions_by_market: &'a mut HashMap<MarketId, Vec<pmkit_book::Position>>,
     timestamp_ms: i64,
@@ -334,6 +340,7 @@ struct RunStrategiesInputs<'a> {
 struct StrategyEvaluation {
     strategy: pmkit_core::StrategyId,
     market: MarketId,
+    event_stream: String,
     book: OrderBookL2,
     verdicts: Vec<crate::causal::ActionRiskVerdict>,
 }
@@ -409,6 +416,7 @@ fn run_strategies(
         evaluations.push(StrategyEvaluation {
             strategy: instance.id.clone(),
             market: instance.market.clone(),
+            event_stream: inputs.event_stream.to_owned(),
             book: book.clone(),
             verdicts,
         });
