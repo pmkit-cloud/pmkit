@@ -723,7 +723,8 @@ async fn dispatch_live_pipeline(
     Ok(())
 }
 
-fn strategy_event_correlation_id(
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn strategy_event_correlation_id(
     strategy: &pmkit_core::StrategyId,
     market: &pmkit_core::MarketId,
     timestamp_ms: i64,

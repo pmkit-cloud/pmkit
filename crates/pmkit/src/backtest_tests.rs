@@ -745,16 +745,30 @@ async fn backtest_records_one_decision_per_book_event() -> Result<(), Box<dyn st
         .start()
         .await?;
 
-    // Then: exactly one causal decision is recorded per book event, owner-scoped.
+    // Then: book and reference evaluations are both durable and owner-scoped.
     let scope = OwnerScope::new(PortfolioId::new("research")?, RunId::new("bt-rec")?);
     let decisions = store.read_decisions(&scope).await?;
-    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions.len(), 3);
     assert!(
         decisions.iter().any(|decision| {
             decision.payload["snapshot"]["cex_trade"]["volume"] == "2"
                 && decision.payload["snapshot"]["cex_trade"]["cvd"] == "2"
         }),
         "decisions: {decisions:?}"
+    );
+    let reference = decisions
+        .iter()
+        .find(|decision| decision.identity.correlation_id.contains(":cex-trade:"))
+        .ok_or("missing reference decision")?;
+    assert!(reference.identity.correlation_id.contains("buyer"));
+    assert_eq!(reference.identity.source_timestamp_ms, 1);
+    assert_eq!(reference.identity.ingest_sequence, 7);
+    assert_eq!(reference.payload["snapshot"]["timing"]["observation_ms"], 1);
+    assert!(reference.payload["snapshot"]["pm_book"]["best_bid"].is_null());
+    assert_eq!(reference.payload["snapshot"]["cex_trade"]["volume"], "2");
+    assert_eq!(
+        reference.payload["snapshot"]["simulation"]["slippage_bps"],
+        0
     );
     drop(store);
     let _ = std::fs::remove_file(&path);

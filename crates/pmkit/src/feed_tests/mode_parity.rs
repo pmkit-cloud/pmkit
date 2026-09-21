@@ -85,32 +85,34 @@ impl LiveDataSource for ParitySource {
 }
 
 async fn emit_reference(sink: Sender<SourceSignal>) -> Result<(), DataSourceError> {
-    sink.send(SourceSignal::Data(Box::new(SourceEnvelope::CexReference(
-        CexReferenceEnvelope {
-            metadata: StreamMetadata {
-                schema_version: 1,
-                source_id: "binance-parity".into(),
-                source_time_ms: 2_000,
-                canonical_source_rank: 1,
-                receipt_time_ms: 2_000,
-                connection_id: "binance-parity".into(),
-                connection_epoch: 0,
-                frame_sequence: 9,
-                ingest_sequence: 9,
+    for (aggregate_trade_id, price, sequence) in [(9, 42, 9_u64), (10, 43, 10_u64)] {
+        sink.send(SourceSignal::Data(Box::new(SourceEnvelope::CexReference(
+            CexReferenceEnvelope {
+                metadata: StreamMetadata {
+                    schema_version: 1,
+                    source_id: "binance-parity".into(),
+                    source_time_ms: 2_000,
+                    canonical_source_rank: 1,
+                    receipt_time_ms: 2_000,
+                    connection_id: "binance-parity".into(),
+                    connection_epoch: 0,
+                    frame_sequence: i64::try_from(sequence).unwrap_or(i64::MAX),
+                    ingest_sequence: sequence,
+                },
+                fact: CexReferenceEvent::Trade {
+                    asset: Asset::Btc,
+                    exchange: Exchange::Binance,
+                    aggregate_trade_id,
+                    price: Decimal::from(price),
+                    qty: Decimal::ONE,
+                    is_buyer_maker: false,
+                    timestamp_ms: 2_000,
+                },
             },
-            fact: CexReferenceEvent::Trade {
-                asset: Asset::Btc,
-                exchange: Exchange::Binance,
-                aggregate_trade_id: 9,
-                price: Decimal::from(42),
-                qty: Decimal::ONE,
-                is_buyer_maker: false,
-                timestamp_ms: 2_000,
-            },
-        },
-    ))))
-    .await
-    .map_err(|_| DataSourceError::SinkClosed)?;
+        ))))
+        .await
+        .map_err(|_| DataSourceError::SinkClosed)?;
+    }
     sink.send(SourceSignal::Watermark(i64::MAX))
         .await
         .map_err(|_| DataSourceError::SinkClosed)?;
@@ -275,15 +277,21 @@ async fn actual_modes_observe_identical_facts_and_portable_decisions()
         let live_report =
             live::drive_with_control(&live_run, &config()?, Some(&store), &control).await?;
         let mut decisions = Vec::new();
+        let mut reference_decisions = Vec::new();
         for run in ["parity-backtest", "parity-paper", "parity-live"] {
             let scope = OwnerScope::new(portfolio.clone(), RunId::new(run)?);
-            let decision = store
-                .read_decisions(&scope)
-                .await?
-                .into_iter()
+            let run_decisions = store.read_decisions(&scope).await?;
+            let decision = run_decisions
+                .iter()
                 .find(|decision| decision.payload["snapshot"].is_object())
                 .ok_or("missing parity decision")?;
-            decisions.push(portable_decision(&decision));
+            decisions.push(portable_decision(decision));
+            let references = run_decisions
+                .iter()
+                .filter(|decision| decision.identity.correlation_id.contains(":cex-trade:"))
+                .map(portable_decision)
+                .collect::<Vec<_>>();
+            reference_decisions.push(references);
         }
 
         // Then: every driver exposes the same fact and mode-independent decision.
@@ -300,8 +308,15 @@ async fn actual_modes_observe_identical_facts_and_portable_decisions()
         assert_eq!(captured(&live_facts), expected_facts);
         assert!(matches!(
             expected_facts.as_slice(),
-            [StrategyFact::Market(_), StrategyFact::Reference(_)]
+            [
+                StrategyFact::Market(_),
+                StrategyFact::Reference(_),
+                StrategyFact::Reference(_)
+            ]
         ));
+        assert_eq!(reference_decisions[0].len(), 2);
+        assert_eq!(reference_decisions[1], reference_decisions[0]);
+        assert_eq!(reference_decisions[2], reference_decisions[0]);
         assert_eq!(decisions[1], decisions[0]);
         assert_eq!(decisions[2], decisions[0]);
         store.delete_database()?;
