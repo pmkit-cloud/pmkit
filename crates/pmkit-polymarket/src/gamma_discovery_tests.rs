@@ -1,9 +1,10 @@
 use std::{
     collections::BTreeMap,
-    io::{Read as _, Write as _},
+    io::{self, Read as _, Write as _},
     net::TcpListener,
     sync::{Arc, Mutex},
     thread,
+    time::{Duration, Instant},
 };
 
 use crate::{DiscoveryError, GammaDiscovery, RecurringFamily};
@@ -282,6 +283,83 @@ async fn gamma_discovery_market_by_event_slug_uses_event_route_and_normalizes_ma
 }
 
 #[tokio::test]
+async fn gamma_discovery_retries_transient_event_unavailability()
+-> Result<(), Box<dyn std::error::Error>> {
+    let market = gamma_market_without_nested_events(&gamma_page_with_window(
+        "10192",
+        "2025-01-01T00:00:00Z",
+        "2026-01-01T00:15:00Z",
+    ));
+    let body = format!(
+        r#"{{"id":"event-0","slug":"btc-up","series":[{{"id":"10192"}}],"markets":{market}}}"#
+    );
+    let (discovery, requests) = event_discovery_responses(vec![
+        status_response("503 Service Unavailable"),
+        response(&body),
+    ])?;
+
+    let result = discovery
+        .market_by_event_slug("btc-up", &BTreeMap::new())
+        .await;
+
+    assert!(result.is_ok());
+    assert_eq!(
+        requests
+            .lock()
+            .map_err(|_| "request capture poisoned")?
+            .len(),
+        2
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn gamma_discovery_bounds_transient_event_retries() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (discovery, requests) =
+        event_discovery_responses(vec![status_response("503 Service Unavailable"); 5])?;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(4),
+        discovery.market_by_event_slug("btc-up", &BTreeMap::new()),
+    )
+    .await?;
+
+    assert!(matches!(result, Err(DiscoveryError::Unavailable)));
+    assert_eq!(
+        requests
+            .lock()
+            .map_err(|_| "request capture poisoned")?
+            .len(),
+        4
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn gamma_discovery_does_not_retry_permanent_event_status()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (discovery, requests) = event_discovery_responses(vec![
+        status_response("404 Not Found"),
+        status_response("404 Not Found"),
+    ])?;
+
+    let result = discovery
+        .market_by_event_slug("btc-up", &BTreeMap::new())
+        .await;
+
+    assert!(matches!(result, Err(DiscoveryError::Unavailable)));
+    assert_eq!(
+        requests
+            .lock()
+            .map_err(|_| "request capture poisoned")?
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn gamma_discovery_market_by_event_slug_rejects_blank_slug()
 -> Result<(), Box<dyn std::error::Error>> {
     let discovery = GammaDiscovery::with_client(SdkGammaClient::new("http://127.0.0.1:1")?);
@@ -344,24 +422,46 @@ async fn gamma_discovery_market_by_event_slug_rejects_malformed_market()
 fn event_discovery(
     body: String,
 ) -> Result<(GammaDiscovery, CapturedRequests), Box<dyn std::error::Error>> {
+    event_discovery_responses(vec![response(&body)])
+}
+
+fn event_discovery_responses(
+    responses: Vec<String>,
+) -> Result<(GammaDiscovery, CapturedRequests), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
     let requests = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&requests);
     thread::spawn(move || {
-        let Ok((mut stream, _)) = listener.accept() else {
-            return;
-        };
-        let mut request = [0_u8; 4096];
-        let Ok(read) = stream.read(&mut request) else {
-            return;
-        };
-        if let Ok(mut requests) = captured.lock() {
-            requests.push(String::from_utf8_lossy(&request[..read]).into_owned());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        for reply in responses {
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            };
+            if stream.set_nonblocking(false).is_err() {
+                return;
+            }
+            let mut request = [0_u8; 4096];
+            let Ok(read) = stream.read(&mut request) else {
+                return;
+            };
+            if let Ok(mut requests) = captured.lock() {
+                requests.push(String::from_utf8_lossy(&request[..read]).into_owned());
+            }
+            if stream.write_all(reply.as_bytes()).is_err() || stream.flush().is_err() {
+                return;
+            }
         }
-        let reply = response(&body);
-        let _ = stream.write_all(reply.as_bytes());
-        let _ = stream.flush();
     });
     Ok((
         GammaDiscovery::with_client(SdkGammaClient::new(&format!("http://{address}"))?),
@@ -401,6 +501,10 @@ fn gamma_market_without_nested_events(market_page: &str) -> String {
         return market_page.to_owned();
     };
     format!("{}}}]", &market_page[..events_start])
+}
+
+fn status_response(status: &str) -> String {
+    format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
 }
 
 fn response(body: &str) -> String {

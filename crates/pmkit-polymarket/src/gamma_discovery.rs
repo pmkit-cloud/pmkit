@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use pmkit_market::MarketDuration;
 use polymarket_client_sdk_v2::{
@@ -6,7 +9,7 @@ use polymarket_client_sdk_v2::{
         Client as SdkGammaClient,
         types::{
             request::{EventBySlugRequest, MarketsRequest},
-            response::Market,
+            response::{Event, Market},
         },
     },
     types::U256,
@@ -15,6 +18,13 @@ use sha2::Digest;
 
 use crate::discovery::normalize_snapshot;
 use crate::{DiscoveryError, DiscoverySnapshot, GammaMarket, GammaOutcome, RecurringFamily};
+
+const GAMMA_EVENT_REQUEST_ATTEMPTS: usize = 4;
+const GAMMA_EVENT_RETRY_DELAYS: [Duration; GAMMA_EVENT_REQUEST_ATTEMPTS - 1] = [
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_millis(1_000),
+];
 
 /// SDK-backed Gamma discovery at the Polymarket adapter boundary.
 #[derive(Debug, Clone)]
@@ -60,11 +70,7 @@ impl GammaDiscovery {
             });
         }
         let request = EventBySlugRequest::builder().slug(slug).build();
-        let event = self
-            .client
-            .event_by_slug(&request)
-            .await
-            .map_err(|_| DiscoveryError::Unavailable)?;
+        let event = self.event_by_slug_with_retry(&request).await?;
         let markets = event.markets.unwrap_or_default();
         let market = match markets.as_slice() {
             [market] => market.clone(),
@@ -80,6 +86,30 @@ impl GammaDiscovery {
                 .map(|series| family_for_series_id(&series.id, families))
         });
         gamma_market(market, families, event_family)
+    }
+
+    async fn event_by_slug_with_retry(
+        &self,
+        request: &EventBySlugRequest,
+    ) -> Result<Event, DiscoveryError> {
+        for (attempt, retry_delay) in GAMMA_EVENT_RETRY_DELAYS
+            .iter()
+            .copied()
+            .chain(std::iter::once(Duration::ZERO))
+            .enumerate()
+        {
+            match self.client.event_by_slug(request).await {
+                Ok(event) => return Ok(event),
+                Err(error)
+                    if attempt + 1 < GAMMA_EVENT_REQUEST_ATTEMPTS
+                        && retryable_gamma_error(&error) =>
+                {
+                    tokio::time::sleep(retry_delay).await;
+                }
+                Err(_) => return Err(DiscoveryError::Unavailable),
+            }
+        }
+        unreachable!("Gamma event retry loop always returns")
     }
 
     /// Fetches a complete Gamma snapshot using fixed `limit` and `offset` pages.
@@ -144,6 +174,23 @@ impl GammaDiscovery {
                 .ok_or(DiscoveryError::OffsetOverflow { offset })?;
         }
         normalize_snapshot(markets, shard_size)
+    }
+}
+
+fn retryable_gamma_error(error: &polymarket_client_sdk_v2::error::Error) -> bool {
+    use polymarket_client_sdk_v2::error::{Kind, Status, StatusCode};
+
+    match error.kind() {
+        Kind::Internal => error
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| error.is_timeout() || error.is_connect() || error.is_body()),
+        Kind::Status => error.downcast_ref::<Status>().is_some_and(|status| {
+            status.status_code == StatusCode::REQUEST_TIMEOUT
+                || status.status_code == StatusCode::TOO_EARLY
+                || status.status_code == StatusCode::TOO_MANY_REQUESTS
+                || status.status_code.is_server_error()
+        }),
+        _ => false,
     }
 }
 

@@ -28,6 +28,7 @@ pmkit-exec = { path = "../pmkit-exec" }
 pmkit-store = { path = "../pmkit-store" }
 pmkit-tape = { path = "../pmkit-tape" }
 polymarket-client-sdk-v2 = { workspace = true }
+reqwest = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
