@@ -8,6 +8,9 @@ use std::{
     time::Instant,
 };
 
+#[cfg(test)]
+use std::{future::Future as _, task::Poll};
+
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use pmkit_core::MarketId;
@@ -36,6 +39,9 @@ use polymarket_client_sdk_v2::{
 };
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
+
+#[cfg(test)]
+use tokio::sync::Notify;
 
 use crate::{MarketTokens, from_venue_side};
 
@@ -278,6 +284,8 @@ pub struct PolymarketLiveData {
     http_client: HttpClient,
     tokens: MarketTokens,
     connection_epoch: Arc<AtomicI64>,
+    #[cfg(test)]
+    test_send_pending: Option<Arc<Notify>>,
 }
 
 impl PolymarketLiveData {
@@ -314,8 +322,37 @@ impl PolymarketLiveData {
             http_client,
             tokens,
             connection_epoch: Arc::new(AtomicI64::new(0)),
+            #[cfg(test)]
+            test_send_pending: None,
         }
     }
+
+    #[cfg(test)]
+    fn with_test_send_pending(mut self, pending: Arc<Notify>) -> Self {
+        self.test_send_pending = Some(pending);
+        self
+    }
+}
+
+#[cfg(test)]
+async fn send_with_pending_marker(
+    sink: &Sender<SourceSignal>,
+    signal: SourceSignal,
+    pending: Option<&Arc<Notify>>,
+) -> Result<(), tokio::sync::mpsc::error::SendError<SourceSignal>> {
+    let Some(pending) = pending else {
+        return sink.send(signal).await;
+    };
+    let send = sink.send(signal);
+    tokio::pin!(send);
+    futures::future::poll_fn(|context| match send.as_mut().poll(context) {
+        Poll::Pending => {
+            pending.notify_one();
+            Poll::Pending
+        }
+        Poll::Ready(result) => Poll::Ready(result),
+    })
+    .await
 }
 
 /// One source-owned reference to one SDK unified market subscription.
@@ -476,7 +513,22 @@ impl PolymarketLiveData {
                             Ok(signal) => signal,
                             Err(error) => break SubscribeOutcome::Terminal(error),
                         };
-                        if sink.send(signal).await.is_err() {
+                        let sent = {
+                            #[cfg(test)]
+                            {
+                                send_with_pending_marker(
+                                    sink,
+                                    signal,
+                                    self.test_send_pending.as_ref(),
+                                )
+                                .await
+                            }
+                            #[cfg(not(test))]
+                            {
+                                sink.send(signal).await
+                            }
+                        };
+                        if sent.is_err() {
                             break SubscribeOutcome::Terminal(DataSourceError::SinkClosed);
                         }
                     }
@@ -1038,7 +1090,7 @@ mod tests {
     use rust_decimal::Decimal;
     use tokio::{
         net::TcpListener,
-        sync::{mpsc, oneshot},
+        sync::{Notify, mpsc},
     };
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
@@ -1475,7 +1527,7 @@ mod tests {
         // intentionally small enough to exercise the SDK's Lagged path.
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let (batches, mut batch_receiver) = mpsc::channel::<(Vec<String>, oneshot::Sender<()>)>(4);
+        let (batches, mut batch_receiver) = mpsc::channel::<Vec<String>>(4);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await?;
             let mut socket = accept_async(stream).await?;
@@ -1490,11 +1542,10 @@ mod tests {
                     None => return Err("client closed before subscribing".into()),
                 }
             }
-            while let Some((frames, sent)) = batch_receiver.recv().await {
+            while let Some(frames) = batch_receiver.recv().await {
                 for frame in frames {
                     socket.send(Message::Text(frame.into())).await?;
                 }
-                let _ = sent.send(());
             }
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
@@ -1504,10 +1555,12 @@ mod tests {
             &format!("ws://{address}"),
             Config::default().with_event_buffer_capacity(2),
         )?;
+        let pending_send = Arc::new(Notify::new());
         let source = super::PolymarketLiveData::new(
             client,
             crate::MarketTokens::new(market.clone(), U256::from(1_u64), U256::from(2_u64)),
-        );
+        )
+        .with_test_send_pending(Arc::clone(&pending_send));
         let (sink, mut events) = mpsc::channel(1);
         let source_sink = sink.clone();
         let source_task =
@@ -1522,6 +1575,9 @@ mod tests {
         send_frames(&batches, vec![book_frame(3)]).await?;
         wait_for_full(&sink).await?;
         send_frames(&batches, vec![book_frame(4)]).await?;
+        tokio::time::timeout(Duration::from_secs(1), pending_send.notified())
+            .await
+            .map_err(|_| "timed out waiting for the adapter's blocked sink send")?;
         assert_eq!(receive_book_signal(&mut events).await?, (3, 3));
         assert_eq!(receive_book_signal(&mut events).await?, (4, 4));
 
@@ -1546,14 +1602,10 @@ mod tests {
     }
 
     async fn send_frames(
-        batches: &mpsc::Sender<(Vec<String>, oneshot::Sender<()>)>,
+        batches: &mpsc::Sender<Vec<String>>,
         frames: Vec<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let (sent, acknowledged) = oneshot::channel();
-        batches.send((frames, sent)).await?;
-        tokio::time::timeout(Duration::from_secs(1), acknowledged)
-            .await
-            .map_err(|_| "timed out waiting for loopback frame write")??;
+        batches.send(frames).await?;
         Ok(())
     }
 
