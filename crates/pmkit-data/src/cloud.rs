@@ -201,11 +201,18 @@ impl HistoricalDataSource for PmKitCloudDataSource {
         if query.markets.is_empty() {
             return Err(DataSourceError::NotAvailable);
         }
-        cloud_http::replay_markets(self, query.markets, query.from, query.to, sink)
-            .await
-            .map_err(|error| DataSourceError::ReplayGap {
-                message: error.to_string(),
-            })
+        cloud_http::replay_markets(
+            self,
+            query.markets,
+            query.from,
+            query.to,
+            query.evidence,
+            sink,
+        )
+        .await
+        .map_err(|error| DataSourceError::ReplayGap {
+            message: error.to_string(),
+        })
     }
 }
 

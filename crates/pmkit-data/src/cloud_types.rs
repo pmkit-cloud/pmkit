@@ -130,6 +130,9 @@ pub enum CloudReplayError {
     /// The requested window is not sealed through its exclusive end.
     #[error("PMKit Cloud replay window is not fully sealed")]
     Unsealed,
+    /// Public Cloud metadata does not prove independent-source corroboration.
+    #[error("PMKit Cloud replay cannot prove independent-source corroboration")]
+    EvidenceUnsupported,
     /// A public response violated its declared schema.
     #[error("PMKit Cloud replay response is malformed")]
     MalformedResponse,

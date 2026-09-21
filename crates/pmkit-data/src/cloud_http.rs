@@ -4,6 +4,8 @@ use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use tokio::sync::mpsc::Sender;
 
+use pmkit_run::EvidenceRequirement;
+
 use super::{
     CloudReplayQuery, PmKitCloudDataSource, cloud_cache, cloud_decode,
     cloud_types::{
@@ -62,7 +64,13 @@ pub(super) async fn replay(
     query: CloudReplayQuery,
     sink: Sender<SourceSignal>,
 ) -> Result<(), CloudReplayError> {
-    replay_segments(source, &query, &sink).await?;
+    replay_segments(
+        source,
+        &query,
+        EvidenceRequirement::AllowSingleSource,
+        &sink,
+    )
+    .await?;
     finish(&sink, query.to.timestamp_millis()).await
 }
 
@@ -71,6 +79,7 @@ pub(super) async fn replay_markets(
     markets: Vec<pmkit_core::MarketId>,
     from: chrono::DateTime<chrono::Utc>,
     to: chrono::DateTime<chrono::Utc>,
+    evidence: EvidenceRequirement,
     sink: Sender<SourceSignal>,
 ) -> Result<(), CloudReplayError> {
     for market in markets {
@@ -81,6 +90,7 @@ pub(super) async fn replay_markets(
                 from,
                 to,
             },
+            evidence,
             &sink,
         )
         .await?;
@@ -91,11 +101,13 @@ pub(super) async fn replay_markets(
 async fn replay_segments(
     source: &PmKitCloudDataSource,
     query: &CloudReplayQuery,
+    evidence: EvidenceRequirement,
     sink: &Sender<SourceSignal>,
 ) -> Result<(), CloudReplayError> {
     query.validate()?;
     let coverage = coverage(source, query).await?;
     validate_coverage(query, &coverage)?;
+    validate_evidence(evidence)?;
     let sealed_end = query
         .to
         .timestamp_millis()
@@ -221,6 +233,15 @@ fn range_url(
         }
     }
     Ok(url)
+}
+
+const fn validate_evidence(evidence: EvidenceRequirement) -> Result<(), CloudReplayError> {
+    match evidence {
+        EvidenceRequirement::AllowSingleSource => Ok(()),
+        // Current coverage and segment metadata prove availability, sealing, and
+        // identity, but not that the data came from independent sources.
+        EvidenceRequirement::CorroboratedOnly => Err(CloudReplayError::EvidenceUnsupported),
+    }
 }
 
 fn validate_coverage(

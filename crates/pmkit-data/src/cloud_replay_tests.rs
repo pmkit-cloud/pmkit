@@ -4,9 +4,99 @@ use tokio::sync::mpsc;
 
 use super::cloud_test_support::{Response, TestServer};
 use super::{CloudApiKey, CloudReplayQuery, PmKitCloudDataSource};
-use crate::{HistoricalDataSource, ReplayQuery, SourceSignal};
+use crate::{DataSourceError, HistoricalDataSource, ReplayQuery, SourceSignal};
 use pmkit_core::MarketId;
 use pmkit_run::{EvidenceRequirement, RetrievalWait};
+
+#[tokio::test]
+async fn corroborated_only_rejects_missing_source_metadata()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut server = TestServer::new(vec![Response::json(200, available_coverage())])?;
+    let source = PmKitCloudDataSource::with_base_url(
+        CloudApiKey::new("secret-value")?,
+        &format!("{}/v1", server.url),
+    )?;
+    let cloud_query = query();
+    let (tx, mut rx) = mpsc::channel(8);
+    let result = super::cloud_http::replay_markets(
+        &source,
+        vec![MarketId::new("market-1")?],
+        cloud_query.from,
+        cloud_query.to,
+        EvidenceRequirement::CorroboratedOnly,
+        tx,
+    )
+    .await;
+
+    assert_eq!(result, Err(super::CloudReplayError::EvidenceUnsupported));
+    assert!(rx.recv().await.is_none());
+    assert_eq!(server.calls(), 1);
+    server.join()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn corroborated_only_rejects_ambiguous_coverage_metadata()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut server = TestServer::new(vec![Response::json(
+        200,
+        r#"{"coverage":"observed","intervals":[{"status":"available","from_ts_ms":0,"to_ts_ms":59999}],"instances":[{"market_id":"market-1","condition_id":"condition-1","outcome_tokens":[{"outcome":"up","token_id":"token-up"},{"outcome":"down","token_id":"token-down"}]}],"sealed_through_ms":59999,"selector":{"kind":"series","seriesId":"btc-usd-5m"}}"#,
+    )])?;
+    let source = PmKitCloudDataSource::with_base_url(
+        CloudApiKey::new("secret-value")?,
+        &format!("{}/v1", server.url),
+    )?;
+    let cloud_query = query();
+    let (tx, mut rx) = mpsc::channel(8);
+    let result = super::cloud_http::replay_markets(
+        &source,
+        vec![MarketId::new("market-1")?],
+        cloud_query.from,
+        cloud_query.to,
+        EvidenceRequirement::CorroboratedOnly,
+        tx,
+    )
+    .await;
+
+    assert_eq!(result, Err(super::CloudReplayError::EvidenceUnsupported));
+    assert!(rx.recv().await.is_none());
+    assert_eq!(server.calls(), 1);
+    server.join()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn historical_replay_maps_unsupported_evidence_to_replay_gap()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut server = TestServer::new(vec![Response::json(200, available_coverage())])?;
+    let source = PmKitCloudDataSource::with_base_url(
+        CloudApiKey::new("secret-value")?,
+        &format!("{}/v1", server.url),
+    )?;
+    let (tx, mut rx) = mpsc::channel(8);
+    let result = source
+        .replay(
+            ReplayQuery {
+                markets: vec![MarketId::new("market-1")?],
+                from: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+                to: "1970-01-01T00:01:00Z".parse()?,
+                evidence: EvidenceRequirement::CorroboratedOnly,
+                retrieval_wait: RetrievalWait::ReturnPending,
+            },
+            tx,
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(DataSourceError::ReplayGap { message })
+            if message.contains("independent-source corroboration")
+    ));
+    assert!(rx.recv().await.is_none());
+    assert_eq!(server.calls(), 1);
+    server.join()?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn hot_segment_is_verified_decoded_and_cached() -> Result<(), Box<dyn std::error::Error>> {
@@ -145,7 +235,7 @@ async fn coverage_exposes_concrete_instances_without_listing_segments()
 }
 
 #[tokio::test]
-async fn historical_replay_emits_one_terminal_pair_for_multiple_markets()
+async fn historical_replay_allows_single_source_and_emits_one_terminal_pair_for_multiple_markets()
 -> Result<(), Box<dyn std::error::Error>> {
     let logical = br#"{"event_time_ms":1000,"event_ordinal":7,"payload":{"event_type":"book","asset_id":"token-up","bids":[],"asks":[]}}
 "#;
