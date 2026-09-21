@@ -9,7 +9,7 @@ use pmkit_run::{EvidenceRequirement, RetrievalWait};
 #[derive(Clone)]
 pub struct ReplaySpec {
     source: Arc<dyn HistoricalDataSource>,
-    reference_source: Option<Arc<dyn HistoricalDataSource>>,
+    reference_sources: Vec<(String, Arc<dyn HistoricalDataSource>)>,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     evidence: EvidenceRequirement,
@@ -28,7 +28,7 @@ impl ReplaySpec {
     ) -> Self {
         Self {
             source,
-            reference_source: None,
+            reference_sources: Vec::new(),
             from,
             to,
             evidence,
@@ -36,10 +36,21 @@ impl ReplaySpec {
         }
     }
 
-    /// Adds an optional historical CEX reference source for parity-aware runs.
+    /// Adds a historical CEX reference source for parity-aware runs.
     #[must_use]
-    pub fn reference_source(mut self, source: Arc<dyn HistoricalDataSource>) -> Self {
-        self.reference_source = Some(source);
+    pub fn reference_source(self, source: Arc<dyn HistoricalDataSource>) -> Self {
+        let name = format!("cex-{}", self.reference_sources.len());
+        self.reference_source_named(name, source)
+    }
+
+    /// Adds a named historical CEX reference source.
+    #[must_use]
+    pub fn reference_source_named(
+        mut self,
+        name: impl Into<String>,
+        source: Arc<dyn HistoricalDataSource>,
+    ) -> Self {
+        self.reference_sources.push((name.into(), source));
         self
     }
 
@@ -49,10 +60,19 @@ impl ReplaySpec {
         &self.source
     }
 
-    /// Returns the optional historical CEX reference source.
+    /// Returns the first historical CEX reference source for compatibility.
     #[must_use]
     pub const fn reference_source_ref(&self) -> Option<&Arc<dyn HistoricalDataSource>> {
-        self.reference_source.as_ref()
+        match self.reference_sources.as_slice() {
+            [] => None,
+            [(_, source), ..] => Some(source),
+        }
+    }
+
+    /// Returns all named historical CEX reference sources in registration order.
+    #[must_use]
+    pub fn reference_source_refs(&self) -> &[(String, Arc<dyn HistoricalDataSource>)] {
+        &self.reference_sources
     }
 
     /// Returns the inclusive window start.
@@ -87,11 +107,47 @@ impl fmt::Debug for ReplaySpec {
             .field("from", &self.from)
             .field("to", &self.to)
             .field(
-                "reference_source",
-                &self.reference_source.as_ref().map(|_| "configured"),
+                "reference_sources",
+                &self
+                    .reference_sources
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
             )
             .field("evidence", &self.evidence)
             .field("retrieval_wait", &self.retrieval_wait)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReplaySpec;
+    use crate::test_support::NoHistory;
+    use pmkit_run::{EvidenceRequirement, RetrievalWait};
+    use std::sync::Arc;
+
+    #[test]
+    fn reference_source_registrations_append_with_stable_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let replay = ReplaySpec::new(
+            Arc::new(NoHistory),
+            "2026-01-01T00:00:00Z".parse()?,
+            "2026-02-01T00:00:00Z".parse()?,
+            EvidenceRequirement::CorroboratedOnly,
+            RetrievalWait::ReturnPending,
+        )
+        .reference_source(Arc::new(NoHistory))
+        .reference_source(Arc::new(NoHistory))
+        .reference_source_named("twap", Arc::new(NoHistory));
+
+        let names = replay
+            .reference_source_refs()
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["cex-0", "cex-1", "twap"]);
+        assert!(replay.reference_source_ref().is_some());
+        Ok(())
     }
 }

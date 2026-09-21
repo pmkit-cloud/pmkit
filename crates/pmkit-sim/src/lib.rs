@@ -208,6 +208,29 @@ impl SimEngine {
             })
     }
 
+    /// Cancels an order only when it belongs to the supplied strategy.
+    pub fn cancel_for_strategy(
+        &mut self,
+        strategy: &StrategyId,
+        order_id: &OrderId,
+    ) -> Option<Decimal> {
+        let owned = self
+            .open_orders()
+            .iter()
+            .any(|open| open.order_id == *order_id && open.strategy.as_ref() == Some(strategy));
+        owned.then(|| self.cancel(order_id)).flatten()
+    }
+
+    /// Cancels every open order owned by a strategy.
+    pub fn cancel_all_for_strategy(&mut self, strategy: &StrategyId) -> Decimal {
+        self.open_orders()
+            .into_iter()
+            .filter(|open| open.strategy.as_ref() == Some(strategy))
+            .map(|open| open.order_id)
+            .filter_map(|order_id| self.cancel(&order_id))
+            .sum()
+    }
+
     /// Cancels every resting order, returning the total notional freed.
     pub fn cancel_all(&mut self) -> Decimal {
         let freed = self

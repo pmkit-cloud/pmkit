@@ -1,14 +1,14 @@
 use super::{
-    PaperReport, RunControl, RunLifecycleEvent, StartError, instantiate_strategies,
-    observe_reconnect, store_signal, validate_account_owner,
+    PaperReport, RunControl, RunLifecycleEvent, StartError, StrategyInstance,
+    instantiate_strategies, observe_reconnect, store_signal, validate_account_owner,
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_accounting::{
     ExposureReservation, PortfolioExposure, PositionExposure, aggregate_exposure,
 };
-use pmkit_book::OrderBookL2;
-use pmkit_event::{MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
-use pmkit_exec::ExecError;
+use pmkit_book::{OrderBookL2, Position};
+use pmkit_event::{CexReferenceEvent, MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
+use pmkit_exec::{ExecError, Executor, OrderId};
 use pmkit_market::Outcome;
 use pmkit_paper::{PaperExecutor, PaperLedgerEntry, PaperLedgerError};
 use pmkit_sim::SimulationConfig;
@@ -16,6 +16,7 @@ use pmkit_spec::PaperRun;
 use pmkit_store::{CausalDecision, CausalIdentity, OwnerScope, StoreError, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
 use rust_decimal::Decimal;
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
 // allow: SIZE_OK — the scoped driver and task-specific recovery tests must remain in this file.
@@ -113,6 +114,479 @@ fn corrupt_paper_ledger(error: &PaperLedgerError) -> StoreError {
     }
 }
 
+fn owned_paper_orders(paper: &PaperExecutor, strategy: &pmkit_core::StrategyId) -> Vec<OrderId> {
+    let account = paper.account_state();
+    account
+        .resting_orders
+        .into_iter()
+        .chain(account.delayed_orders)
+        .filter(|order| order.strategy.as_ref() == Some(strategy))
+        .map(|order| order.order_id)
+        .collect()
+}
+
+async fn cancel_paper_order(
+    run: &PaperRun,
+    paper: &PaperExecutor,
+    store: Option<&dyn TapeStore>,
+    scope: &OwnerScope,
+    strategy: &pmkit_core::StrategyId,
+    order_id: &OrderId,
+) -> Result<(), StartError> {
+    if owned_paper_orders(paper, strategy).contains(order_id) {
+        paper
+            .cancel(order_id)
+            .await
+            .map_err(|source| StartError::ExecutionState {
+                run: run.id().clone(),
+                source,
+            })?;
+        persist_or_drain_paper(store, scope, paper, run.id()).await?;
+    }
+    Ok(())
+}
+
+struct PaperActionContext<'a> {
+    run: &'a PaperRun,
+    paper: &'a PaperExecutor,
+    store: Option<&'a dyn TapeStore>,
+    scope: &'a OwnerScope,
+    strategy: &'a pmkit_core::StrategyId,
+    timestamp_ms: i64,
+    metrics: &'a crate::RunMetrics,
+}
+
+async fn submit_paper_order(
+    context: &PaperActionContext<'_>,
+    order: &pmkit_exec::PlaceOrder,
+    action_index: u32,
+    marks: &HashMap<(pmkit_core::MarketId, Outcome), Decimal>,
+    loss_limit: Decimal,
+    loss_breached: &mut bool,
+    verdicts: &mut Vec<crate::causal::ActionRiskVerdict>,
+) -> Result<(), StartError> {
+    let submit_result = context
+        .paper
+        .submit_for_strategy(order, context.strategy.clone(), context.timestamp_ms)
+        .await;
+    context.metrics.set_fills(context.paper.fill_count());
+    if let Err(ExecError::Rejected { reason }) = &submit_result {
+        context.metrics.reject();
+        verdicts.push(crate::causal::ActionRiskVerdict::rejected(
+            action_index,
+            reason.clone(),
+        ));
+    }
+    update_loss_breach(
+        context.paper,
+        marks,
+        loss_limit,
+        loss_breached,
+        context.store,
+        context.scope,
+        context.run.id(),
+        context.timestamp_ms,
+    )
+    .await?;
+    persist_or_drain_paper(
+        context.store,
+        context.scope,
+        context.paper,
+        context.run.id(),
+    )
+    .await?;
+    match submit_result {
+        Ok(_) => verdicts.push(crate::causal::ActionRiskVerdict::accepted(action_index)),
+        Err(ExecError::Rejected { .. }) => {}
+        Err(source) => {
+            return Err(StartError::ExecutionState {
+                run: context.run.id().clone(),
+                source,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "paper risk admission explicitly carries the shared exposure inputs"
+)]
+fn paper_order_rejection_reason(
+    paper: &PaperExecutor,
+    order: &pmkit_exec::PlaceOrder,
+    strategy_market: &pmkit_core::MarketId,
+    strategy: &pmkit_core::StrategyId,
+    marks: &HashMap<(pmkit_core::MarketId, Outcome), Decimal>,
+    limits: &pmkit_runtime::RiskLimits,
+    effective_limits_by_strategy: &HashMap<pmkit_core::StrategyId, pmkit_runtime::RiskLimits>,
+    loss_breached: bool,
+) -> Option<&'static str> {
+    if order.market != *strategy_market {
+        return Some("market mismatch");
+    }
+    let account = paper.account_state();
+    let mut positions_by_market = paper_positions_by_market(&account);
+    let Some(daily_pnl) = crate::live::live_risk::marked_daily_pnl(
+        &mut positions_by_market,
+        marks,
+        account.realized_pnl.as_decimal(),
+        account.fees.as_decimal(),
+    ) else {
+        return Some("risk data unavailable");
+    };
+    let effective_limits = effective_limits_by_strategy.get(strategy).unwrap_or(limits);
+    let market_positions = positions_by_market
+        .get(strategy_market)
+        .map_or(&[][..], Vec::as_slice);
+    let exposure = paper_risk_exposure(
+        &account,
+        &positions_by_market,
+        marks,
+        strategy_market,
+        strategy,
+        order.outcome,
+        daily_pnl,
+    );
+    if loss_breached
+        || !crate::live::live_risk::passes_aggregated_risk(
+            order,
+            effective_limits,
+            market_positions,
+            exposure,
+        )
+    {
+        Some("risk gate")
+    } else {
+        None
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "paper admission keeps the shared risk gate adjacent to submission"
+)]
+async fn submit_risk_checked_paper_order(
+    context: &PaperActionContext<'_>,
+    strategy_market: &pmkit_core::MarketId,
+    order: &pmkit_exec::PlaceOrder,
+    action_index: u32,
+    marks: &HashMap<(pmkit_core::MarketId, Outcome), Decimal>,
+    limits: &pmkit_runtime::RiskLimits,
+    loss_limit: Decimal,
+    effective_limits_by_strategy: &HashMap<pmkit_core::StrategyId, pmkit_runtime::RiskLimits>,
+    loss_breached: &mut bool,
+    verdicts: &mut Vec<crate::causal::ActionRiskVerdict>,
+) -> Result<(), StartError> {
+    update_loss_breach(
+        context.paper,
+        marks,
+        loss_limit,
+        loss_breached,
+        context.store,
+        context.scope,
+        context.run.id(),
+        context.timestamp_ms,
+    )
+    .await?;
+    if let Some(reason) = paper_order_rejection_reason(
+        context.paper,
+        order,
+        strategy_market,
+        context.strategy,
+        marks,
+        limits,
+        effective_limits_by_strategy,
+        *loss_breached,
+    ) {
+        context.metrics.reject();
+        verdicts.push(crate::causal::ActionRiskVerdict::rejected(
+            action_index,
+            reason,
+        ));
+        return Ok(());
+    }
+    submit_paper_order(
+        context,
+        order,
+        action_index,
+        marks,
+        loss_limit,
+        loss_breached,
+        verdicts,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn persist_or_drain_paper(
+    store: Option<&dyn TapeStore>,
+    scope: &OwnerScope,
+    paper: &PaperExecutor,
+    run: &pmkit_core::RunId,
+) -> Result<(), StartError> {
+    if let Some(store) = store {
+        persist_paper_ledger(store, scope, paper)
+            .await
+            .map_err(|source| StartError::Storage {
+                run: run.clone(),
+                source,
+            })?;
+    } else {
+        paper.drain_ledger();
+    }
+    Ok(())
+}
+
+fn paper_positions_by_market(
+    account: &pmkit_paper::PaperAccountState,
+) -> HashMap<pmkit_core::MarketId, Vec<Position>> {
+    let mut positions_by_market = HashMap::new();
+    for position in &account.positions {
+        positions_by_market
+            .entry(position.market.clone())
+            .or_insert_with(Vec::new)
+            .push(Position {
+                outcome: position.outcome,
+                qty: position.quantity,
+                avg_entry: position.average_entry,
+                unrealized_pnl: Decimal::ZERO,
+            });
+    }
+    positions_by_market
+}
+
+fn paper_risk_exposure(
+    account: &pmkit_paper::PaperAccountState,
+    positions_by_market: &HashMap<pmkit_core::MarketId, Vec<Position>>,
+    marks: &HashMap<(pmkit_core::MarketId, Outcome), Decimal>,
+    market: &pmkit_core::MarketId,
+    strategy: &pmkit_core::StrategyId,
+    outcome: Outcome,
+    daily_pnl: Decimal,
+) -> crate::live::live_risk::PortfolioRiskExposure {
+    let mut reserved_portfolio = Decimal::ZERO;
+    let mut reserved_market = Decimal::ZERO;
+    let mut reserved_strategy = Decimal::ZERO;
+    let mut pending_position_notional = Decimal::ZERO;
+    for order in account
+        .resting_orders
+        .iter()
+        .chain(account.delayed_orders.iter())
+    {
+        let notional = order.remaining_qty * order.price;
+        reserved_portfolio += notional;
+        if order.market == *market {
+            reserved_market += notional;
+            if order.outcome == outcome {
+                pending_position_notional += notional;
+            }
+        }
+        if order.strategy.as_ref() == Some(strategy) {
+            reserved_strategy += notional;
+        }
+    }
+    crate::live::live_risk::PortfolioRiskExposure {
+        portfolio_notional: crate::live::live_risk::portfolio_marked_notional(
+            positions_by_market,
+            marks,
+        ) + reserved_portfolio,
+        market_notional: positions_by_market
+            .get(market)
+            .map_or(Decimal::ZERO, |positions| {
+                crate::live::live_risk::marked_position_notional(market, positions, marks)
+            })
+            + reserved_market,
+        strategy_notional: reserved_strategy,
+        pending_position_notional,
+        daily_pnl,
+        open_orders: account.resting_orders.len() + account.delayed_orders.len(),
+    }
+}
+
+const PAPER_MAX_LOSS_BREACH_CORRELATION: &str = "paper-risk:max-loss";
+
+async fn paper_loss_breached(
+    store: Option<&dyn TapeStore>,
+    scope: &OwnerScope,
+) -> Result<bool, StoreError> {
+    let Some(store) = store else {
+        return Ok(false);
+    };
+    Ok(store.read_decisions(scope).await?.iter().any(|decision| {
+        decision.identity.correlation_id == PAPER_MAX_LOSS_BREACH_CORRELATION
+            && decision.payload["kind"] == "paper-risk-breach"
+            && decision.payload["reason"] == "max_loss"
+    }))
+}
+
+fn effective_max_loss(
+    limits: &pmkit_runtime::RiskLimits,
+    effective_limits_by_strategy: &HashMap<pmkit_core::StrategyId, pmkit_runtime::RiskLimits>,
+) -> Decimal {
+    effective_limits_by_strategy
+        .values()
+        .map(|effective| effective.max_loss.as_decimal())
+        .fold(limits.max_loss.as_decimal(), |current, candidate| {
+            if candidate < current {
+                candidate
+            } else {
+                current
+            }
+        })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "durable paper loss latching carries the storage identity context"
+)]
+async fn update_loss_breach(
+    paper: &PaperExecutor,
+    marks: &HashMap<(pmkit_core::MarketId, Outcome), Decimal>,
+    loss_limit: Decimal,
+    loss_breached: &mut bool,
+    store: Option<&dyn TapeStore>,
+    scope: &OwnerScope,
+    run: &pmkit_core::RunId,
+    timestamp_ms: i64,
+) -> Result<(), StartError> {
+    if *loss_breached {
+        return Ok(());
+    }
+    let account = paper.account_state();
+    let mut positions_by_market = paper_positions_by_market(&account);
+    let Some(daily_pnl) = crate::live::live_risk::marked_daily_pnl(
+        &mut positions_by_market,
+        marks,
+        account.realized_pnl.as_decimal(),
+        account.fees.as_decimal(),
+    ) else {
+        return Ok(());
+    };
+    if daily_pnl > -loss_limit {
+        return Ok(());
+    }
+    *loss_breached = true;
+    let Some(store) = store else {
+        return Ok(());
+    };
+    store
+        .store_decision(&CausalDecision {
+            identity: CausalIdentity {
+                scope: scope.clone(),
+                correlation_id: PAPER_MAX_LOSS_BREACH_CORRELATION.into(),
+                source_timestamp_ms: timestamp_ms,
+                ingest_sequence: 0,
+            },
+            payload: json!({
+                "kind": "paper-risk-breach",
+                "reason": "max_loss",
+            }),
+        })
+        .await
+        .map_err(|source| StartError::Storage {
+            run: run.clone(),
+            source,
+        })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shared dispatcher carries ordered paper execution state"
+)]
+async fn dispatch_paper_strategy(
+    run: &PaperRun,
+    paper: &PaperExecutor,
+    store: Option<&dyn TapeStore>,
+    scope: &OwnerScope,
+    instance: &mut StrategyInstance,
+    fact: &StrategyFact,
+    book: &OrderBookL2,
+    positions: &[Position],
+    timestamp_ms: i64,
+    marks: &HashMap<(pmkit_core::MarketId, Outcome), Decimal>,
+    limits: &pmkit_runtime::RiskLimits,
+    loss_limit: Decimal,
+    effective_limits_by_strategy: &HashMap<pmkit_core::StrategyId, pmkit_runtime::RiskLimits>,
+    loss_breached: &mut bool,
+    fill_rx: &mut tokio::sync::mpsc::Receiver<MarketEvent>,
+    metrics: &crate::RunMetrics,
+) -> Result<Vec<crate::causal::ActionRiskVerdict>, StartError> {
+    let context = StrategyContext {
+        fact,
+        market: &instance.market,
+        book,
+        positions,
+        now: LogicalTimestamp::from_millis(timestamp_ms),
+    };
+    metrics.decision();
+    let mut verdicts = Vec::new();
+    if let Ok(actions) = instance.strategy.on_event(context) {
+        let action_context = PaperActionContext {
+            run,
+            paper,
+            store,
+            scope,
+            strategy: &instance.id,
+            timestamp_ms,
+            metrics,
+        };
+        for (action_index, action) in actions.as_slice().iter().enumerate() {
+            let action_index = u32::try_from(action_index).unwrap_or(u32::MAX);
+            match action {
+                Action::Place(order) => {
+                    submit_risk_checked_paper_order(
+                        &action_context,
+                        &instance.market,
+                        order,
+                        action_index,
+                        marks,
+                        limits,
+                        loss_limit,
+                        effective_limits_by_strategy,
+                        loss_breached,
+                        &mut verdicts,
+                    )
+                    .await?;
+                }
+                Action::Cancel(order_id) => {
+                    cancel_paper_order(run, paper, store, scope, &instance.id, order_id).await?;
+                }
+                Action::ReplaceQuotes { cancel, place } => {
+                    for order_id in cancel {
+                        cancel_paper_order(run, paper, store, scope, &instance.id, order_id)
+                            .await?;
+                    }
+                    for order in place {
+                        submit_risk_checked_paper_order(
+                            &action_context,
+                            &instance.market,
+                            order,
+                            action_index,
+                            marks,
+                            limits,
+                            loss_limit,
+                            effective_limits_by_strategy,
+                            loss_breached,
+                            &mut verdicts,
+                        )
+                        .await?;
+                    }
+                }
+                Action::CancelAll => {
+                    for order_id in owned_paper_orders(paper, &instance.id) {
+                        cancel_paper_order(run, paper, store, scope, &instance.id, &order_id)
+                            .await?;
+                    }
+                }
+            }
+        }
+    }
+    drain_fills(fill_rx);
+    metrics.set_fills(paper.fill_count());
+    Ok(verdicts)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the paper run owns one ordered feed, executor, strategy, and recording loop"
@@ -123,6 +597,22 @@ pub async fn drive_with_control(
     control: &RunControl,
 ) -> Result<PaperReport, StartError> {
     let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
+    let effective_limits_by_strategy: HashMap<_, _> = run
+        .strategies()
+        .iter()
+        .map(|registration| {
+            (
+                registration.id().clone(),
+                registration.risk_overrides_ref().effective_limits(
+                    run.risk(),
+                    registration.market(),
+                    registration.id(),
+                ),
+            )
+        })
+        .collect();
+    let limits = run.risk().clone();
+    let loss_limit = effective_max_loss(&limits, &effective_limits_by_strategy);
     let metrics = control.metrics_for(run.id());
 
     let (fill_tx, mut fill_rx) = tokio::sync::mpsc::channel(1024);
@@ -171,6 +661,13 @@ pub async fn drive_with_control(
     } else {
         paper.drain_ledger();
     }
+    let mut loss_breached =
+        paper_loss_breached(store, &scope)
+            .await
+            .map_err(|source| StartError::Storage {
+                run: run.id().clone(),
+                source,
+            })?;
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1024);
     let mut subscribed = HashSet::new();
@@ -188,9 +685,10 @@ pub async fn drive_with_control(
             }));
         }
     }
-    if let Some(reference) = run.reference_data_ref() {
+    for (name, reference) in run.reference_data_refs() {
+        let name = name.clone();
         let reference = reference.clone();
-        sources.push(SourceTaskDefinition::new("cex", move |sink| async move {
+        sources.push(SourceTaskDefinition::new(name, move |sink| async move {
             reference.subscribe_reference(sink).await
         }));
     }
@@ -208,6 +706,7 @@ pub async fn drive_with_control(
     let mut fills = paper.fill_count();
     metrics.set_fills(fills);
     let mut marks = HashMap::new();
+    let mut strategy_books = vec![OrderBookL2::default(); strategies.len()];
     let mut connection_epochs = HashMap::new();
     let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
     control.emit(RunLifecycleEvent::Started {
@@ -257,6 +756,57 @@ pub async fn drive_with_control(
         })?;
         if let SourceEnvelope::CexReference(envelope) = &merged.source {
             cex_metrics.observe(&envelope.fact);
+            let timestamp_ms = match &envelope.fact {
+                CexReferenceEvent::Trade { timestamp_ms, .. } => *timestamp_ms,
+            };
+            let mut verdicts = Vec::new();
+            for (index, instance) in strategies.iter_mut().enumerate() {
+                let positions = paper.positions_for_market(&instance.market);
+                verdicts.extend(
+                    dispatch_paper_strategy(
+                        run,
+                        &paper,
+                        store,
+                        &scope,
+                        instance,
+                        &merged.fact,
+                        &strategy_books[index],
+                        &positions,
+                        timestamp_ms,
+                        &marks,
+                        &limits,
+                        loss_limit,
+                        &effective_limits_by_strategy,
+                        &mut loss_breached,
+                        &mut fill_rx,
+                        &metrics,
+                    )
+                    .await?,
+                );
+            }
+            if let Some(store) = store {
+                let book = strategy_books.first().cloned().unwrap_or_default();
+                let identity = CausalIdentity {
+                    scope: scope.clone(),
+                    correlation_id: format!("cex:{}:{timestamp_ms}", envelope.metadata.source_id),
+                    source_timestamp_ms: envelope.metadata.source_time_ms,
+                    ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
+                        .unwrap_or(i64::MAX),
+                };
+                crate::causal::record_book_decision(
+                    store,
+                    &identity,
+                    &book,
+                    cex_metrics.snapshot(),
+                    verdicts,
+                    Some(simulation_config),
+                )
+                .await
+                .map_err(|source| StartError::Storage {
+                    run: run.id().clone(),
+                    source,
+                })?;
+            }
             continue;
         }
         if let SourceEnvelope::PmAccount(envelope) = &merged.source {
@@ -281,6 +831,17 @@ pub async fn drive_with_control(
                         run: run.id().clone(),
                         source: corrupt_paper_ledger(&error),
                     })?;
+                update_loss_breach(
+                    &paper,
+                    &marks,
+                    loss_limit,
+                    &mut loss_breached,
+                    store,
+                    &scope,
+                    run.id(),
+                    *timestamp_ms,
+                )
+                .await?;
                 if let Some(store) = store {
                     persist_paper_ledger(store, &scope, &paper)
                         .await
@@ -321,6 +882,21 @@ pub async fn drive_with_control(
             let fact = StrategyFact::Market(event.clone());
             let update_result = paper.update_book(market, *outcome, book.clone()).await;
             metrics.set_fills(paper.fill_count());
+            update_result.map_err(|source| StartError::ExecutionState {
+                run: run.id().clone(),
+                source,
+            })?;
+            update_loss_breach(
+                &paper,
+                &marks,
+                loss_limit,
+                &mut loss_breached,
+                store,
+                &scope,
+                run.id(),
+                *timestamp_ms,
+            )
+            .await?;
             if let Some(store) = store {
                 persist_paper_ledger(store, &scope, &paper)
                     .await
@@ -331,65 +907,37 @@ pub async fn drive_with_control(
             } else {
                 paper.drain_ledger();
             }
-            update_result.map_err(|source| StartError::ExecutionState {
-                run: run.id().clone(),
-                source,
-            })?;
             drain_fills(&mut fill_rx);
             fills = paper.fill_count();
             metrics.set_fills(fills);
-            let mut actions_placed = 0_u32;
-            for instance in &mut *strategies {
+            let mut verdicts = Vec::new();
+            for (index, instance) in strategies.iter_mut().enumerate() {
                 if instance.market != *market {
                     continue;
                 }
+                strategy_books[index] = book.clone();
                 let positions = paper.positions_for_market(market);
-                let context = StrategyContext {
-                    fact: &fact,
-                    market,
-                    book: &book,
-                    positions: &positions,
-                    now: LogicalTimestamp::from_millis(*timestamp_ms),
-                };
-                metrics.decision();
-                if let Ok(actions) = instance.strategy.on_event(context) {
-                    for action in actions.as_slice() {
-                        if let Action::Place(order) = action {
-                            let submit_result = paper
-                                .submit_for_strategy(order, instance.id.clone(), *timestamp_ms)
-                                .await;
-                            metrics.set_fills(paper.fill_count());
-                            if matches!(&submit_result, Err(ExecError::Rejected { .. })) {
-                                metrics.reject();
-                            }
-                            if let Some(store) = store {
-                                persist_paper_ledger(store, &scope, &paper).await.map_err(
-                                    |source| StartError::Storage {
-                                        run: run.id().clone(),
-                                        source,
-                                    },
-                                )?;
-                            } else {
-                                paper.drain_ledger();
-                            }
-                            match submit_result {
-                                Ok(_) => {
-                                    actions_placed = actions_placed.saturating_add(1);
-                                }
-                                Err(ExecError::Rejected { .. }) => {}
-                                Err(source) => {
-                                    return Err(StartError::ExecutionState {
-                                        run: run.id().clone(),
-                                        source,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-                drain_fills(&mut fill_rx);
-                fills = paper.fill_count();
-                metrics.set_fills(fills);
+                verdicts.extend(
+                    dispatch_paper_strategy(
+                        run,
+                        &paper,
+                        store,
+                        &scope,
+                        instance,
+                        &fact,
+                        &strategy_books[index],
+                        &positions,
+                        *timestamp_ms,
+                        &marks,
+                        &limits,
+                        loss_limit,
+                        &effective_limits_by_strategy,
+                        &mut loss_breached,
+                        &mut fill_rx,
+                        &metrics,
+                    )
+                    .await?,
+                );
             }
             if let Some(store) = store {
                 let identity = CausalIdentity {
@@ -404,7 +952,7 @@ pub async fn drive_with_control(
                     &identity,
                     &book,
                     cex_metrics.snapshot(),
-                    actions_placed,
+                    verdicts,
                     Some(simulation_config),
                 )
                 .await

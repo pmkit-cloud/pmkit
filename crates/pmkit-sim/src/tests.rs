@@ -1,6 +1,6 @@
 use super::{FeeModel, MarketCategory, SimEngine, SimulationConfig};
 use pmkit_book::{OrderBookL2, Side};
-use pmkit_core::MarketId;
+use pmkit_core::{MarketId, StrategyId};
 use pmkit_event::{Liquidity, MarketEvent};
 use pmkit_exec::{MarketLimits, PlaceOrder, TimeInForce};
 use pmkit_market::Outcome;
@@ -159,6 +159,70 @@ fn queue_model_partially_fills_crossed_maker() -> Result<(), Box<dyn std::error:
         [MarketEvent::Fill { size, .. }] if *size == Decimal::from(5)
     ));
     assert_eq!(engine.resting_count(), 1);
+    Ok(())
+}
+
+#[test]
+fn maker_fills_never_exceed_submitted_quantity() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = SimEngine::new("paper", 0, MarketCategory::Crypto);
+    let market = MarketId::new("btc-5m")?;
+    engine.update_book(&market, Outcome::Up, ask_book());
+    engine.submit(&order(Side::Buy, Decimal::new(45, 2), true)?, 0);
+
+    for size in [Decimal::from(5), Decimal::from(10)] {
+        engine.update_book(
+            &market,
+            Outcome::Up,
+            OrderBookL2 {
+                bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+                asks: vec![(Decimal::new(45, 2), size)],
+                timestamp_ms: 1,
+                last_trade_price: None,
+            },
+        );
+    }
+
+    let fills = engine.drain_fills();
+    let total: Decimal = fills
+        .iter()
+        .filter_map(|event| match event {
+            MarketEvent::Fill { size, .. } => Some(*size),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(total, Decimal::from(10));
+    assert_eq!(engine.resting_count(), 0);
+    Ok(())
+}
+
+#[test]
+fn strategy_cancellation_does_not_touch_other_strategy_orders()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = SimEngine::new("paper", 0, MarketCategory::Crypto);
+    let market = MarketId::new("btc-5m")?;
+    let first = StrategyId::new("first")?;
+    let second = StrategyId::new("second")?;
+    engine.update_book(&market, Outcome::Up, ask_book());
+    let first_id = engine
+        .submit_for_strategy(
+            &order(Side::Buy, Decimal::new(45, 2), true)?,
+            first.clone(),
+            0,
+        )
+        .ok_or("first maker was rejected")?;
+    engine
+        .submit_for_strategy(
+            &order(Side::Buy, Decimal::new(45, 2), true)?,
+            second.clone(),
+            0,
+        )
+        .ok_or("second maker was rejected")?;
+
+    assert!(engine.cancel_for_strategy(&first, &first_id).is_some());
+    assert_eq!(engine.cancel_all_for_strategy(&first), Decimal::ZERO);
+    let remaining = engine.open_orders();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].strategy.as_ref(), Some(&second));
     Ok(())
 }
 

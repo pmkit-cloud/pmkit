@@ -315,7 +315,7 @@ impl PaperExecutor {
                 last_timestamp_ms,
             } = &mut *state;
             ensure_market_limits(order, config)?;
-            ensure_sufficient_cash(order, ledger)?;
+            ensure_sufficient_cash(order, ledger, config)?;
             let (placement_id, expected_order_id) = ledger
                 .begin_order(order, Some(strategy.clone()), now_ms)
                 .map_err(|error| execution_error(&error))?;
@@ -398,14 +398,23 @@ fn ensure_market_limits(order: &PlaceOrder, config: &SimulationConfig) -> Result
 ///
 /// A run created without cash is an unfunded simulation — fills only, no
 /// balance to respect — and stays unconstrained.
-fn ensure_sufficient_cash(order: &PlaceOrder, ledger: &PaperLedger) -> Result<(), ExecError> {
+fn ensure_sufficient_cash(
+    order: &PlaceOrder,
+    ledger: &PaperLedger,
+    config: &SimulationConfig,
+) -> Result<(), ExecError> {
     if order.side != Side::Buy {
         return Ok(());
     }
-    let Some(available) = ledger.available_cash() else {
+    let fee_model = config.fee_model.unwrap_or_default();
+    let Some(available) = ledger.available_cash(fee_model) else {
         return Ok(());
     };
-    let cost = Money::from_decimal(order.price * order.qty);
+    let cost = Money::from_decimal(
+        fee_model
+            .max_buy_cost(order.qty, order.price)
+            .unwrap_or(Decimal::MAX),
+    );
     if cost > available {
         return Err(ExecError::Rejected {
             reason: format!("buy of {cost} exceeds the available paper balance of {available}"),
@@ -434,7 +443,7 @@ impl Executor for PaperExecutor {
                 last_timestamp_ms,
             } = &mut *state;
             ensure_market_limits(order, config)?;
-            ensure_sufficient_cash(order, ledger)?;
+            ensure_sufficient_cash(order, ledger, config)?;
             let (placement_id, expected_order_id) = ledger
                 .begin_order(order, None, now_ms)
                 .map_err(|error| execution_error(&error))?;
@@ -791,8 +800,16 @@ mod tests {
         // refuse for lack of collateral leaves no durable trace to replay.
         assert!(paper.pending_ledger_entry().is_none());
 
-        // Within the balance the same order trades normally.
-        let affordable = buy(&market, Decimal::new(50, 2), Decimal::from(10), false);
+        // A gross-notional-sized buy is rejected because its fee reserve also
+        // needs collateral.
+        let at_gross_limit = buy(&market, Decimal::new(50, 2), Decimal::from(20), false);
+        assert!(matches!(
+            paper.submit(&at_gross_limit, 100).await,
+            Err(ExecError::Rejected { .. })
+        ));
+
+        // Within the fee-inclusive balance the same order trades normally.
+        let affordable = buy(&market, Decimal::new(50, 2), Decimal::from(9), false);
         paper.submit(&affordable, 100).await?;
         Ok(())
     }
@@ -802,20 +819,20 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (paper, _fills, market) = funded_paper(Money::usdc(10)).await?;
 
-        // A resting bid for 8 of the 10 available.
-        let resting = buy(&market, Decimal::new(40, 2), Decimal::from(20), true);
+        // A resting bid for 7.2 plus a bounded fee reserve.
+        let resting = buy(&market, Decimal::new(40, 2), Decimal::from(18), true);
         paper.submit(&resting, 100).await?;
 
         // A second order for 5 more fits the raw balance but not the free one:
         // the same dollar cannot back two orders.
-        let second = buy(&market, Decimal::new(40, 2), Decimal::from(12), true);
+        let second = buy(&market, Decimal::new(40, 2), Decimal::from(8), true);
         let Err(ExecError::Rejected { reason }) = paper.submit(&second, 100).await else {
             return Err("expected a typed rejection".into());
         };
         assert!(reason.contains("exceeds the available paper balance"));
 
         // What the reservation leaves free still trades.
-        let within_free = buy(&market, Decimal::new(40, 2), Decimal::from(5), true);
+        let within_free = buy(&market, Decimal::new(40, 2), Decimal::from(4), true);
         paper.submit(&within_free, 100).await?;
         Ok(())
     }

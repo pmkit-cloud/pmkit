@@ -54,6 +54,20 @@ impl FeeModel {
         self.taker_bps
     }
 
+    /// Returns a fee-inclusive upper bound for a buy order's collateral.
+    ///
+    /// The fee schedule is proportional to `price * (1 - price)`, whose
+    /// maximum over the venue's price range is one quarter. Reserving that
+    /// bound keeps paper cash checks safe even when slippage changes the
+    /// eventual fill price.
+    #[must_use]
+    pub fn max_buy_cost(self, size: Decimal, price: Decimal) -> Option<Decimal> {
+        let notional = size.checked_mul(price)?;
+        let rate = Decimal::from(self.taker_bps).checked_div(Decimal::from(10_000))?;
+        let fee_bound = size.checked_mul(rate)?.checked_mul(Decimal::new(25, 2))?;
+        notional.checked_add(fee_bound)
+    }
+
     pub(crate) fn fee_order(
         self,
         size: Decimal,

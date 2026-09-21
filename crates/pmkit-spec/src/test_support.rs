@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use pmkit_core::MarketId;
 use pmkit_data::{
-    DataSourceError, HistoricalDataSource, LiveDataSource, ReplayQuery, SourceSignal,
+    DataSourceError, HistoricalDataSource, LiveCexDataSource, LiveDataSource, ReplayQuery,
+    SourceSignal,
 };
 use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
 use pmkit_market::Outcome;
@@ -34,6 +35,18 @@ impl LiveDataSource for NoLive {
         &self,
         _market: MarketId,
         _outcome: Outcome,
+        _sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        Ok(())
+    }
+}
+
+pub struct NoCex;
+
+#[async_trait]
+impl LiveCexDataSource for NoCex {
+    async fn subscribe_reference(
+        &self,
         _sink: Sender<SourceSignal>,
     ) -> Result<(), DataSourceError> {
         Ok(())
