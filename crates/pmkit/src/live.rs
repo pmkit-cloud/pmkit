@@ -518,6 +518,7 @@ async fn submit_live_order(
             portfolio_notional: context.risk_state.portfolio_notional() + reserved_portfolio,
             market_notional: context.risk_state.market_notional(context.market) + reserved_market,
             strategy_notional: reserved_strategy,
+            pending_position_notional: rust_decimal::Decimal::ZERO,
             daily_pnl,
             open_orders: context.open_orders.len(),
         });
