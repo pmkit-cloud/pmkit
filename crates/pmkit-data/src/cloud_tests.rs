@@ -270,6 +270,167 @@ async fn corrupt_download_bodies_fail_closed() -> Result<(), Box<dyn std::error:
 }
 
 #[tokio::test]
+async fn bounded_segment_sizes_reject_oversized_declarations_before_download()
+-> Result<(), Box<dyn std::error::Error>> {
+    let logical = br#"{"event_time_ms":1000,"event_ordinal":7,"payload":{"event_type":"book","asset_id":"token-up","bids":[],"asks":[]}}
+"#;
+    let encoded = zstd::stream::encode_all(logical.as_slice(), 0)?;
+    let logical_sha = digest(logical);
+    let encoded_sha = digest(&encoded);
+    for (logical_bytes, encoded_bytes) in [
+        (logical.len(), super::cloud_cache::MAX_SEGMENT_BYTES + 1),
+        (super::cloud_cache::MAX_SEGMENT_BYTES + 1, encoded.len()),
+    ] {
+        let page = segment_page(
+            "hot",
+            logical_bytes,
+            &logical_sha,
+            encoded_bytes,
+            &encoded_sha,
+        );
+        let mut server = TestServer::new(vec![
+            Response::json(200, available_coverage()),
+            Response::json(200, &page),
+        ])?;
+        let (tx, mut rx) = mpsc::channel(8);
+        assert_eq!(
+            source(&server)?.replay_cloud(query(), tx).await,
+            Err(CloudReplayError::IntegrityMismatch)
+        );
+        assert!(rx.recv().await.is_none());
+        assert_eq!(
+            server.calls(),
+            2,
+            "oversized metadata must fail before download"
+        );
+        server.join()?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn bounded_http_body_rejects_actual_and_declared_oversize_and_accepts_boundary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut server = TestServer::new(vec![
+        Response::json(200, "1234").without_content_length(),
+        Response::json(200, "1234").without_content_length(),
+        Response::json(200, "x").with_content_length(4),
+    ])?;
+    let source = source(&server)?;
+    let url = reqwest::Url::parse(&format!("{}/body", server.url))?;
+    let response = super::cloud_http::request(&source, url.clone()).await?;
+    assert_eq!(
+        super::cloud_cache::read_response_bounded(response, 3).await,
+        Err(CloudReplayError::IntegrityMismatch)
+    );
+    let response = super::cloud_http::request(&source, url.clone()).await?;
+    assert_eq!(
+        super::cloud_cache::read_response_bounded(response, 4).await?,
+        b"1234"
+    );
+    let response = super::cloud_http::request(&source, url).await?;
+    assert_eq!(
+        super::cloud_cache::read_response_bounded(response, 3).await,
+        Err(CloudReplayError::IntegrityMismatch)
+    );
+    assert_eq!(server.calls(), 3);
+    server.join()?;
+    Ok(())
+}
+
+#[test]
+fn bounded_decompression_rejects_expansion_and_accepts_exact_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (logical, limit, expected) in [
+        (b"1234".as_slice(), 4, Ok(b"1234".to_vec())),
+        (
+            b"12345".as_slice(),
+            4,
+            Err(CloudReplayError::IntegrityMismatch),
+        ),
+    ] {
+        let encoded = zstd::stream::encode_all(logical, 0)?;
+        let decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(encoded))?;
+        assert_eq!(super::cloud_cache::read_bounded(decoder, limit), expected);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_ndjson_row_fails_without_partial_signals()
+-> Result<(), Box<dyn std::error::Error>> {
+    let first = r#"{"event_time_ms":1000,"event_ordinal":7,"payload":{"event_type":"book","asset_id":"token-up","bids":[],"asks":[]}}"#;
+    let second = r#"{"event_time_ms":1000,"event_ordinal":8,"payload":{"event_type":"book","asset_id":"token-up","bids":[],"asks":[]}}"#;
+    let oversized = format!(
+        "{second}{}",
+        " ".repeat(super::cloud_decode::MAX_NDJSON_ROW_BYTES + 1 - second.len())
+    );
+    let logical = format!("{first}\n{oversized}\n");
+    let encoded = zstd::stream::encode_all(logical.as_bytes(), 0)?;
+    let logical_sha = digest(logical.as_bytes());
+    let encoded_sha = digest(&encoded);
+    let page = segment_page(
+        "hot",
+        logical.len(),
+        &logical_sha,
+        encoded.len(),
+        &encoded_sha,
+    );
+    let mut server = TestServer::new(vec![
+        Response::json(200, available_coverage()),
+        Response::json(200, &page),
+        Response::bytes(200, encoded, &encoded_sha, &logical_sha),
+    ])?;
+    let (tx, mut rx) = mpsc::channel(8);
+    assert_eq!(
+        source(&server)?.replay_cloud(query(), tx).await,
+        Err(CloudReplayError::MalformedResponse)
+    );
+    assert!(rx.recv().await.is_none());
+    assert_eq!(server.calls(), 3);
+    server.join()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn decoded_event_limit_fails_without_partial_signals()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::fmt::Write as _;
+
+    let mut logical = String::new();
+    for ordinal in 0..=super::cloud_decode::MAX_DECODED_EVENTS {
+        writeln!(
+            logical,
+            r#"{{"event_time_ms":1000,"event_ordinal":{ordinal},"payload":{{"event_type":"book","asset_id":"token-up","bids":[],"asks":[]}}}}"#
+        )?;
+    }
+    let encoded = zstd::stream::encode_all(logical.as_bytes(), 0)?;
+    let logical_sha = digest(logical.as_bytes());
+    let encoded_sha = digest(&encoded);
+    let page = segment_page(
+        "hot",
+        logical.len(),
+        &logical_sha,
+        encoded.len(),
+        &encoded_sha,
+    );
+    let mut server = TestServer::new(vec![
+        Response::json(200, available_coverage()),
+        Response::json(200, &page),
+        Response::bytes(200, encoded, &encoded_sha, &logical_sha),
+    ])?;
+    let (tx, mut rx) = mpsc::channel(8);
+    assert_eq!(
+        source(&server)?.replay_cloud(query(), tx).await,
+        Err(CloudReplayError::MalformedResponse)
+    );
+    assert!(rx.recv().await.is_none());
+    assert_eq!(server.calls(), 3);
+    server.join()?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn invalid_query_fails_before_coverage() -> Result<(), Box<dyn std::error::Error>> {
     let mut server = TestServer::new(vec![])?;
     let source = source(&server)?;

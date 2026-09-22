@@ -13,6 +13,8 @@ pub(super) struct Response {
     status: u16,
     body: Vec<u8>,
     headers: Vec<(String, String)>,
+    content_length: Option<usize>,
+    omit_content_length: bool,
 }
 
 impl Response {
@@ -21,6 +23,8 @@ impl Response {
             status,
             body: body.as_bytes().to_vec(),
             headers: vec![],
+            content_length: None,
+            omit_content_length: false,
         }
     }
 
@@ -32,7 +36,19 @@ impl Response {
                 ("x-pmkit-encoded-sha256".into(), encoded.into()),
                 ("x-pmkit-segment-sha256".into(), logical.into()),
             ],
+            content_length: None,
+            omit_content_length: false,
         }
+    }
+
+    pub(super) fn with_content_length(mut self, content_length: usize) -> Self {
+        self.content_length = Some(content_length);
+        self
+    }
+
+    pub(super) fn without_content_length(mut self) -> Self {
+        self.omit_content_length = true;
+        self
     }
 }
 
@@ -135,12 +151,16 @@ fn write_response(stream: &mut TcpStream, response: Response) -> std::io::Result
     for (name, value) in response.headers {
         write!(extra, "{name}: {value}\r\n").map_err(std::io::Error::other)?;
     }
-    stream.write_all(
+    let content_length = if response.omit_content_length {
+        String::new()
+    } else {
         format!(
-            "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
-            response.body.len()
+            "Content-Length: {}\r\n",
+            response.content_length.unwrap_or(response.body.len())
         )
-        .as_bytes(),
+    };
+    stream.write_all(
+        format!("HTTP/1.1 {status}\r\n{content_length}{extra}Connection: close\r\n\r\n").as_bytes(),
     )?;
     stream.write_all(&response.body)
 }

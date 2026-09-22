@@ -136,9 +136,17 @@ async fn replay_segments(
                 RetrievalState::Hot | RetrievalState::ReadyUntil => {}
                 state => return Err(CloudReplayError::RetrievalRequired { state }),
             }
+            if segment.encoded_bytes > cloud_cache::MAX_SEGMENT_BYTES as u64
+                || segment.bytes > cloud_cache::MAX_SEGMENT_BYTES as u64
+            {
+                return Err(CloudReplayError::IntegrityMismatch);
+            }
             let encoded = cloud_cache::encoded_segment(source, &segment).await?;
-            let logical = zstd::stream::decode_all(Cursor::new(encoded.as_ref()))
+            let decoder = zstd::stream::read::Decoder::new(Cursor::new(encoded.as_ref()))
                 .map_err(|_| CloudReplayError::IntegrityMismatch)?;
+            let logical_limit =
+                usize::try_from(segment.bytes).map_err(|_| CloudReplayError::IntegrityMismatch)?;
+            let logical = cloud_cache::read_bounded(decoder, logical_limit)?;
             verify_logical(&segment, &logical)?;
             for signal in cloud_decode::decode(&segment, &logical)? {
                 sink.send(signal)
@@ -172,11 +180,9 @@ async fn json<T: serde::de::DeserializeOwned>(
     source: &PmKitCloudDataSource,
     url: Url,
 ) -> Result<T, CloudReplayError> {
-    request(source, url)
-        .await?
-        .json()
-        .await
-        .map_err(|_| CloudReplayError::MalformedResponse)
+    let response = request(source, url).await?;
+    let body = cloud_cache::read_response_bounded(response, cloud_cache::MAX_SEGMENT_BYTES).await?;
+    serde_json::from_slice(&body).map_err(|_| CloudReplayError::MalformedResponse)
 }
 
 pub(super) async fn request(
