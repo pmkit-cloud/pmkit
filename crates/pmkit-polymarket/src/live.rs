@@ -469,6 +469,7 @@ struct TokenBook {
     bids: BTreeMap<rust_decimal::Decimal, rust_decimal::Decimal>,
     asks: BTreeMap<rust_decimal::Decimal, rust_decimal::Decimal>,
     timestamp_ms: i64,
+    snapshot_timestamp_ms: i64,
     initialized: bool,
 }
 
@@ -477,12 +478,13 @@ impl TokenBook {
         if update.asset_id != token {
             return Err(replay_gap("book snapshot has the wrong asset id"));
         }
-        if self.initialized && update.timestamp < self.timestamp_ms {
+        if self.initialized && update.timestamp <= self.timestamp_ms {
             return Err(replay_gap("stale book snapshot"));
         }
         self.bids = levels(&update.bids)?;
         self.asks = levels(&update.asks)?;
         self.timestamp_ms = update.timestamp;
+        self.snapshot_timestamp_ms = update.timestamp;
         self.initialized = true;
         Ok(())
     }
@@ -491,7 +493,7 @@ impl TokenBook {
         if !self.initialized {
             return Err(replay_gap("price change before initial book snapshot"));
         }
-        if update.timestamp < self.timestamp_ms {
+        if update.timestamp < self.timestamp_ms || update.timestamp == self.snapshot_timestamp_ms {
             return Err(replay_gap("stale price change"));
         }
         let matching = update
@@ -956,6 +958,13 @@ mod tests {
         )?;
         let mut book = TokenBook::default();
         book.replace(&snapshot, token)?;
+        let books_first: PriceChange = serde_json::from_str(
+            r#"{"event_type":"price_change","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"42","price_changes":[{"asset_id":"1","price":"0.48","size":"1","side":"BUY"}]}"#,
+        )?;
+        assert!(matches!(
+            book.apply(&books_first, token),
+            Err(DataSourceError::ReplayGap { .. })
+        ));
         let mut pending = VecDeque::from([later, same_timestamp_first, same_timestamp_second]);
 
         let events =
@@ -1025,6 +1034,35 @@ mod tests {
             Err(DataSourceError::ReplayGap { message })
                 if message == "buffered price changes overlap at the same timestamp"
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn equal_timestamp_book_replacement_after_delta_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let token = U256::from(1_u64);
+        let snapshot: BookUpdate = serde_json::from_str(
+            r#"{"asset_id":"1","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"42","bids":[{"price":"0.49","size":"2"}],"asks":[{"price":"0.51","size":"3"}]}"#,
+        )?;
+        let applied_delta: PriceChange = serde_json::from_str(
+            r#"{"event_type":"price_change","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"43","price_changes":[{"asset_id":"1","price":"0.52","size":"2","side":"SELL"}]}"#,
+        )?;
+        let equal_replacement: BookUpdate = serde_json::from_str(
+            r#"{"asset_id":"1","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"43","bids":[],"asks":[]}"#,
+        )?;
+        let later_replacement: BookUpdate = serde_json::from_str(
+            r#"{"asset_id":"1","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"44","bids":[],"asks":[]}"#,
+        )?;
+        let mut book = TokenBook::default();
+        book.replace(&snapshot, token)?;
+        assert!(book.apply(&applied_delta, token)?);
+        assert!(matches!(
+            book.replace(&equal_replacement, token),
+            Err(DataSourceError::ReplayGap { .. })
+        ));
+        book.replace(&later_replacement, token)?;
+        assert_eq!(book.timestamp_ms, 44);
         Ok(())
     }
 

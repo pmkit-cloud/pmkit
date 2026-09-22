@@ -12,7 +12,9 @@ use pmkit_event::{
     CexReferenceEnvelope, CexReferenceEvent, Liquidity, MarketEvent, PmAccountEnvelope,
     PmAccountEvent, SourceEnvelope, StreamMetadata,
 };
-use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
+use pmkit_exec::{
+    ExecError, ExecutionSnapshot, Executor, OrderId, OrderStatus, OrderStatusDetails, PlaceOrder,
+};
 use pmkit_market::{Asset, Exchange, Outcome};
 use pmkit_money::Money;
 use pmkit_runtime::{LiveOrderPolicy, StrategyRegistration};
@@ -39,6 +41,12 @@ struct RecordingExec;
 struct CountingExec {
     submissions: AtomicUsize,
 }
+
+struct ReferenceRestartExec {
+    open_orders: Vec<OrderId>,
+}
+
+struct EmptyLive;
 
 #[derive(Default)]
 struct RejectedExec {
@@ -89,6 +97,59 @@ impl Executor for CountingExec {
 
     async fn cancel_all(&self) -> Result<(), ExecError> {
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Executor for ReferenceRestartExec {
+    async fn preflight(&self) -> Result<ExecutionSnapshot, ExecError> {
+        Ok(ExecutionSnapshot {
+            open_orders: self.open_orders.clone(),
+        })
+    }
+
+    async fn reconcile(&self) -> Result<ExecutionSnapshot, ExecError> {
+        Ok(ExecutionSnapshot {
+            open_orders: self.open_orders.clone(),
+        })
+    }
+
+    async fn query_status(&self, _order_id: &OrderId) -> Result<OrderStatus, ExecError> {
+        Ok(OrderStatus::Open(OrderStatusDetails {
+            filled_qty: Some(Decimal::ZERO),
+            price: Some(Decimal::new(46, 2)),
+            fee: Some(Decimal::ZERO),
+            settlement_reference: None,
+        }))
+    }
+
+    async fn submit(&self, _order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
+        Ok(OrderId("unused".to_owned()))
+    }
+
+    async fn cancel(&self, _order_id: &OrderId) -> Result<(), ExecError> {
+        Ok(())
+    }
+
+    async fn cancel_all(&self) -> Result<(), ExecError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl LiveDataSource for EmptyLive {
+    async fn subscribe(
+        &self,
+        _market: MarketId,
+        _outcome: Outcome,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
     }
 }
 
@@ -770,6 +831,82 @@ async fn live_delivers_reference_facts_with_latest_market_context()
     assert_eq!(nonempty_books.load(Ordering::Relaxed), 1);
     assert_eq!(executor.submissions.load(Ordering::Relaxed), 1);
     assert_eq!(report.rejected, 0);
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
+async fn live_reference_intent_restarts_from_durable_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let store =
+        TursoTapeStore::open_local(directory.path().join("live-reference-restart.db")).await?;
+    let first_executor = Arc::new(CountingExec::default());
+    let first_run = LiveRun::new(
+        RunId::new("live-reference-restart")?,
+        PortfolioId::new("alice")?,
+        first_executor.clone(),
+        Arc::new(LiveWithBook),
+        risk()?,
+    )
+    .reference_data(Arc::new(ScriptedReferenceLive))
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("reference-buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(ReferenceBuyerFactory {
+            calls: Arc::new(AtomicUsize::new(0)),
+            nonempty_books: Arc::new(AtomicUsize::new(0)),
+        }),
+    ));
+    let mut runtime = config()?;
+    runtime.shutdown.live_orders = LiveOrderPolicy::Leave;
+
+    live::drive_with_store(&first_run, &runtime, Some(&store)).await?;
+    assert_eq!(first_executor.submissions.load(Ordering::Relaxed), 1);
+
+    let scope = OwnerScope::new(
+        PortfolioId::new("alice")?,
+        RunId::new("live-reference-restart")?,
+    );
+    let decisions = store.read_decisions(&scope).await?;
+    let decision = decisions
+        .iter()
+        .find(|decision| decision.identity.correlation_id.contains("binance-live"))
+        .ok_or("missing reference decision")?;
+    for component in [
+        "source:12:binance-live",
+        "connection:9:reference",
+        "epoch:0",
+        "frame:1",
+    ] {
+        assert!(
+            decision.identity.correlation_id.contains(component),
+            "missing causal identity component: {component}"
+        );
+    }
+    let intents = store.read_accepted_intents(&scope).await?;
+    assert_eq!(intents.len(), 1);
+
+    let restarted_run = LiveRun::new(
+        RunId::new("live-reference-restart")?,
+        PortfolioId::new("alice")?,
+        Arc::new(ReferenceRestartExec {
+            open_orders: vec![OrderId("reference-order".to_owned())],
+        }),
+        Arc::new(EmptyLive),
+        risk()?,
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("reference-buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(BuyFactory),
+    ));
+
+    let report = live::drive_with_store(&restarted_run, &runtime, Some(&store)).await?;
+
+    assert_eq!(report.exposure.portfolio_notional, Decimal::new(46, 2));
+    store.delete_database()?;
+    assert!(!directory.path().join("live-reference-restart.db").exists());
     Ok(())
 }
 

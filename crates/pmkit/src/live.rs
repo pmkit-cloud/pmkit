@@ -8,6 +8,7 @@ use pmkit_accounting::{ExposureReservation, aggregate_exposure};
 use pmkit_book::OrderBookL2;
 use pmkit_event::{
     CexReferenceEvent, FillIdentity, MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact,
+    StreamMetadata,
 };
 use pmkit_exec::{ExecError, Executor, OrderId, OrderStatus, PlaceOrder};
 use pmkit_market::Outcome;
@@ -278,6 +279,28 @@ fn strategy_correlation_id(
         "live-strategy:{}:{strategy}:market:{}:{market}:{timestamp_ms}",
         strategy.len(),
         market.len()
+    )
+}
+
+fn strategy_reference_correlation_id(
+    strategy: &pmkit_core::StrategyId,
+    market: &pmkit_core::MarketId,
+    timestamp_ms: i64,
+    metadata: &StreamMetadata,
+) -> String {
+    let strategy = strategy.to_string();
+    let market = market.to_string();
+    let source_id = &metadata.source_id;
+    let connection_id = &metadata.connection_id;
+    format!(
+        "live-strategy:{}:{strategy}:market:{}:{market}:source:{}:{source_id}:connection:{}:{connection_id}:epoch:{}:frame:{}:ingest:{}:event:{timestamp_ms}",
+        strategy.len(),
+        market.len(),
+        source_id.len(),
+        connection_id.len(),
+        metadata.connection_epoch,
+        metadata.frame_sequence,
+        metadata.ingest_sequence,
     )
 }
 
@@ -894,9 +917,11 @@ async fn drive_with_control_and_rate_limits(
                 let book = &strategy_books[index];
                 let identity = CausalIdentity {
                     scope: scope.clone(),
-                    correlation_id: format!(
-                        "{:?}:cex:{}:{timestamp_ms}",
-                        instance.id, envelope.metadata.source_id
+                    correlation_id: strategy_reference_correlation_id(
+                        &instance.id,
+                        market,
+                        timestamp_ms,
+                        &envelope.metadata,
                     ),
                     source_timestamp_ms: envelope.metadata.source_time_ms,
                     ingest_sequence: i64::try_from(envelope.metadata.ingest_sequence)
