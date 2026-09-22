@@ -89,6 +89,7 @@ impl LiveCexDataSource for BinanceAggTradeLive {
                     continue;
                 }
             };
+            let mut continuity_validated = false;
             let mut heartbeat =
                 tokio::time::interval(std::time::Duration::from_millis(LIVE_HEARTBEAT_INTERVAL_MS));
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -96,9 +97,11 @@ impl LiveCexDataSource for BinanceAggTradeLive {
             let disconnect = loop {
                 let message = tokio::select! {
                     _ = heartbeat.tick() => {
-                        sink.send(SourceSignal::Watermark(live_watermark_now()))
-                            .await
-                            .map_err(|_| DataSourceError::SinkClosed)?;
+                        if continuity_validated {
+                            sink.send(SourceSignal::Watermark(live_watermark_now()))
+                                .await
+                                .map_err(|_| DataSourceError::SinkClosed)?;
+                        }
                         continue;
                     }
                     message = socket.next() => message,
@@ -147,6 +150,7 @@ impl LiveCexDataSource for BinanceAggTradeLive {
                     }
                 }
                 last_aggregate_trade_id = Some(aggregate_trade_id);
+                continuity_validated = true;
                 let (frame_sequence, ingest_sequence) = reference_trade_identity(&fact)?;
                 sink.send(SourceSignal::Data(Box::new(SourceEnvelope::CexReference(
                     CexReferenceEnvelope {
@@ -180,7 +184,7 @@ impl LiveCexDataSource for BinanceAggTradeLive {
 #[cfg(test)]
 mod tests {
     use super::{BINANCE_MAX_RECONNECT_ATTEMPTS, BinanceAggTradeLive};
-    use crate::{DataSourceError, LiveCexDataSource, SourceSignal};
+    use crate::{DataSourceError, LIVE_HEARTBEAT_INTERVAL_MS, LiveCexDataSource, SourceSignal};
     use futures_util::SinkExt;
     use pmkit_event::{CexReferenceEvent, SourceEnvelope};
     use pmkit_market::Asset;
@@ -263,6 +267,150 @@ mod tests {
             "receipt ordering must survive reconnect"
         );
         server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_withholds_watermark_until_first_validated_trade()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (reconnected, reconnected_rx) = oneshot::channel();
+        let (send_trade, send_trade_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut socket = accept_async(stream).await?;
+            socket
+                .send(Message::Text(
+                    r#"{"e":"aggTrade","a":7,"p":"0.42","q":"1","T":1735689600123,"m":false}"#
+                        .into(),
+                ))
+                .await?;
+            drop(socket);
+
+            let (stream, _) = listener.accept().await?;
+            let mut socket = accept_async(stream).await?;
+            let _ = reconnected.send(());
+            let _ = send_trade_rx.await;
+            socket
+                .send(Message::Text(
+                    r#"{"e":"aggTrade","a":8,"p":"0.43","q":"1","T":1735689601123,"m":false}"#
+                        .into(),
+                ))
+                .await?;
+            drop(socket);
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        let source = BinanceAggTradeLive::with_endpoint(Asset::Btc, &format!("ws://{address}"));
+        let (sink, mut events) = mpsc::channel(8);
+        let source_task = tokio::spawn(async move { source.subscribe_reference(sink).await });
+
+        let Some(SourceSignal::Data(first)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await?
+        else {
+            return Err("expected first trade before reconnect".into());
+        };
+        let SourceEnvelope::CexReference(first) = *first else {
+            return Err("expected CEX envelope".into());
+        };
+        assert!(matches!(
+            first.fact,
+            CexReferenceEvent::Trade {
+                aggregate_trade_id: 7,
+                ..
+            }
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), reconnected_rx)
+            .await
+            .map_err(|_| std::io::Error::other("timed out waiting for reconnect"))??;
+
+        let no_signal = tokio::time::timeout(
+            std::time::Duration::from_millis(LIVE_HEARTBEAT_INTERVAL_MS + 100),
+            events.recv(),
+        )
+        .await;
+        assert!(
+            no_signal.is_err(),
+            "reconnect emitted a signal before continuity was validated"
+        );
+
+        let _ = send_trade.send(());
+        let Some(SourceSignal::Data(second)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await?
+        else {
+            return Err("expected validated reconnect trade as the next signal".into());
+        };
+        let SourceEnvelope::CexReference(second) = *second else {
+            return Err("expected CEX envelope".into());
+        };
+        assert!(matches!(
+            second.fact,
+            CexReferenceEvent::Trade {
+                aggregate_trade_id: 8,
+                ..
+            }
+        ));
+
+        source_task.abort();
+        tokio::time::timeout(std::time::Duration::from_secs(2), server).await???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initial_warmup_withholds_watermark_until_first_trade()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (connected, connected_rx) = oneshot::channel();
+        let (send_trade, send_trade_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut socket = accept_async(stream).await?;
+            let _ = connected.send(());
+            let _ = send_trade_rx.await;
+            socket
+                .send(Message::Text(
+                    r#"{"e":"aggTrade","a":7,"p":"0.42","q":"1","T":1735689600123,"m":false}"#
+                        .into(),
+                ))
+                .await?;
+            socket.close(None).await?;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        let source = BinanceAggTradeLive::with_endpoint(Asset::Btc, &format!("ws://{address}"));
+        let (sink, mut events) = mpsc::channel(8);
+        let source_task = tokio::spawn(async move { source.subscribe_reference(sink).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), connected_rx).await??;
+        let no_signal = tokio::time::timeout(
+            std::time::Duration::from_millis(LIVE_HEARTBEAT_INTERVAL_MS + 100),
+            events.recv(),
+        )
+        .await;
+        assert!(
+            no_signal.is_err(),
+            "initial connection emitted a watermark before its first trade"
+        );
+
+        let _ = send_trade.send(());
+        let Some(SourceSignal::Data(envelope)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await?
+        else {
+            return Err("expected first trade after warm-up".into());
+        };
+        let SourceEnvelope::CexReference(envelope) = *envelope else {
+            return Err("expected CEX envelope".into());
+        };
+        assert!(matches!(
+            envelope.fact,
+            CexReferenceEvent::Trade {
+                aggregate_trade_id: 7,
+                ..
+            }
+        ));
+
+        source_task.abort();
+        tokio::time::timeout(std::time::Duration::from_secs(2), server).await???;
         Ok(())
     }
 
