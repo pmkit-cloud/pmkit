@@ -860,6 +860,21 @@ async fn paper_reference_cancellations_use_event_timestamp()
         let decisions = store
             .read_decisions(&OwnerScope::new(portfolio, run_id))
             .await?;
+        let cancellation_decision = decisions
+            .iter()
+            .find(|decision| {
+                decision.identity.source_timestamp_ms == 200
+                    && decision.payload.get("decision").is_some()
+            })
+            .ok_or_else(|| format!("missing {name} cancellation decision"))?;
+        assert_eq!(
+            cancellation_decision.payload["decision"]["kind"], "actions",
+            "{name}"
+        );
+        assert_eq!(
+            cancellation_decision.payload["decision"]["risk"][0]["action_index"], 0,
+            "{name}"
+        );
         let ledger_timestamps = decisions
             .iter()
             .filter(|decision| decision.payload["record_type"] == "paper_ledger")

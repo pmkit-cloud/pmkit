@@ -133,17 +133,18 @@ async fn cancel_paper_order(
     strategy: &pmkit_core::StrategyId,
     order_id: &OrderId,
     timestamp_ms: i64,
-) -> Result<(), StartError> {
-    if owned_paper_orders(paper, strategy).contains(order_id) {
-        paper
-            .cancel_at(order_id, timestamp_ms)
-            .map_err(|source| StartError::ExecutionState {
-                run: run.id().clone(),
-                source,
-            })?;
-        persist_or_drain_paper(store, scope, paper, run.id()).await?;
+) -> Result<bool, StartError> {
+    if !owned_paper_orders(paper, strategy).contains(order_id) {
+        return Ok(false);
     }
-    Ok(())
+    paper
+        .cancel_at(order_id, timestamp_ms)
+        .map_err(|source| StartError::ExecutionState {
+            run: run.id().clone(),
+            source,
+        })?;
+    persist_or_drain_paper(store, scope, paper, run.id()).await?;
+    Ok(true)
 }
 
 struct PaperActionContext<'a> {
@@ -882,6 +883,7 @@ pub async fn drive_with_control(
 
 #[expect(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the shared dispatch carries the paper driver state without changing its ownership"
 )]
 async fn dispatch_strategy(
@@ -940,7 +942,7 @@ async fn dispatch_strategy(
                     .await?;
                 }
                 Action::Cancel(order_id) => {
-                    cancel_paper_order(
+                    if cancel_paper_order(
                         run,
                         paper,
                         store,
@@ -949,11 +951,16 @@ async fn dispatch_strategy(
                         order_id,
                         timestamp_ms,
                     )
-                    .await?;
+                    .await?
+                    {
+                        verdicts.push(crate::causal::ActionRiskVerdict::accepted(action_index));
+                    }
                 }
                 Action::ReplaceQuotes { cancel, place } => {
+                    let cancel_only = place.is_empty();
+                    let mut cancelled = false;
                     for order_id in cancel {
-                        cancel_paper_order(
+                        cancelled |= cancel_paper_order(
                             run,
                             paper,
                             store,
@@ -963,6 +970,9 @@ async fn dispatch_strategy(
                             timestamp_ms,
                         )
                         .await?;
+                    }
+                    if cancel_only && cancelled {
+                        verdicts.push(crate::causal::ActionRiskVerdict::accepted(action_index));
                     }
                     for order in place {
                         submit_risk_checked_paper_order(
@@ -981,8 +991,9 @@ async fn dispatch_strategy(
                     }
                 }
                 Action::CancelAll => {
+                    let mut cancelled = false;
                     for order_id in owned_paper_orders(paper, &instance.id) {
-                        cancel_paper_order(
+                        cancelled |= cancel_paper_order(
                             run,
                             paper,
                             store,
@@ -992,6 +1003,9 @@ async fn dispatch_strategy(
                             timestamp_ms,
                         )
                         .await?;
+                    }
+                    if cancelled {
+                        verdicts.push(crate::causal::ActionRiskVerdict::accepted(action_index));
                     }
                 }
             }
