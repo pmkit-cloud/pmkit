@@ -11,6 +11,14 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
+/// Returns whether marked `PnL` has reached the configured fail-closed loss limit.
+#[allow(dead_code, reason = "retained as the unaggregated risk test helper")]
+#[must_use]
+pub(crate) fn loss_limit_breached(daily_pnl: Decimal, max_loss: Decimal) -> bool {
+    daily_pnl <= -max_loss
+}
+
+#[allow(dead_code, reason = "retained as the unaggregated risk test helper")]
 #[must_use]
 pub(crate) fn passes_risk(
     order: &PlaceOrder,
@@ -18,10 +26,26 @@ pub(crate) fn passes_risk(
     positions: &[Position],
     portfolio_unrealized_pnl: Option<Decimal>,
 ) -> bool {
+    passes_risk_with_pending(
+        order,
+        limits,
+        positions,
+        Decimal::ZERO,
+        portfolio_unrealized_pnl,
+    )
+}
+
+fn passes_risk_with_pending(
+    order: &PlaceOrder,
+    limits: &RiskLimits,
+    positions: &[Position],
+    pending_position_notional: Decimal,
+    portfolio_unrealized_pnl: Option<Decimal>,
+) -> bool {
     let Some(portfolio_unrealized_pnl) = portfolio_unrealized_pnl else {
         return false;
     };
-    if portfolio_unrealized_pnl <= -limits.max_loss.as_decimal()
+    if loss_limit_breached(portfolio_unrealized_pnl, limits.max_loss.as_decimal())
         || order.qty * order.price > limits.max_order_notional.as_decimal()
     {
         return false;
@@ -35,7 +59,8 @@ pub(crate) fn passes_risk(
         .find(|position| position.outcome == order.outcome)
         .map(|position| position.qty)
         .unwrap_or_default();
-    (held + signed).abs() * order.price <= limits.max_position_notional.as_decimal()
+    (held + signed).abs() * order.price + pending_position_notional
+        <= limits.max_position_notional.as_decimal()
 }
 
 /// Aggregated exposure checked before one live venue submission.
@@ -47,6 +72,8 @@ pub(crate) struct PortfolioRiskExposure {
     pub(crate) market_notional: Decimal,
     /// Current reserved notional attributable to the strategy.
     pub(crate) strategy_notional: Decimal,
+    /// Pending same-market/outcome position notional for the candidate order.
+    pub(crate) pending_position_notional: Decimal,
     /// Current daily portfolio profit and loss.
     pub(crate) daily_pnl: Decimal,
     /// Current open order count.
@@ -61,9 +88,13 @@ pub(crate) fn passes_aggregated_risk(
     exposure: PortfolioRiskExposure,
 ) -> bool {
     let order_notional = order.qty * order.price;
-    passes_risk(order, limits, positions, Some(exposure.daily_pnl))
-        && exposure.portfolio_notional + order_notional
-            <= limits.max_portfolio_notional.as_decimal()
+    passes_risk_with_pending(
+        order,
+        limits,
+        positions,
+        exposure.pending_position_notional,
+        Some(exposure.daily_pnl),
+    ) && exposure.portfolio_notional + order_notional <= limits.max_portfolio_notional.as_decimal()
         && exposure.market_notional + order_notional <= limits.max_market_notional.as_decimal()
         && exposure.strategy_notional + order_notional <= limits.max_strategy_notional.as_decimal()
         && exposure.daily_pnl > -limits.max_daily_loss.as_decimal()
@@ -825,7 +856,7 @@ impl LiveRiskState {
             self.realized_pnl,
             self.fees,
         );
-        if daily_pnl.is_some_and(|pnl| pnl <= -limits.max_loss.as_decimal()) {
+        if daily_pnl.is_some_and(|pnl| loss_limit_breached(pnl, limits.max_loss.as_decimal())) {
             self.loss_breached = true;
         }
         daily_pnl
@@ -1006,6 +1037,7 @@ mod override_tests {
             portfolio_notional: Decimal::ZERO,
             market_notional: Decimal::ZERO,
             strategy_notional: Decimal::ZERO,
+            pending_position_notional: Decimal::ZERO,
             daily_pnl: Decimal::ZERO,
             open_orders: 0,
         }

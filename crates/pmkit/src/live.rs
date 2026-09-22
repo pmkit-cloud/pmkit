@@ -649,6 +649,7 @@ async fn dispatch_live_pipeline(
                     portfolio_notional: risk_state.portfolio_notional() + reserved_portfolio,
                     market_notional: risk_state.market_notional(market) + reserved_market,
                     strategy_notional: reserved_strategy,
+                    pending_position_notional: rust_decimal::Decimal::ZERO,
                     daily_pnl,
                     open_orders: open_orders.len(),
                 });

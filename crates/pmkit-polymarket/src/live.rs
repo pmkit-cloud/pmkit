@@ -8,6 +8,9 @@ use std::{
     time::Instant,
 };
 
+#[cfg(test)]
+use std::{future::Future as _, task::Poll};
+
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use pmkit_core::MarketId;
@@ -37,10 +40,16 @@ use polymarket_client_sdk_v2::{
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 
+#[cfg(test)]
+use tokio::sync::Notify;
+
 use crate::{MarketTokens, from_venue_side};
 
 const MARKET_SOURCE_ID: &str = "polymarket:market-ws";
 const CLOB_HTTP_ENDPOINT: &str = "https://clob.polymarket.com";
+const CLOB_WS_ENDPOINT: &str = "wss://ws-subscriptions-clob.polymarket.com";
+// Keep the SDK default conservative; this recorder opts into extra headroom for its durable sink.
+const MARKET_EVENT_BUFFER_CAPACITY: usize = 65_536;
 
 /// Adapts raw Polymarket frames into typed PM stream envelopes.
 pub trait PolymarketFrameAdapter {
@@ -275,6 +284,8 @@ pub struct PolymarketLiveData {
     http_client: HttpClient,
     tokens: MarketTokens,
     connection_epoch: Arc<AtomicI64>,
+    #[cfg(test)]
+    test_send_pending: Option<Arc<Notify>>,
 }
 
 impl PolymarketLiveData {
@@ -289,11 +300,12 @@ impl PolymarketLiveData {
             polymarket_client_sdk_v2::clob::Config::default(),
         )
         .map_err(|error| unavailable(&format!("Polymarket CLOB client failed: {error}")))?;
-        Ok(Self::with_http_client(
-            Client::default(),
-            http_client,
-            tokens,
-        ))
+        let ws_config = polymarket_client_sdk_v2::ws::config::Config::default()
+            .with_event_buffer_capacity(MARKET_EVENT_BUFFER_CAPACITY);
+        let client = Client::new(CLOB_WS_ENDPOINT, ws_config).map_err(|error| {
+            unavailable(&format!("Polymarket WebSocket client failed: {error}"))
+        })?;
+        Ok(Self::with_http_client(client, http_client, tokens))
     }
 
     /// Creates a live source from an SDK WebSocket client and market token map.
@@ -310,8 +322,37 @@ impl PolymarketLiveData {
             http_client,
             tokens,
             connection_epoch: Arc::new(AtomicI64::new(0)),
+            #[cfg(test)]
+            test_send_pending: None,
         }
     }
+
+    #[cfg(test)]
+    fn with_test_send_pending(mut self, pending: Arc<Notify>) -> Self {
+        self.test_send_pending = Some(pending);
+        self
+    }
+}
+
+#[cfg(test)]
+async fn send_with_pending_marker(
+    sink: &Sender<SourceSignal>,
+    signal: SourceSignal,
+    pending: Option<&Arc<Notify>>,
+) -> Result<(), tokio::sync::mpsc::error::SendError<SourceSignal>> {
+    let Some(pending) = pending else {
+        return sink.send(signal).await;
+    };
+    let send = sink.send(signal);
+    tokio::pin!(send);
+    futures::future::poll_fn(|context| match send.as_mut().poll(context) {
+        Poll::Pending => {
+            pending.notify_one();
+            Poll::Pending
+        }
+        Poll::Ready(result) => Poll::Ready(result),
+    })
+    .await
 }
 
 /// One source-owned reference to one SDK unified market subscription.
@@ -472,7 +513,22 @@ impl PolymarketLiveData {
                             Ok(signal) => signal,
                             Err(error) => break SubscribeOutcome::Terminal(error),
                         };
-                        if sink.send(signal).await.is_err() {
+                        let sent = {
+                            #[cfg(test)]
+                            {
+                                send_with_pending_marker(
+                                    sink,
+                                    signal,
+                                    self.test_send_pending.as_ref(),
+                                )
+                                .await
+                            }
+                            #[cfg(not(test))]
+                            {
+                                sink.send(signal).await
+                            }
+                        };
+                        if sent.is_err() {
                             break SubscribeOutcome::Terminal(DataSourceError::SinkClosed);
                         }
                     }
@@ -1010,9 +1066,12 @@ mod tests {
     };
 
     use async_trait::async_trait;
+    use futures::{SinkExt as _, StreamExt as _};
     use pmkit_book::Side;
     use pmkit_core::{MarketId, PortfolioId, RunId};
-    use pmkit_data::{DataSourceError, RawPmAccountFrame, RawPmMarketFrame, SourceSignal};
+    use pmkit_data::{
+        DataSourceError, LiveDataSource, RawPmAccountFrame, RawPmMarketFrame, SourceSignal,
+    };
     use pmkit_event::{MarketEvent, PmAccountEvent, SourceEnvelope, StreamMetadata};
 
     use pmkit_market::Outcome;
@@ -1023,11 +1082,17 @@ mod tests {
     use polymarket_client_sdk_v2::{
         clob::{
             types::response::OrderBookSummaryResponse,
-            ws::{BookUpdate, LastTradePrice, PriceChange, WsMessage},
+            ws::{BookUpdate, Client, LastTradePrice, PriceChange, WsMessage},
         },
         types::U256,
+        ws::config::Config,
     };
     use rust_decimal::Decimal;
+    use tokio::{
+        net::TcpListener,
+        sync::{Notify, mpsc},
+    };
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
 
     use super::{
         RawFrameAdapterError, RawPolymarketFrameAdapter, SummaryRecovery, TokenBook, book_event,
@@ -1454,6 +1519,134 @@ mod tests {
         );
         Ok(())
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_adapter_propagates_buffer_through_isolated_and_fails_closed_on_lag()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Given: a loopback WebSocket server and an adapter client whose bounded event buffer is
+        // intentionally small enough to exercise the SDK's Lagged path.
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (batches, mut batch_receiver) = mpsc::channel::<Vec<String>>(4);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut socket = accept_async(stream).await?;
+            loop {
+                match socket.next().await {
+                    Some(Ok(Message::Text(_))) => break,
+                    Some(Ok(Message::Ping(payload))) => {
+                        socket.send(Message::Pong(payload)).await?;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Err(error.into()),
+                    None => return Err("client closed before subscribing".into()),
+                }
+            }
+            while let Some(frames) = batch_receiver.recv().await {
+                for frame in frames {
+                    socket.send(Message::Text(frame.into())).await?;
+                }
+            }
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+
+        let market = MarketId::new("btc-5m")?;
+        let client = Client::new(
+            &format!("ws://{address}"),
+            Config::default().with_event_buffer_capacity(2),
+        )?;
+        let pending_send = Arc::new(Notify::new());
+        let source = super::PolymarketLiveData::new(
+            client,
+            crate::MarketTokens::new(market.clone(), U256::from(1_u64), U256::from(2_u64)),
+        )
+        .with_test_send_pending(Arc::clone(&pending_send));
+        let (sink, mut events) = mpsc::channel(1);
+        let source_sink = sink.clone();
+        let source_task =
+            tokio::spawn(async move { source.subscribe(market, Outcome::Up, source_sink).await });
+
+        // When: the adapter drains frames one at a time while the bounded sink temporarily holds
+        // one frame. The fourth frame must wait behind the third rather than being reordered.
+        send_frames(&batches, vec![book_frame(1)]).await?;
+        assert_eq!(receive_book_signal(&mut events).await?, (1, 1));
+        send_frames(&batches, vec![book_frame(2)]).await?;
+        assert_eq!(receive_book_signal(&mut events).await?, (2, 2));
+        send_frames(&batches, vec![book_frame(3)]).await?;
+        wait_for_full(&sink).await?;
+        send_frames(&batches, vec![book_frame(4)]).await?;
+        tokio::time::timeout(Duration::from_secs(1), pending_send.notified())
+            .await
+            .map_err(|_| "timed out waiting for the adapter's blocked sink send")?;
+        assert_eq!(receive_book_signal(&mut events).await?, (3, 3));
+        assert_eq!(receive_book_signal(&mut events).await?, (4, 4));
+
+        // Then: a burst arriving behind a full sink exceeds the configured SDK buffer of two;
+        // the adapter reports the terminal Lagged error instead of silently dropping evidence.
+        send_frames(&batches, vec![book_frame(5)]).await?;
+        wait_for_full(&sink).await?;
+        let burst = (6..=40).map(book_frame).collect::<Vec<_>>();
+        send_frames(&batches, vec![format!("[{}]", burst.join(","))]).await?;
+        assert_eq!(receive_book_signal(&mut events).await?, (5, 5));
+        let result = tokio::time::timeout(Duration::from_secs(2), source_task)
+            .await
+            .map_err(|_| "timed out waiting for terminal lag failure")??;
+        assert!(matches!(
+            result,
+            Err(DataSourceError::Unavailable { message }) if message.contains("lagged")
+        ));
+
+        drop(batches);
+        server.await??;
+        Ok(())
+    }
+
+    async fn send_frames(
+        batches: &mpsc::Sender<Vec<String>>,
+        frames: Vec<String>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        batches.send(frames).await?;
+        Ok(())
+    }
+
+    async fn wait_for_full(
+        sink: &mpsc::Sender<SourceSignal>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sink.capacity() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "timed out waiting for the bounded sink to fill")?;
+        Ok(())
+    }
+
+    async fn receive_book_signal(
+        events: &mut mpsc::Receiver<SourceSignal>,
+    ) -> Result<(i64, i64), Box<dyn std::error::Error + Send + Sync>> {
+        let signal = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .map_err(|_| "timed out waiting for the expected book")?
+            .ok_or("source ended before delivering the expected book")?;
+        let SourceSignal::Data(envelope) = signal else {
+            return Err("expected market data signal".into());
+        };
+        let SourceEnvelope::PmMarket(envelope) = *envelope else {
+            return Err("expected PM market envelope".into());
+        };
+        let MarketEvent::BookUpdate { timestamp_ms, .. } = envelope.fact else {
+            return Err("expected book update".into());
+        };
+        Ok((timestamp_ms, envelope.metadata.frame_sequence))
+    }
+
+    fn book_frame(timestamp: i64) -> String {
+        format!(
+            r#"{{"event_type":"book","asset_id":"1","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"{timestamp}","bids":[{{"price":"0.49","size":"1"}}],"asks":[{{"price":"0.51","size":"1"}}]}}"#
+        )
+    }
+
     #[test]
     fn parse_market_frame_accepts_book_update_json() -> Result<(), Box<dyn std::error::Error>> {
         use crate::MarketTokens;

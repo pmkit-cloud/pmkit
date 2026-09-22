@@ -13,14 +13,14 @@ use pmkit_event::{
 };
 use pmkit_market::{Asset, Exchange, Outcome};
 use pmkit_money::Money;
-use pmkit_runtime::StrategyRegistration;
+use pmkit_runtime::{PartialRiskLimits, RiskLimitOverrides, StrategyRegistration};
 use pmkit_spec::{ConservativeV1Config, PaperRun};
 use pmkit_store::{OwnerScope, TapeStore, TursoTapeStore};
 use pmkit_strategy::{
-    Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
+    Action, Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
 };
 use rust_decimal::Decimal;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -34,6 +34,22 @@ struct BothOutcomesLive;
 struct IdleLive;
 
 struct StaleMarkLive;
+
+struct RiskSequenceLive {
+    books: Vec<(Decimal, Decimal, i64)>,
+}
+
+struct CancelLive;
+
+struct RepeatPlace {
+    seen: usize,
+}
+
+struct RepeatPlaceFactory;
+
+struct RepeatTaker;
+
+struct RepeatTakerFactory;
 
 struct FailingLive;
 
@@ -63,6 +79,25 @@ struct RepeatBuyFactory;
 
 struct MismatchedMarket;
 struct MismatchedMarketFactory;
+
+#[derive(Debug, Clone, Copy)]
+enum ReferenceCancellationAction {
+    Cancel,
+    CancelAll,
+    ReplaceQuotes,
+}
+
+struct ReferenceCancellationLive;
+struct ReferenceCancellationCex;
+
+struct ReferenceCancellationStrategy {
+    action: ReferenceCancellationAction,
+    placed: bool,
+}
+
+struct ReferenceCancellationFactory {
+    action: ReferenceCancellationAction,
+}
 
 fn record_fact(facts: &Mutex<Vec<StrategyFact>>, fact: &StrategyFact) {
     match facts.lock() {
@@ -156,6 +191,47 @@ impl Strategy for FailingStrategy {
 impl StrategyFactory for FailingFactory {
     fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
         Ok(Box::new(FailingStrategy(Arc::clone(&self.0))))
+    }
+}
+
+impl Strategy for RepeatTaker {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        Ok(Actions::place(pmkit_exec::PlaceOrder {
+            market: context.market.clone(),
+            outcome: Outcome::Up,
+            side: pmkit_book::Side::Buy,
+            price: Decimal::new(50, 2),
+            qty: Decimal::from(10),
+            post_only: false,
+            tif: pmkit_exec::TimeInForce::Gtc,
+        }))
+    }
+}
+
+impl StrategyFactory for RepeatTakerFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(RepeatTaker))
+    }
+}
+
+impl Strategy for RepeatPlace {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        self.seen += 1;
+        Ok(Actions::place(pmkit_exec::PlaceOrder {
+            market: context.market.clone(),
+            outcome: Outcome::Up,
+            side: pmkit_book::Side::Buy,
+            price: Decimal::new(45, 2),
+            qty: Decimal::ONE,
+            post_only: true,
+            tif: pmkit_exec::TimeInForce::Gtc,
+        }))
+    }
+}
+
+impl StrategyFactory for RepeatPlaceFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(RepeatPlace { seen: 0 }))
     }
 }
 
@@ -309,6 +385,172 @@ impl LiveDataSource for ScriptedLive {
             .await
             .map_err(|_| DataSourceError::SinkClosed)?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl LiveDataSource for ReferenceCancellationLive {
+    async fn subscribe(
+        &self,
+        market: MarketId,
+        outcome: Outcome,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        if outcome == Outcome::Up {
+            sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
+                market,
+                outcome,
+                bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+                asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
+                timestamp_ms: 100,
+            }))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        }
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+#[async_trait]
+impl LiveCexDataSource for ReferenceCancellationCex {
+    async fn subscribe_reference(&self, sink: Sender<SourceSignal>) -> Result<(), DataSourceError> {
+        sink.send(SourceSignal::Data(Box::new(SourceEnvelope::CexReference(
+            CexReferenceEnvelope {
+                metadata: StreamMetadata {
+                    schema_version: 1,
+                    source_id: "test-reference-cancel".into(),
+                    source_time_ms: 200,
+                    canonical_source_rank: 1,
+                    receipt_time_ms: 200,
+                    connection_id: "test-reference-cancel".into(),
+                    connection_epoch: 0,
+                    frame_sequence: 0,
+                    ingest_sequence: 0,
+                },
+                fact: reference_trade(1, 200, 100),
+            },
+        ))))
+        .await
+        .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+impl Strategy for ReferenceCancellationStrategy {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        if !self.placed
+            && matches!(
+                context.fact,
+                StrategyFact::Market(MarketEvent::BookUpdate { .. })
+            )
+        {
+            self.placed = true;
+            return Ok(Actions::place(pmkit_exec::PlaceOrder {
+                market: context.market.clone(),
+                outcome: Outcome::Up,
+                side: pmkit_book::Side::Buy,
+                price: Decimal::new(45, 2),
+                qty: Decimal::ONE,
+                post_only: true,
+                tif: pmkit_exec::TimeInForce::Gtc,
+            }));
+        }
+        if matches!(context.fact, StrategyFact::Reference(_)) {
+            let mut actions = Actions::none();
+            match self.action {
+                ReferenceCancellationAction::Cancel => {
+                    actions.push(Action::Cancel(pmkit_exec::OrderId("paper-0".into())));
+                }
+                ReferenceCancellationAction::CancelAll => actions.push(Action::CancelAll),
+                ReferenceCancellationAction::ReplaceQuotes => {
+                    actions.push(Action::ReplaceQuotes {
+                        cancel: vec![pmkit_exec::OrderId("paper-0".into())],
+                        place: Vec::new(),
+                    });
+                }
+            }
+            return Ok(actions);
+        }
+        Ok(Actions::none())
+    }
+}
+
+impl StrategyFactory for ReferenceCancellationFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(ReferenceCancellationStrategy {
+            action: self.action,
+            placed: false,
+        }))
+    }
+}
+
+#[async_trait]
+impl LiveDataSource for CancelLive {
+    async fn subscribe(
+        &self,
+        market: MarketId,
+        outcome: Outcome,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        if outcome == Outcome::Up {
+            for timestamp_ms in [1, 2] {
+                sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
+                    market: market.clone(),
+                    outcome,
+                    bids: vec![(Decimal::new(44, 2), Decimal::from(50))],
+                    asks: vec![(Decimal::new(46, 2), Decimal::from(50))],
+                    timestamp_ms,
+                }))
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)?;
+            }
+        }
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+#[async_trait]
+impl LiveDataSource for RiskSequenceLive {
+    async fn subscribe(
+        &self,
+        market: MarketId,
+        outcome: Outcome,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        if outcome == Outcome::Up {
+            for (bid, ask, timestamp_ms) in &self.books {
+                sink.send(SourceSignal::market_event(MarketEvent::BookUpdate {
+                    market: market.clone(),
+                    outcome,
+                    bids: vec![(*bid, Decimal::from(50))],
+                    asks: vec![(*ask, Decimal::from(50))],
+                    timestamp_ms: *timestamp_ms,
+                }))
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)?;
+            }
+        }
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
     }
 }
 
@@ -530,6 +772,127 @@ async fn paper_run_drives_live_feed_to_fill() -> Result<(), Box<dyn std::error::
 }
 
 #[tokio::test]
+async fn paper_risk_gate_counts_resting_order_reservation() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut limits = risk()?;
+    limits.max_open_orders = NonZeroU32::new(1).ok_or("nonzero")?;
+    let run = PaperRun::new(
+        RunId::new("paper-open-order-limit")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        limits,
+        Arc::new(CancelLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("maker")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(RepeatPlaceFactory),
+    ));
+
+    let app = Pmkit::builder(config()?).run(run).start().await?;
+    let RunReport::Paper(report) = app
+        .report(&RunId::new("paper-open-order-limit")?)
+        .ok_or("missing report")?
+    else {
+        return Err("expected a paper report".into());
+    };
+    assert_eq!(report.fills, 0);
+    assert_eq!(report.metrics.rejected, 1);
+    assert_eq!(report.exposure.portfolio_notional, Decimal::new(45, 2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn paper_reference_cancellations_use_event_timestamp()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (action, name) in [
+        (ReferenceCancellationAction::Cancel, "cancel"),
+        (ReferenceCancellationAction::CancelAll, "cancel-all"),
+        (ReferenceCancellationAction::ReplaceQuotes, "replace-quotes"),
+    ] {
+        let directory = tempfile::tempdir()?;
+        let run_id = RunId::new(format!("paper-reference-{name}"))?;
+        let portfolio = PortfolioId::new("alice")?;
+        let market = MarketId::new("btc-5m")?;
+        let store = Arc::new(
+            TursoTapeStore::open_local(directory.path().join(format!("{name}.db"))).await?,
+        );
+        let run = PaperRun::new(
+            run_id.clone(),
+            portfolio.clone(),
+            Money::usdc(10_000),
+            risk()?,
+            Arc::new(ReferenceCancellationLive),
+            ConservativeV1Config {
+                activation_latency: Duration::ZERO,
+                maker_queue_ahead_bps: 0,
+                slippage_bps: 0,
+                market_impact_bps: 0,
+                fee_model: None,
+                market_limits: None,
+            },
+        )
+        .reference_data(Arc::new(ReferenceCancellationCex))
+        .strategy(StrategyRegistration::new(
+            StrategyId::new("canceller")?,
+            market,
+            Arc::new(ReferenceCancellationFactory { action }),
+        ));
+
+        let app = Pmkit::builder(config()?)
+            .storage(store.clone())
+            .run(run)
+            .start()
+            .await?;
+        let RunReport::Paper(report) = app.report(&run_id).ok_or("missing report")? else {
+            return Err("expected a paper report".into());
+        };
+        assert_eq!(report.fills, 0, "{name}");
+        drop(app);
+        let decisions = store
+            .read_decisions(&OwnerScope::new(portfolio, run_id))
+            .await?;
+        let cancellation_decision = decisions
+            .iter()
+            .find(|decision| {
+                decision.identity.source_timestamp_ms == 200
+                    && decision.payload.get("decision").is_some()
+            })
+            .ok_or_else(|| format!("missing {name} cancellation decision"))?;
+        assert_eq!(
+            cancellation_decision.payload["decision"]["kind"], "actions",
+            "{name}"
+        );
+        assert_eq!(
+            cancellation_decision.payload["decision"]["risk"][0]["action_index"], 0,
+            "{name}"
+        );
+        let ledger_timestamps = decisions
+            .iter()
+            .filter(|decision| decision.payload["record_type"] == "paper_ledger")
+            .map(|decision| decision.identity.source_timestamp_ms)
+            .collect::<Vec<_>>();
+        assert_eq!(ledger_timestamps, vec![0, 100, 100, 200], "{name}");
+        let cancellation = decisions
+            .iter()
+            .find(|decision| decision.payload["event"]["kind"] == "order_cancelled")
+            .ok_or_else(|| format!("missing {name} cancellation"))?;
+        assert_eq!(cancellation.identity.source_timestamp_ms, 200, "{name}");
+        assert_eq!(cancellation.payload["timestamp_ms"], 200, "{name}");
+        drop(store);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn paper_run_delivers_reference_facts_once_in_causal_order()
 -> Result<(), Box<dyn std::error::Error>> {
     // Given: a finite reference stream, one failing strategy, and one recorder.
@@ -675,6 +1038,292 @@ async fn paper_reference_rejection_is_durable_and_risk_only()
         reference.payload["decision"]["risk"][0]["verdict"]["reason"],
         "risk gate"
     );
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
+async fn paper_max_loss_breach_survives_restart() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(TursoTapeStore::open_local(directory.path().join("loss-latch.db")).await?);
+    let mut limits = risk()?;
+    limits.max_loss = Money::usdc(1);
+    let first_run = PaperRun::new(
+        RunId::new("paper-loss-latch")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        limits.clone(),
+        Arc::new(RiskSequenceLive {
+            books: vec![
+                (Decimal::new(44, 2), Decimal::new(46, 2), 1),
+                (Decimal::new(4, 2), Decimal::new(6, 2), 2),
+            ],
+        }),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(RepeatTakerFactory),
+    ));
+    let first_app = Pmkit::builder(config()?)
+        .storage(store.clone())
+        .run(first_run)
+        .start()
+        .await?;
+    let RunReport::Paper(first_report) = first_app
+        .report(&RunId::new("paper-loss-latch")?)
+        .ok_or("missing first report")?
+    else {
+        return Err("expected a paper report".into());
+    };
+    assert_eq!(first_report.fills, 1);
+    assert_eq!(first_report.metrics.rejected, 1);
+    drop(first_app);
+
+    let second_run = PaperRun::new(
+        RunId::new("paper-loss-latch")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        limits,
+        Arc::new(RiskSequenceLive {
+            books: vec![(Decimal::new(48, 2), Decimal::new(49, 2), 3)],
+        }),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("buyer")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(RepeatTakerFactory),
+    ));
+    let second_app = Pmkit::builder(config()?)
+        .storage(store.clone())
+        .run(second_run)
+        .start()
+        .await?;
+    let RunReport::Paper(second_report) = second_app
+        .report(&RunId::new("paper-loss-latch")?)
+        .ok_or("missing second report")?
+    else {
+        return Err("expected a paper report".into());
+    };
+    assert_eq!(second_report.fills, 1);
+    assert_eq!(second_report.metrics.rejected, 1);
+    drop(second_app);
+    drop(store);
+    Ok(())
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "restart regression keeps both runs and durable assertions together"
+)]
+async fn paper_strategy_max_loss_latch_survives_recovery_and_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let store =
+        Arc::new(TursoTapeStore::open_local(directory.path().join("override-loss.db")).await?);
+    let strategy = StrategyId::new("override-buyer")?;
+    let market = MarketId::new("btc-5m")?;
+    let mut overrides = RiskLimitOverrides::default();
+    overrides.per_strategy.insert(
+        strategy.clone(),
+        PartialRiskLimits {
+            max_loss: Some(Money::usdc(1)),
+            ..PartialRiskLimits::default()
+        },
+    );
+    let limits = risk()?;
+    let first_run = PaperRun::new(
+        RunId::new("paper-override-loss-latch")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        limits.clone(),
+        Arc::new(RiskSequenceLive {
+            books: vec![
+                (Decimal::new(44, 2), Decimal::new(46, 2), 1),
+                (Decimal::new(4, 2), Decimal::new(6, 2), 2),
+                (Decimal::new(49, 2), Decimal::new(50, 2), 3),
+            ],
+        }),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(
+        StrategyRegistration::new(
+            strategy.clone(),
+            market.clone(),
+            Arc::new(RepeatTakerFactory),
+        )
+        .risk_overrides(overrides.clone()),
+    );
+    let first_app = Pmkit::builder(config()?)
+        .storage(store.clone())
+        .run(first_run)
+        .start()
+        .await?;
+    let RunReport::Paper(first_report) = first_app
+        .report(&RunId::new("paper-override-loss-latch")?)
+        .ok_or("missing first report")?
+    else {
+        return Err("expected a paper report".into());
+    };
+    assert_eq!(first_report.fills, 1);
+    assert_eq!(first_report.metrics.rejected, 2);
+    let scope = OwnerScope::new(
+        PortfolioId::new("alice")?,
+        RunId::new("paper-override-loss-latch")?,
+    );
+    let decisions = store.read_decisions(&scope).await?;
+    assert_eq!(
+        decisions
+            .iter()
+            .filter(|decision| decision.payload["kind"] == "paper-risk-breach")
+            .count(),
+        1
+    );
+    drop(first_app);
+
+    let second_run = PaperRun::new(
+        RunId::new("paper-override-loss-latch")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        limits,
+        Arc::new(RiskSequenceLive {
+            books: vec![(Decimal::new(49, 2), Decimal::new(50, 2), 4)],
+        }),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(
+        StrategyRegistration::new(strategy, market, Arc::new(RepeatTakerFactory))
+            .risk_overrides(overrides),
+    );
+    let second_app = Pmkit::builder(config()?)
+        .storage(store.clone())
+        .run(second_run)
+        .start()
+        .await?;
+    let RunReport::Paper(second_report) = second_app
+        .report(&RunId::new("paper-override-loss-latch")?)
+        .ok_or("missing second report")?
+    else {
+        return Err("expected a paper report".into());
+    };
+    assert_eq!(second_report.fills, 1);
+    assert_eq!(second_report.metrics.rejected, 1);
+    drop(second_app);
+    drop(store);
+    Ok(())
+}
+
+#[tokio::test]
+async fn paper_risk_gate_counts_resting_position_reservation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut limits = risk()?;
+    limits.max_position_notional = Money::from_decimal(Decimal::new(75, 2));
+    let run = PaperRun::new(
+        RunId::new("paper-resting-position-limit")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        limits,
+        Arc::new(CancelLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("maker")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(RepeatPlaceFactory),
+    ));
+
+    let app = Pmkit::builder(config()?).run(run).start().await?;
+    let RunReport::Paper(report) = app
+        .report(&RunId::new("paper-resting-position-limit")?)
+        .ok_or("missing report")?
+    else {
+        return Err("expected a paper report".into());
+    };
+    assert_eq!(report.fills, 0);
+    assert_eq!(report.metrics.rejected, 1);
+    assert_eq!(report.exposure.portfolio_notional, Decimal::new(45, 2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn paper_risk_gate_counts_delayed_position_reservation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut limits = risk()?;
+    limits.max_position_notional = Money::usdc(8);
+    let run = PaperRun::new(
+        RunId::new("paper-delayed-position-limit")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        limits,
+        Arc::new(RiskSequenceLive {
+            books: vec![
+                (Decimal::new(44, 2), Decimal::new(46, 2), 1),
+                (Decimal::new(4, 2), Decimal::new(6, 2), 2),
+            ],
+        }),
+        ConservativeV1Config {
+            activation_latency: Duration::from_millis(100),
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("taker")?,
+        MarketId::new("btc-5m")?,
+        Arc::new(RepeatTakerFactory),
+    ));
+
+    let app = Pmkit::builder(config()?).run(run).start().await?;
+    let RunReport::Paper(report) = app
+        .report(&RunId::new("paper-delayed-position-limit")?)
+        .ok_or("missing report")?
+    else {
+        return Err("expected a paper report".into());
+    };
+    assert_eq!(report.fills, 0);
+    assert_eq!(report.metrics.rejected, 1);
+    assert_eq!(report.exposure.portfolio_notional, Decimal::from(5));
     Ok(())
 }
 

@@ -244,6 +244,7 @@ fn aggregated_risk_enforces_portfolio_market_strategy_and_daily_limits()
             portfolio_notional: Decimal::from(portfolio),
             market_notional: Decimal::from(market),
             strategy_notional: Decimal::from(strategy),
+            pending_position_notional: Decimal::ZERO,
             daily_pnl: Decimal::from(daily_pnl),
             open_orders: 0,
         };

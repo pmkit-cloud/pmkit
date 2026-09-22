@@ -206,6 +206,10 @@ repository, not the long-term target.
 - Store-before-adapt behavior.
 - Historical cursor source backed by stored PM envelopes.
 - Gamma SDK client in `pmkit-api` for market metadata and token/outcome helpers.
+- Gamma event-by-slug discovery retries only timeout, connect, and body transport
+  failures plus HTTP 408/425/429/5xx responses: four total attempts with 250 ms,
+  500 ms, and 1 s delays between attempts, with no total deadline. Other failures
+  remain fail-closed.
 - Typed Chainlink 60-second TWAP SDK subscription normalized into strict PMKit
   evidence; the live source retains no raw wire bytes.
 
