@@ -30,6 +30,87 @@ async fn known_gap_fails_before_segment_listing() -> Result<(), Box<dyn std::err
 }
 
 #[tokio::test]
+async fn nested_known_gap_fails_before_segment_listing_without_signals()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut server = TestServer::new(vec![Response::json(
+        200,
+        r#"{"coverage":"observed","intervals":[{"status":"available","from_ts_ms":0,"to_ts_ms":59999},{"status":"known_gap","from_ts_ms":1000,"to_ts_ms":2000}],"instances":[],"sealed_through_ms":59999,"selector":{"kind":"series","seriesId":"btc-usd-5m"}}"#,
+    )])?;
+    let (tx, mut rx) = mpsc::channel(8);
+    assert_eq!(
+        source(&server)?.replay_cloud(query(), tx).await,
+        Err(CloudReplayError::KnownGap)
+    );
+    assert!(rx.recv().await.is_none());
+    assert_eq!(server.calls(), 1);
+    server.join()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_edge_known_gaps_fail_before_segment_listing_without_signals()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (gap_from, gap_to) in [(-1, 0), (59_999, 60_000)] {
+        let coverage = format!(
+            r#"{{"coverage":"observed","intervals":[{{"status":"available","from_ts_ms":0,"to_ts_ms":59999}},{{"status":"known_gap","from_ts_ms":{gap_from},"to_ts_ms":{gap_to}}}],"instances":[],"sealed_through_ms":59999,"selector":{{"kind":"series","seriesId":"btc-usd-5m"}}}}"#
+        );
+        let mut server = TestServer::new(vec![Response::json(200, &coverage)])?;
+        let (tx, mut rx) = mpsc::channel(8);
+        assert_eq!(
+            source(&server)?.replay_cloud(query(), tx).await,
+            Err(CloudReplayError::KnownGap)
+        );
+        assert!(rx.recv().await.is_none());
+        assert_eq!(server.calls(), 1);
+        server.join()?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn adjacent_known_gaps_are_allowed() -> Result<(), Box<dyn std::error::Error>> {
+    for (gap_from, gap_to) in [(-2, -1), (60_000, 60_001)] {
+        let coverage = format!(
+            r#"{{"coverage":"observed","intervals":[{{"status":"available","from_ts_ms":0,"to_ts_ms":59999}},{{"status":"known_gap","from_ts_ms":{gap_from},"to_ts_ms":{gap_to}}}],"instances":[],"sealed_through_ms":59999,"selector":{{"kind":"series","seriesId":"btc-usd-5m"}}}}"#
+        );
+        let mut server = TestServer::new(vec![
+            Response::json(200, &coverage),
+            Response::json(200, r#"{"next_cursor":null,"segments":[]}"#),
+        ])?;
+        let (tx, mut rx) = mpsc::channel(8);
+        assert_eq!(
+            source(&server)?.replay_cloud(query(), tx).await,
+            Err(CloudReplayError::MalformedResponse)
+        );
+        assert!(rx.recv().await.is_none());
+        assert_eq!(server.calls(), 2);
+        server.join()?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn overlapping_available_intervals_are_contiguous() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut server = TestServer::new(vec![
+        Response::json(
+            200,
+            r#"{"coverage":"observed","intervals":[{"status":"available","from_ts_ms":0,"to_ts_ms":30000},{"status":"available","from_ts_ms":20000,"to_ts_ms":59999}],"instances":[],"sealed_through_ms":59999,"selector":{"kind":"series","seriesId":"btc-usd-5m"}}"#,
+        ),
+        Response::json(200, r#"{"next_cursor":null,"segments":[]}"#),
+    ])?;
+    let (tx, mut rx) = mpsc::channel(8);
+    assert_eq!(
+        source(&server)?.replay_cloud(query(), tx).await,
+        Err(CloudReplayError::MalformedResponse)
+    );
+    assert!(rx.recv().await.is_none());
+    assert_eq!(server.calls(), 2);
+    server.join()?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn empty_coverage_fails_before_segment_listing() -> Result<(), Box<dyn std::error::Error>> {
     let mut server = TestServer::new(vec![Response::json(
         200,

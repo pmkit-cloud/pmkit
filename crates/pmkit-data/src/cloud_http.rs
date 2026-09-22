@@ -253,32 +253,50 @@ fn validate_coverage(
     }
     let from_ms = query.from.timestamp_millis();
     let to_ms = query.to.timestamp_millis();
-    let mut intervals = coverage.intervals.iter().collect::<Vec<_>>();
-    intervals.sort_unstable_by_key(|interval| interval.from_ts_ms);
+    let intervals = coverage
+        .intervals
+        .iter()
+        .map(|interval| {
+            if interval.from_ts_ms > interval.to_ts_ms {
+                return Err(CloudReplayError::MalformedResponse);
+            }
+            let interval_end = interval
+                .to_ts_ms
+                .checked_add(1)
+                .ok_or(CloudReplayError::MalformedResponse)?;
+            Ok((interval, interval_end))
+        })
+        .collect::<Result<Vec<_>, CloudReplayError>>()?;
+
+    if intervals.iter().any(|(interval, interval_end)| {
+        matches!(interval.status, CloudCoverageStatus::KnownGap)
+            && *interval_end > from_ms
+            && interval.from_ts_ms < to_ms
+    }) {
+        return Err(CloudReplayError::KnownGap);
+    }
+
+    let mut available = intervals
+        .into_iter()
+        .filter(|(interval, _)| matches!(interval.status, CloudCoverageStatus::Available))
+        .collect::<Vec<_>>();
+    available.sort_unstable_by_key(|(interval, _)| interval.from_ts_ms);
+
     let mut covered_until = from_ms;
-    for interval in intervals {
-        if interval.from_ts_ms > interval.to_ts_ms {
-            return Err(CloudReplayError::MalformedResponse);
-        }
-        let interval_end = interval
-            .to_ts_ms
-            .checked_add(1)
-            .ok_or(CloudReplayError::MalformedResponse)?;
+    for (interval, interval_end) in available {
         if interval_end <= from_ms || interval.from_ts_ms >= to_ms {
             continue;
-        }
-        if matches!(interval.status, CloudCoverageStatus::KnownGap) {
-            return Err(CloudReplayError::KnownGap);
         }
         if interval.from_ts_ms > covered_until {
             return Err(CloudReplayError::KnownGap);
         }
         covered_until = covered_until.max(interval_end.min(to_ms));
-        if covered_until == to_ms {
-            return Ok(());
-        }
     }
-    Err(CloudReplayError::KnownGap)
+    if covered_until == to_ms {
+        Ok(())
+    } else {
+        Err(CloudReplayError::KnownGap)
+    }
 }
 
 fn validate_identity(query: &CloudReplayQuery, segment: &Segment) -> Result<(), CloudReplayError> {
