@@ -7,12 +7,19 @@ use tokio::sync::mpsc::Sender;
 use pmkit_run::EvidenceRequirement;
 
 use super::{
-    CloudReplayQuery, PmKitCloudDataSource, cloud_cache, cloud_decode,
+    CloudReplayQuery, MAX_REPLAY_SEGMENTS, PmKitCloudDataSource, cloud_cache, cloud_decode,
     cloud_types::{
         CloudCoverage, CloudCoverageStatus, CloudReplayError, CloudReplaySelector, RetrievalState,
     },
 };
 use crate::SourceSignal;
+
+// The API requests 100 rows/page; this also bounds cursor-only page chains.
+pub(super) const MAX_REPLAY_PAGES: usize = 128;
+// Enough for 10k typical IDs plus generous room for long release/segment IDs.
+pub(super) const MAX_REPLAY_METADATA_BYTES: usize = 4 * 1024 * 1024;
+const REPLAY_SEGMENT_ENTRY_OVERHEAD_BYTES: usize =
+    std::mem::size_of::<(String, String)>() + 4 * std::mem::size_of::<usize>();
 
 #[derive(Debug, Deserialize)]
 struct SegmentPage {
@@ -121,11 +128,45 @@ async fn replay_segments(
     }
 
     let mut cursor = None;
+    let mut replay_pages = 0;
+    let mut replay_segments: usize = 0;
+    let mut seen_segment_bytes: usize = 0;
     let mut seen_segments = HashSet::new();
     let mut saw_segment = false;
     loop {
+        if replay_pages >= MAX_REPLAY_PAGES {
+            return Err(CloudReplayError::MalformedResponse);
+        }
         let page_url = range_url(source, "replay/segments", query, cursor.as_deref())?;
         let page = json::<SegmentPage>(source, page_url).await?;
+        replay_pages += 1;
+
+        let next_segment_count = replay_segments
+            .checked_add(page.segments.len())
+            .ok_or(CloudReplayError::MalformedResponse)?;
+        let page_key_bytes = page.segments.iter().try_fold(0usize, |total, segment| {
+            let key_bytes = segment
+                .release_id
+                .len()
+                .checked_add(segment.id.len())
+                .and_then(|bytes| bytes.checked_add(REPLAY_SEGMENT_ENTRY_OVERHEAD_BYTES))
+                .ok_or(CloudReplayError::MalformedResponse)?;
+            total
+                .checked_add(key_bytes)
+                .ok_or(CloudReplayError::MalformedResponse)
+        })?;
+        // Preflight the whole page so a page that crosses either cumulative budget emits nothing.
+        let next_seen_segment_bytes = seen_segment_bytes
+            .checked_add(page_key_bytes)
+            .ok_or(CloudReplayError::MalformedResponse)?;
+        if next_segment_count > MAX_REPLAY_SEGMENTS
+            || next_seen_segment_bytes > MAX_REPLAY_METADATA_BYTES
+        {
+            return Err(CloudReplayError::MalformedResponse);
+        }
+        replay_segments = next_segment_count;
+        seen_segment_bytes = next_seen_segment_bytes;
+
         for segment in page.segments {
             saw_segment = true;
             if !seen_segments.insert((segment.release_id.clone(), segment.id.clone())) {
@@ -136,9 +177,17 @@ async fn replay_segments(
                 RetrievalState::Hot | RetrievalState::ReadyUntil => {}
                 state => return Err(CloudReplayError::RetrievalRequired { state }),
             }
+            if segment.encoded_bytes > cloud_cache::MAX_SEGMENT_BYTES as u64
+                || segment.bytes > cloud_cache::MAX_SEGMENT_BYTES as u64
+            {
+                return Err(CloudReplayError::IntegrityMismatch);
+            }
             let encoded = cloud_cache::encoded_segment(source, &segment).await?;
-            let logical = zstd::stream::decode_all(Cursor::new(encoded.as_ref()))
+            let decoder = zstd::stream::read::Decoder::new(Cursor::new(encoded.as_ref()))
                 .map_err(|_| CloudReplayError::IntegrityMismatch)?;
+            let logical_limit =
+                usize::try_from(segment.bytes).map_err(|_| CloudReplayError::IntegrityMismatch)?;
+            let logical = cloud_cache::read_bounded(decoder, logical_limit)?;
             verify_logical(&segment, &logical)?;
             for signal in cloud_decode::decode(&segment, &logical)? {
                 sink.send(signal)
@@ -172,11 +221,9 @@ async fn json<T: serde::de::DeserializeOwned>(
     source: &PmKitCloudDataSource,
     url: Url,
 ) -> Result<T, CloudReplayError> {
-    request(source, url)
-        .await?
-        .json()
-        .await
-        .map_err(|_| CloudReplayError::MalformedResponse)
+    let response = request(source, url).await?;
+    let body = cloud_cache::read_response_bounded(response, cloud_cache::MAX_SEGMENT_BYTES).await?;
+    serde_json::from_slice(&body).map_err(|_| CloudReplayError::MalformedResponse)
 }
 
 pub(super) async fn request(
@@ -253,32 +300,50 @@ fn validate_coverage(
     }
     let from_ms = query.from.timestamp_millis();
     let to_ms = query.to.timestamp_millis();
-    let mut intervals = coverage.intervals.iter().collect::<Vec<_>>();
-    intervals.sort_unstable_by_key(|interval| interval.from_ts_ms);
+    let intervals = coverage
+        .intervals
+        .iter()
+        .map(|interval| {
+            if interval.from_ts_ms > interval.to_ts_ms {
+                return Err(CloudReplayError::MalformedResponse);
+            }
+            let interval_end = interval
+                .to_ts_ms
+                .checked_add(1)
+                .ok_or(CloudReplayError::MalformedResponse)?;
+            Ok((interval, interval_end))
+        })
+        .collect::<Result<Vec<_>, CloudReplayError>>()?;
+
+    if intervals.iter().any(|(interval, interval_end)| {
+        matches!(interval.status, CloudCoverageStatus::KnownGap)
+            && *interval_end > from_ms
+            && interval.from_ts_ms < to_ms
+    }) {
+        return Err(CloudReplayError::KnownGap);
+    }
+
+    let mut available = intervals
+        .into_iter()
+        .filter(|(interval, _)| matches!(interval.status, CloudCoverageStatus::Available))
+        .collect::<Vec<_>>();
+    available.sort_unstable_by_key(|(interval, _)| interval.from_ts_ms);
+
     let mut covered_until = from_ms;
-    for interval in intervals {
-        if interval.from_ts_ms > interval.to_ts_ms {
-            return Err(CloudReplayError::MalformedResponse);
-        }
-        let interval_end = interval
-            .to_ts_ms
-            .checked_add(1)
-            .ok_or(CloudReplayError::MalformedResponse)?;
+    for (interval, interval_end) in available {
         if interval_end <= from_ms || interval.from_ts_ms >= to_ms {
             continue;
-        }
-        if matches!(interval.status, CloudCoverageStatus::KnownGap) {
-            return Err(CloudReplayError::KnownGap);
         }
         if interval.from_ts_ms > covered_until {
             return Err(CloudReplayError::KnownGap);
         }
         covered_until = covered_until.max(interval_end.min(to_ms));
-        if covered_until == to_ms {
-            return Ok(());
-        }
     }
-    Err(CloudReplayError::KnownGap)
+    if covered_until == to_ms {
+        Ok(())
+    } else {
+        Err(CloudReplayError::KnownGap)
+    }
 }
 
 fn validate_identity(query: &CloudReplayQuery, segment: &Segment) -> Result<(), CloudReplayError> {

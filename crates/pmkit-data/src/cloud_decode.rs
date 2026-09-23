@@ -6,7 +6,11 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{cloud_http::Segment, cloud_types::CloudReplayError};
+use super::{cloud_cache, cloud_http::Segment, cloud_types::CloudReplayError};
+
+// ponytail: 1 MiB rows and 64K events cap per-segment decode overhead; raise only with a measured memory budget.
+pub(super) const MAX_NDJSON_ROW_BYTES: usize = cloud_cache::MAX_SEGMENT_BYTES / 64;
+pub(super) const MAX_DECODED_EVENTS: usize = cloud_cache::MAX_SEGMENT_BYTES / 1024;
 use crate::SourceSignal;
 
 #[derive(Deserialize)]
@@ -21,6 +25,11 @@ pub(super) fn decode(
     segment: &Segment,
     bytes: &[u8],
 ) -> Result<Vec<SourceSignal>, CloudReplayError> {
+    if segment.bytes > cloud_cache::MAX_SEGMENT_BYTES as u64
+        || bytes.len() > cloud_cache::MAX_SEGMENT_BYTES
+    {
+        return Err(CloudReplayError::IntegrityMismatch);
+    }
     let market =
         MarketId::new(&segment.market_id).map_err(|_| CloudReplayError::MalformedResponse)?;
     let mut signals = Vec::new();
@@ -30,6 +39,9 @@ pub(super) fn decode(
         .filter(|line| !line.is_empty())
         .enumerate()
     {
+        if index >= MAX_DECODED_EVENTS || line.len() > MAX_NDJSON_ROW_BYTES {
+            return Err(CloudReplayError::MalformedResponse);
+        }
         let row =
             serde_json::from_slice::<Row>(line).map_err(|_| CloudReplayError::MalformedResponse)?;
         if row.event_time_ms < segment.from_ts_ms

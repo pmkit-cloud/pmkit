@@ -22,6 +22,8 @@ pub use cloud_types::{
 };
 
 const PRODUCTION_BASE_URL: &str = "https://pmkit.cloud/v1";
+// Allows 100 full API pages while bounding unique replay and cache entries.
+const MAX_REPLAY_SEGMENTS: usize = 10_000;
 
 /// A `PMKit` Cloud API key that never exposes its value through formatting.
 #[derive(Clone)]

@@ -312,6 +312,149 @@ async fn historical_replay_allows_single_source_and_emits_one_terminal_pair_for_
 }
 
 #[tokio::test]
+async fn replay_page_cap_rejects_a_long_cursor_chain_without_signals()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut responses = vec![Response::json(200, available_coverage())];
+    for page in 0..super::cloud_http::MAX_REPLAY_PAGES {
+        responses.push(Response::json(
+            200,
+            &format!(r#"{{"next_cursor":"page-{page}","segments":[]}}"#),
+        ));
+    }
+    let mut server = TestServer::new(responses)?;
+    let source = PmKitCloudDataSource::with_base_url(
+        CloudApiKey::new("secret-value")?,
+        &format!("{}/v1", server.url),
+    )?;
+    let (tx, mut rx) = mpsc::channel(8);
+
+    assert_eq!(
+        source.replay_cloud(query(), tx).await,
+        Err(super::CloudReplayError::MalformedResponse)
+    );
+    assert!(rx.recv().await.is_none());
+    assert_eq!(server.calls(), super::cloud_http::MAX_REPLAY_PAGES + 1);
+    server.join()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cumulative_segment_cap_rejects_the_page_before_emitting_its_events()
+-> Result<(), Box<dyn std::error::Error>> {
+    let logical = br#"{"event_time_ms":1000,"event_ordinal":7,"payload":{"event_type":"book","asset_id":"token-up","bids":[],"asks":[]}}
+"#;
+    let encoded = zstd::stream::encode_all(logical.as_slice(), 0)?;
+    let logical_sha = digest(logical);
+    let encoded_sha = digest(&encoded);
+    let first_page = segment_page(
+        "hot",
+        logical.len(),
+        &logical_sha,
+        encoded.len(),
+        &encoded_sha,
+        Some("page-2"),
+    );
+    let second_page = metadata_listing_page(
+        &(0..super::MAX_REPLAY_SEGMENTS)
+            .map(|index| metadata_segment(&format!("release-{index}"), &format!("segment-{index}")))
+            .collect::<Vec<_>>()
+            .join(","),
+        None,
+    );
+    let mut server = TestServer::new(vec![
+        Response::json(200, available_coverage()),
+        Response::json(200, &first_page),
+        Response::bytes(200, encoded, &encoded_sha, &logical_sha),
+        Response::json(200, &second_page),
+    ])?;
+    let source = PmKitCloudDataSource::with_base_url(
+        CloudApiKey::new("secret-value")?,
+        &format!("{}/v1", server.url),
+    )?;
+    let (tx, mut rx) = mpsc::channel(8);
+
+    assert_eq!(
+        source.replay_cloud(query(), tx).await,
+        Err(super::CloudReplayError::MalformedResponse)
+    );
+    let mut data_signals = 0;
+    let mut terminal_signals = 0;
+    while let Some(signal) = rx.recv().await {
+        match signal {
+            SourceSignal::Data(_) => data_signals += 1,
+            SourceSignal::Watermark(_) | SourceSignal::Eof => terminal_signals += 1,
+        }
+    }
+    assert_eq!(
+        data_signals, 1,
+        "only the already-accepted page was emitted"
+    );
+    assert_eq!(
+        terminal_signals, 0,
+        "failed replay has no completion signals"
+    );
+    assert_eq!(server.calls(), 4, "rejected page is not downloaded");
+    server.join()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cumulative_segment_key_budget_rejects_a_page_before_its_events()
+-> Result<(), Box<dyn std::error::Error>> {
+    let logical = br#"{"event_time_ms":1000,"event_ordinal":7,"payload":{"event_type":"book","asset_id":"token-up","bids":[],"asks":[]}}
+"#;
+    let encoded = zstd::stream::encode_all(logical.as_slice(), 0)?;
+    let logical_sha = digest(logical);
+    let encoded_sha = digest(&encoded);
+    let first_page = segment_page(
+        "hot",
+        logical.len(),
+        &logical_sha,
+        encoded.len(),
+        &encoded_sha,
+        Some("page-2"),
+    );
+    let large_release = "r".repeat(super::cloud_http::MAX_REPLAY_METADATA_BYTES);
+    let second_page =
+        metadata_listing_page(&metadata_segment(&large_release, "segment-large"), None);
+    let mut server = TestServer::new(vec![
+        Response::json(200, available_coverage()),
+        Response::json(200, &first_page),
+        Response::bytes(200, encoded, &encoded_sha, &logical_sha),
+        Response::json(200, &second_page),
+    ])?;
+    let source = PmKitCloudDataSource::with_base_url(
+        CloudApiKey::new("secret-value")?,
+        &format!("{}/v1", server.url),
+    )?;
+    let (tx, mut rx) = mpsc::channel(8);
+
+    assert_eq!(
+        source.replay_cloud(query(), tx).await,
+        Err(super::CloudReplayError::MalformedResponse)
+    );
+    let mut data_signals = 0;
+    let mut terminal_signals = 0;
+    while let Some(signal) = rx.recv().await {
+        match signal {
+            SourceSignal::Data(_) => data_signals += 1,
+            SourceSignal::Watermark(_) | SourceSignal::Eof => terminal_signals += 1,
+        }
+    }
+    assert_eq!(
+        data_signals, 1,
+        "only the already-accepted page was emitted"
+    );
+    assert_eq!(
+        terminal_signals, 0,
+        "failed replay has no completion signals"
+    );
+    assert_eq!(server.calls(), 4, "rejected page is not downloaded");
+    server.join()?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn pagination_uses_the_cursor_from_the_previous_page()
 -> Result<(), Box<dyn std::error::Error>> {
     let logical = br#"{"event_time_ms":1000,"event_ordinal":7,"payload":{"event_type":"book","asset_id":"token-up","bids":[],"asks":[]}}
@@ -350,6 +493,18 @@ async fn pagination_uses_the_cursor_from_the_previous_page()
     );
     server.join()?;
     Ok(())
+}
+
+fn metadata_segment(release_id: &str, segment_id: &str) -> String {
+    format!(
+        r#"{{"bytes":0,"encoded_bytes":0,"encoded_sha256":"","from_ts_ms":1000,"release_id":"{release_id}","segment_id":"{segment_id}","sha256":"","to_ts_ms":1000,"market_id":"market-1","series_id":"btc-usd-5m","outcome_tokens":[{{"outcome":"up","token_id":"token-up"}}],"availability":{{"state":"hot"}}}}"#
+    )
+}
+
+fn metadata_listing_page(segments: &str, next_cursor: Option<&str>) -> String {
+    let next_cursor =
+        next_cursor.map_or_else(|| "null".to_owned(), |cursor| format!("\"{cursor}\""));
+    format!(r#"{{"next_cursor":{next_cursor},"segments":[{segments}]}}"#)
 }
 
 fn available_coverage() -> &'static str {
