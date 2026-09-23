@@ -1,5 +1,7 @@
 use super::{LiveRiskState, Reservation, StartError, correlation_strategy, query_order_status};
+use pmkit_book::Side;
 use pmkit_exec::{ExecError, OrderId, OrderStatus, OrderStatusDetails};
+use pmkit_market::Outcome;
 use pmkit_runtime::{RuntimeConfig, StrategyRegistration};
 use pmkit_spec::LiveRun;
 use pmkit_store::{DurableIntent, OwnerScope, StoreError, TapeStore};
@@ -100,6 +102,8 @@ struct IntentPayload {
 #[derive(Deserialize)]
 struct IntentOrder {
     market: String,
+    outcome: String,
+    side: String,
     price: Decimal,
     qty: Decimal,
 }
@@ -108,6 +112,8 @@ pub(super) struct DurableOrder {
     pub(super) order_id: OrderId,
     pub(super) strategy: pmkit_core::StrategyId,
     pub(super) market: pmkit_core::MarketId,
+    pub(super) outcome: Outcome,
+    pub(super) side: Side,
     pub(super) price: Decimal,
     pub(super) qty: Decimal,
 }
@@ -133,6 +139,16 @@ fn durable_order(
     }
     let strategy = correlation_strategy(decision_correlation, registrations)
         .ok_or_else(|| corrupt_order("intent strategy is missing or ambiguous"))?;
+    let outcome = match payload.order.outcome.as_str() {
+        "Up" => Outcome::Up,
+        "Down" => Outcome::Down,
+        _ => return Err(corrupt_order("order outcome is invalid")),
+    };
+    let side = match payload.order.side.as_str() {
+        "buy" => Side::Buy,
+        "sell" => Side::Sell,
+        _ => return Err(corrupt_order("order side is invalid")),
+    };
     let market = pmkit_core::MarketId::new(payload.order.market)
         .map_err(|error| corrupt_order(error.to_string()))?;
     if registrations
@@ -153,6 +169,8 @@ fn durable_order(
         order_id: OrderId(payload.venue_order_id),
         strategy,
         market,
+        outcome,
+        side,
         price: payload.order.price,
         qty: payload.order.qty,
     })
@@ -241,6 +259,8 @@ pub(super) async fn reconstruct_accepted_orders(
                     Reservation {
                         strategy: order.strategy,
                         market: order.market,
+                        outcome: order.outcome,
+                        side: order.side,
                         price: order.price,
                         remaining_qty,
                     },

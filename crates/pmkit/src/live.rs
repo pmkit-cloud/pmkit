@@ -5,7 +5,7 @@ use super::{
 };
 use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_accounting::{ExposureReservation, aggregate_exposure};
-use pmkit_book::OrderBookL2;
+use pmkit_book::{OrderBookL2, Side};
 use pmkit_event::{
     CexReferenceEvent, FillIdentity, MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact,
     StreamMetadata,
@@ -398,6 +398,8 @@ enum PlaceFailure {
 struct Reservation {
     strategy: pmkit_core::StrategyId,
     market: pmkit_core::MarketId,
+    outcome: Outcome,
+    side: Side,
     price: rust_decimal::Decimal,
     remaining_qty: rust_decimal::Decimal,
 }
@@ -406,6 +408,23 @@ impl Reservation {
     fn notional(&self) -> rust_decimal::Decimal {
         self.remaining_qty * self.price
     }
+}
+
+fn pending_position_notional(
+    reservations: &HashMap<String, Reservation>,
+    market: &pmkit_core::MarketId,
+    outcome: Outcome,
+    side: Side,
+) -> rust_decimal::Decimal {
+    reservations
+        .values()
+        .filter(|reservation| {
+            reservation.market == *market
+                && reservation.outcome == outcome
+                && reservation.side == side
+        })
+        .map(Reservation::notional)
+        .sum()
 }
 
 fn apply_reservation_fill(
@@ -535,13 +554,19 @@ async fn submit_live_order(
         .filter(|reservation| reservation.strategy == *context.strategy)
         .map(Reservation::notional)
         .sum();
+    let reserved_position_notional = pending_position_notional(
+        context.reservations,
+        context.market,
+        order.outcome,
+        order.side,
+    );
     let exposure = context
         .portfolio_daily_pnl
         .map(|daily_pnl| PortfolioRiskExposure {
             portfolio_notional: context.risk_state.portfolio_notional() + reserved_portfolio,
             market_notional: context.risk_state.market_notional(context.market) + reserved_market,
             strategy_notional: reserved_strategy,
-            pending_position_notional: rust_decimal::Decimal::ZERO,
+            pending_position_notional: reserved_position_notional,
             daily_pnl,
             open_orders: context.open_orders.len(),
         });
@@ -606,6 +631,8 @@ async fn submit_live_order(
                 Reservation {
                     strategy: context.strategy.clone(),
                     market: context.market.clone(),
+                    outcome: order.outcome,
+                    side: order.side,
                     price: order.price,
                     remaining_qty: order.qty,
                 },
@@ -641,9 +668,16 @@ async fn submit_live_order(
 
 #[cfg(test)]
 mod reservation_tests {
-    use super::{Reservation, apply_reservation_fill};
+    use super::{
+        PortfolioRiskExposure, Reservation, apply_reservation_fill, passes_aggregated_risk,
+        pending_position_notional,
+    };
+    use crate::test_support::risk;
+    use pmkit_book::Side;
     use pmkit_core::{MarketId, StrategyId};
-    use pmkit_exec::OrderId;
+    use pmkit_exec::{OrderId, PlaceOrder, TimeInForce};
+    use pmkit_market::Outcome;
+    use pmkit_money::Money;
     use rust_decimal::Decimal;
     use std::collections::{HashMap, HashSet};
 
@@ -655,6 +689,8 @@ mod reservation_tests {
             Reservation {
                 strategy: StrategyId::new("maker")?,
                 market: MarketId::new("btc-5m")?,
+                outcome: Outcome::Up,
+                side: Side::Buy,
                 price: Decimal::new(5, 1),
                 remaining_qty: Decimal::from(10),
             },
@@ -692,6 +728,8 @@ mod reservation_tests {
             Reservation {
                 strategy: StrategyId::new("maker")?,
                 market: MarketId::new("btc-5m")?,
+                outcome: Outcome::Up,
+                side: Side::Buy,
                 price: Decimal::new(5, 1),
                 remaining_qty: Decimal::from(5),
             },
@@ -710,6 +748,78 @@ mod reservation_tests {
         assert!(result.is_err());
         assert_eq!(reservations["order-1"].remaining_qty, Decimal::from(5));
         assert!(open_orders.contains(&OrderId("order-1".to_owned())));
+        Ok(())
+    }
+
+    #[test]
+    fn pending_same_side_orders_block_repeated_position_exposure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Given: one resting buy plus unrelated sides, outcomes, and markets.
+        let market = MarketId::new("btc-5m")?;
+        let strategy = StrategyId::new("maker")?;
+        let reservation = |market, outcome, side| Reservation {
+            strategy: strategy.clone(),
+            market,
+            outcome,
+            side,
+            price: Decimal::new(5, 1),
+            remaining_qty: Decimal::from(6),
+        };
+        let reservations = HashMap::from([
+            (
+                "same-side".to_owned(),
+                reservation(market.clone(), Outcome::Up, Side::Buy),
+            ),
+            (
+                "opposite-side".to_owned(),
+                reservation(market.clone(), Outcome::Up, Side::Sell),
+            ),
+            (
+                "other-outcome".to_owned(),
+                reservation(market.clone(), Outcome::Down, Side::Buy),
+            ),
+            (
+                "other-market".to_owned(),
+                reservation(MarketId::new("eth-5m")?, Outcome::Up, Side::Buy),
+            ),
+        ]);
+        let order = PlaceOrder {
+            market: market.clone(),
+            outcome: Outcome::Up,
+            side: Side::Buy,
+            price: Decimal::new(5, 1),
+            qty: Decimal::from(6),
+            post_only: false,
+            tif: TimeInForce::Gtc,
+        };
+        let pending = pending_position_notional(&reservations, &market, order.outcome, order.side);
+        assert_eq!(pending, Decimal::from(3));
+
+        // When: the matching resting buy is included in the max-position check.
+        let mut limits = risk()?;
+        limits.max_position_notional = Money::usdc(5);
+        let exposure = |pending_position_notional| PortfolioRiskExposure {
+            portfolio_notional: Decimal::ZERO,
+            market_notional: Decimal::ZERO,
+            strategy_notional: Decimal::ZERO,
+            pending_position_notional,
+            daily_pnl: Decimal::ZERO,
+            open_orders: 0,
+        };
+
+        // Then: the second buy passes alone, but not alongside the resting buy.
+        assert!(passes_aggregated_risk(
+            &order,
+            &limits,
+            &[],
+            exposure(Decimal::ZERO),
+        ));
+        assert!(!passes_aggregated_risk(
+            &order,
+            &limits,
+            &[],
+            exposure(pending),
+        ));
         Ok(())
     }
 }
@@ -1742,6 +1852,8 @@ mod recovery_tests {
             order_id: OrderId("venue-delta".into()),
             strategy: strategy.clone(),
             market: market.clone(),
+            outcome: Outcome::Up,
+            side: pmkit_book::Side::Buy,
             price: Decimal::new(50, 2),
             qty: Decimal::from(10),
         };
