@@ -1,7 +1,13 @@
+use std::{collections::HashMap, sync::Arc};
+
 use reqwest::Url;
 
 pub(super) const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 pub(super) const MAX_SEGMENT_BYTES: usize = MAX_CACHE_BYTES;
+// Retain at most one replay's segment cardinality, even when payloads are tiny.
+const MAX_CACHE_ENTRIES: usize = super::MAX_REPLAY_SEGMENTS;
+// Covers map storage and allocation overhead in addition to key capacity and payload bytes.
+const CACHE_ENTRY_OVERHEAD_BYTES: usize = 128;
 
 use super::{
     PmKitCloudDataSource,
@@ -54,16 +60,41 @@ pub(super) async fn encoded_segment(
     {
         return Err(CloudReplayError::IntegrityMismatch);
     }
-    let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
-    if bytes.len() <= MAX_CACHE_BYTES {
-        let cached_bytes = cache.values().map(|value| value.len()).sum::<usize>();
-        if cached_bytes.saturating_add(bytes.len()) > MAX_CACHE_BYTES {
-            // ponytail: purge-all eviction keeps this cache bounded without an LRU dependency.
-            cache.clear();
-        }
-        cache.insert(cache_key, bytes.clone());
-    }
+    let bytes: Arc<[u8]> = Arc::from(bytes);
+    insert_cached(&mut cache, cache_key, bytes.clone());
     Ok(bytes)
+}
+
+fn insert_cached(cache: &mut HashMap<String, Arc<[u8]>>, key: String, bytes: Arc<[u8]>) {
+    insert_cached_with_limit(cache, key, bytes, MAX_CACHE_BYTES);
+}
+
+fn insert_cached_with_limit(
+    cache: &mut HashMap<String, Arc<[u8]>>,
+    key: String,
+    bytes: Arc<[u8]>,
+    max_cache_bytes: usize,
+) {
+    let entry_bytes = cache_entry_bytes(key.capacity(), bytes.len());
+    if entry_bytes > max_cache_bytes {
+        return;
+    }
+    let cached_bytes = cache.iter().fold(0usize, |total, (key, bytes)| {
+        total.saturating_add(cache_entry_bytes(key.capacity(), bytes.len()))
+    });
+    if cache.len() >= MAX_CACHE_ENTRIES
+        || cached_bytes.saturating_add(entry_bytes) > max_cache_bytes
+    {
+        // ponytail: purge-all eviction keeps this cache bounded without an LRU dependency.
+        cache.clear();
+    }
+    cache.insert(key, bytes);
+}
+
+const fn cache_entry_bytes(key_capacity: usize, payload_bytes: usize) -> usize {
+    key_capacity
+        .saturating_add(payload_bytes)
+        .saturating_add(CACHE_ENTRY_OVERHEAD_BYTES)
 }
 
 pub(super) async fn read_response_bounded(
@@ -132,4 +163,132 @@ pub(super) fn digest(bytes: &[u8]) -> String {
     use sha2::{Digest as _, Sha256};
 
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CACHE_ENTRY_OVERHEAD_BYTES, MAX_CACHE_ENTRIES, cache_entry_bytes, insert_cached,
+        insert_cached_with_limit,
+    };
+    use std::{collections::HashMap, sync::Arc};
+
+    #[test]
+    fn byte_budget_evicts_based_on_key_capacity() {
+        let mut cache: HashMap<String, Arc<[u8]>> = HashMap::new();
+        let first_key = "a".repeat(512);
+        let second_key = "b".repeat(512);
+        let max_key_capacity = first_key.capacity().max(second_key.capacity());
+        // Each key fits, but the sum of their capacities does not. Payload-only accounting
+        // would incorrectly retain both tiny entries under this budget.
+        let byte_limit = max_key_capacity + 256;
+        let payload: Arc<[u8]> = Arc::from([0_u8].as_slice());
+
+        insert_cached_with_limit(&mut cache, first_key.clone(), payload.clone(), byte_limit);
+        insert_cached_with_limit(&mut cache, second_key.clone(), payload, byte_limit);
+
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.contains_key(&first_key));
+        assert!(cache.contains_key(&second_key));
+    }
+
+    #[test]
+    fn byte_budget_evicts_based_on_per_entry_overhead() {
+        let mut cache: HashMap<String, Arc<[u8]>> = HashMap::new();
+        let first_key = String::from("a");
+        let second_key = String::from("b");
+        let max_key_capacity = first_key.capacity().max(second_key.capacity());
+        // Fixed per-entry overhead pushes both otherwise tiny entries over the budget.
+        let byte_limit = max_key_capacity + 256;
+        let payload: Arc<[u8]> = Arc::from([0_u8].as_slice());
+
+        insert_cached_with_limit(&mut cache, first_key.clone(), payload.clone(), byte_limit);
+        insert_cached_with_limit(&mut cache, second_key.clone(), payload, byte_limit);
+
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.contains_key(&first_key));
+        assert!(cache.contains_key(&second_key));
+    }
+
+    #[test]
+    fn over_budget_entry_is_not_cached_or_evicting_existing_entries() {
+        let mut cache: HashMap<String, Arc<[u8]>> = HashMap::new();
+        let byte_limit = 256;
+        let kept_key = String::from("keep");
+        insert_cached_with_limit(
+            &mut cache,
+            kept_key.clone(),
+            Arc::from([0_u8].as_slice()),
+            byte_limit,
+        );
+        assert!(cache.contains_key(&kept_key));
+
+        let oversized_key = "x".repeat(byte_limit);
+        insert_cached_with_limit(
+            &mut cache,
+            oversized_key.clone(),
+            Arc::from([1_u8].as_slice()),
+            byte_limit,
+        );
+
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&kept_key));
+        assert!(!cache.contains_key(&oversized_key));
+    }
+
+    #[test]
+    fn over_budget_payload_is_not_cached_or_evicting_existing_entries() {
+        let mut cache: HashMap<String, Arc<[u8]>> = HashMap::new();
+        let byte_limit = 256;
+        let kept_key = String::from("keep");
+        insert_cached_with_limit(
+            &mut cache,
+            kept_key.clone(),
+            Arc::from([0_u8].as_slice()),
+            byte_limit,
+        );
+        assert!(cache.contains_key(&kept_key));
+
+        let oversized_key = String::from("large-payload");
+        let oversized_payload = Arc::<[u8]>::from(vec![1_u8; byte_limit]);
+        insert_cached_with_limit(
+            &mut cache,
+            oversized_key.clone(),
+            oversized_payload,
+            byte_limit,
+        );
+
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&kept_key));
+        assert!(!cache.contains_key(&oversized_key));
+    }
+
+    #[test]
+    fn many_tiny_unique_keys_hit_the_cache_entry_cap() {
+        let mut cache: HashMap<String, Arc<[u8]>> = HashMap::with_capacity(MAX_CACHE_ENTRIES);
+        for index in 0..MAX_CACHE_ENTRIES {
+            cache.insert(
+                format!("release:segment-{index}:digest"),
+                Arc::from([0_u8].as_slice()),
+            );
+        }
+
+        let payload_bytes = cache.values().map(|bytes| bytes.len()).sum::<usize>();
+        let accounted_bytes = cache.iter().fold(0usize, |total, (key, bytes)| {
+            total.saturating_add(cache_entry_bytes(key.capacity(), bytes.len()))
+        });
+        assert_eq!(payload_bytes, MAX_CACHE_ENTRIES);
+        assert!(accounted_bytes >= payload_bytes + MAX_CACHE_ENTRIES * CACHE_ENTRY_OVERHEAD_BYTES);
+
+        insert_cached(
+            &mut cache,
+            "release:new:digest".to_owned(),
+            Arc::from([1_u8].as_slice()),
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            cache.get("release:new:digest").map(AsRef::as_ref),
+            Some(&[1][..])
+        );
+    }
 }
