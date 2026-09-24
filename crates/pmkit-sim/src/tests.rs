@@ -52,6 +52,19 @@ fn taker_buy_fills_immediately() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn taker_without_a_book_never_fills() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = SimEngine::new("paper", 0, MarketCategory::Crypto);
+
+    assert!(
+        engine
+            .submit(&order(Side::Buy, Decimal::new(50, 2), false)?, 100)
+            .is_none()
+    );
+    assert!(engine.drain_fills().is_empty());
+    Ok(())
+}
+
+#[test]
 fn maker_rests_then_fills_when_crossed() -> Result<(), Box<dyn std::error::Error>> {
     let mut engine = SimEngine::new("paper", 0, MarketCategory::Crypto);
     engine.update_book(&MarketId::new("btc-5m")?, Outcome::Up, ask_book());

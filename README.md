@@ -133,6 +133,38 @@ for live and Binance Vision `aggTrades` for history. The cache:
 Bybit and other exchanges return `HistoryUnavailable` until a matched official
 archive exists. PMKit does not use BBO, depth, or `@trade` as strategy input.
 
+### Cloud BTC 5m replay
+
+`PmKitCloudDataSource` uses the public Cloud API only. Supply an API key, then
+use it as the historical source in a `ReplaySpec` for a BTC 5m backtest:
+
+```rust,no_run
+use std::sync::Arc;
+
+use pmkit_data::{CloudApiKey, PmKitCloudDataSource};
+use pmkit_run::{EvidenceRequirement, RetrievalWait};
+use pmkit_spec::ReplaySpec;
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let source = Arc::new(PmKitCloudDataSource::new(CloudApiKey::new(
+    std::env::var("PMKIT_CLOUD_API_KEY")?,
+)?)?);
+let replay = ReplaySpec::new(
+    source,
+    "2026-08-01T00:00:00Z".parse()?,
+    "2026-08-01T01:00:00Z".parse()?,
+    EvidenceRequirement::CorroboratedOnly,
+    RetrievalWait::ReturnPending,
+);
+let _ = replay; // Pass `replay` to `BacktestRun::new`.
+# Ok(())
+# }
+```
+
+The source checks coverage before listing segments, returns archive retrieval
+states without starting a restore, verifies encoded and logical SHA-256
+digests, and reuses immutable frames by release, segment, and encoded digest.
+
 ### Whole-database deletion
 
 `TursoTapeStore::delete_database()` removes the local SQLite database and all

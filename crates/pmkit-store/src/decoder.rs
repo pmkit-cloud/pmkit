@@ -216,8 +216,10 @@ fn decode_erc1155_transfer_batch(raw: &RawRpcLog) -> Result<ChainEvent, DecodeEr
     }
     let transfers = ids
         .as_bytes()
-        .chunks_exact(64)
-        .zip(values.as_bytes().chunks_exact(64))
+        .as_chunks::<64>()
+        .0
+        .iter()
+        .zip(values.as_bytes().as_chunks::<64>().0.iter())
         .map(|(asset_id, amount)| {
             let asset_id = std::str::from_utf8(asset_id)
                 .map_err(|_| malformed("ERC-1155 asset ID is not hex"))?;

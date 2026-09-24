@@ -82,11 +82,7 @@ pub fn agree_on_finalized_log_batches(
             .filter(|batch| valid_for_agreed_head(batch) && batches_agree(candidate, batch))
             .count()
     };
-    let largest_agreement_count = batches
-        .iter()
-        .map(agreement_count)
-        .max()
-        .map_or(0, |count| count);
+    let largest_agreement_count = batches.iter().map(agreement_count).max().unwrap_or(0);
     if let Some(agreed) = batches
         .iter()
         .find(|candidate| agreement_count(candidate) >= required_provider_count)
