@@ -13,6 +13,8 @@
 //! Raw PM frame sources (`PmMarketFrameSource`, `PmAccountFrameSource`) deliver
 //! byte-identical provider text before venue adaptation for lossless storage.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use pmkit_core::{MarketId, PortfolioId};
@@ -115,6 +117,42 @@ pub enum DataSourceError {
         /// Why the stream cannot safely continue.
         message: String,
     },
+}
+
+/// Heartbeat cadence for production live sources.
+///
+/// A source emits a watermark at this cadence while its socket is alive. The
+/// merge never advances a quiet source without one of these source-owned
+/// heartbeats.
+pub const LIVE_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
+
+/// Maximum source-event lateness covered by a production live watermark.
+///
+/// Live adapters derive heartbeats from their local receipt clock. An adapter
+/// must not emit a watermark unless it can exclude source events older than
+/// this bound.
+pub const LIVE_MAX_LATENESS_MS: i64 = 5_000;
+
+/// Returns a bounded live watermark for a received frame's metadata.
+#[must_use]
+pub const fn live_watermark(receipt_time_ms: i64) -> i64 {
+    receipt_time_ms.saturating_sub(LIVE_MAX_LATENESS_MS)
+}
+
+/// Returns the current wall-clock timestamp used by live source heartbeats.
+#[must_use]
+pub fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
+        .unwrap_or(i64::MAX)
+}
+
+/// Returns a bounded live watermark from the current receipt clock.
+#[must_use]
+pub fn live_watermark_now() -> i64 {
+    live_watermark(now_ms())
 }
 
 /// A source lifecycle signal consumed by the deterministic merge boundary.

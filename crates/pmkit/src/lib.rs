@@ -21,7 +21,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::{sync::mpsc, task::JoinSet};
+use tokio::{
+    sync::{Notify, mpsc},
+    task::JoinSet,
+};
 
 use pmkit_accounting::PortfolioExposure;
 use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
@@ -306,9 +309,19 @@ pub enum RuntimeError {
 /// Cloneable. Calling [`Cancellation::cancel`] stops each run at its next event
 /// boundary; a cancelled run still returns its partial report and, for live
 /// runs, still applies its configured shutdown policy.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Cancellation {
     flag: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl Default for Cancellation {
+    fn default() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
 }
 
 impl Cancellation {
@@ -320,13 +333,30 @@ impl Cancellation {
 
     /// Requests cancellation of every run sharing this token.
     pub fn cancel(&self) {
-        self.flag.store(true, Ordering::SeqCst);
+        if !self.flag.swap(true, Ordering::SeqCst) {
+            self.notify.notify_waiters();
+        }
     }
 
     /// Returns `true` once cancellation has been requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.flag.load(Ordering::SeqCst)
+    }
+
+    pub(crate) async fn wait(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -364,6 +394,10 @@ pub(crate) struct RunControl {
 impl RunControl {
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancel.as_ref().is_some_and(Cancellation::is_cancelled)
+    }
+
+    pub(crate) fn cancellation(&self) -> Option<Cancellation> {
+        self.cancel.clone()
     }
 
     pub(crate) fn emit(&self, event: RunLifecycleEvent) {

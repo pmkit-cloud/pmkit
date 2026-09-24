@@ -1,5 +1,5 @@
-use crate::feed::{FeedMode, MergedFeed, SourceDefinition};
-use crate::{FeedHealthSnapshot, RunMetrics};
+use crate::feed::{FeedMode, MergedFeed, SourceDefinition, SourceTaskDefinition};
+use crate::{Cancellation, FeedHealthSnapshot, RunMetrics};
 use pmkit_core::{MarketId, RunId};
 use pmkit_data::{DataSourceError, SourceSignal};
 use pmkit_event::{
@@ -8,6 +8,12 @@ use pmkit_event::{
 };
 use pmkit_market::{Asset, Exchange, Outcome};
 use rust_decimal::Decimal;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
+use tokio::sync::mpsc;
 
 mod health;
 mod mode_parity;
@@ -57,6 +63,131 @@ fn cex(timestamp_ms: i64, aggregate_trade_id: u64) -> SourceSignal {
             },
         },
     )))
+}
+
+fn pm_with_receipt(
+    timestamp_ms: i64,
+    sequence: i64,
+    receipt_time_ms: i64,
+) -> Result<SourceSignal, Box<dyn std::error::Error>> {
+    let SourceSignal::Data(mut envelope) = pm(timestamp_ms, sequence)? else {
+        unreachable!("pm helper always returns data")
+    };
+    let SourceEnvelope::PmMarket(pm) = envelope.as_mut() else {
+        unreachable!("pm helper always returns PM market data")
+    };
+    pm.metadata.receipt_time_ms = receipt_time_ms;
+    Ok(SourceSignal::Data(envelope))
+}
+
+struct DropProbe(Arc<AtomicBool>);
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn live_delivers_before_source_eof_and_cancels_cleanly()
+-> Result<(), Box<dyn std::error::Error>> {
+    let cancellation = Cancellation::new();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let source_dropped = Arc::clone(&dropped);
+    let (output, mut facts) = mpsc::channel(4);
+    let feed = MergedFeed::from_tasks(
+        FeedMode::Live,
+        vec![SourceTaskDefinition::new("live", move |sink| async move {
+            let _probe = DropProbe(source_dropped);
+            sink.send(pm(10, 1).map_err(|error| DataSourceError::ReplayGap {
+                message: error.to_string(),
+            })?)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+            sink.send(SourceSignal::Watermark(10))
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)?;
+            std::future::pending::<Result<(), DataSourceError>>().await
+        })],
+        None,
+    );
+    let merge = tokio::spawn(feed.forward_with_cancellation(output, Some(cancellation.clone())));
+
+    let fact = tokio::time::timeout(Duration::from_secs(1), facts.recv())
+        .await?
+        .ok_or("expected a fact before source EOF")?;
+    assert!(matches!(fact.fact, StrategyFact::Market(_)));
+    cancellation.cancel();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), merge)
+            .await??
+            .is_ok()
+    );
+    assert!(dropped.load(Ordering::SeqCst));
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_frontier_orders_facts_across_sources() -> Result<(), Box<dyn std::error::Error>> {
+    let (output, mut facts) = mpsc::channel(4);
+    let feed = MergedFeed::from_tasks(
+        FeedMode::Paper,
+        vec![
+            SourceTaskDefinition::new("late", |sink| async move {
+                sink.send(cex(10, 1))
+                    .await
+                    .map_err(|_| DataSourceError::SinkClosed)?;
+                sink.send(SourceSignal::Watermark(10))
+                    .await
+                    .map_err(|_| DataSourceError::SinkClosed)?;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                sink.send(SourceSignal::Watermark(20))
+                    .await
+                    .map_err(|_| DataSourceError::SinkClosed)?;
+                sink.send(SourceSignal::Eof)
+                    .await
+                    .map_err(|_| DataSourceError::SinkClosed)
+            }),
+            SourceTaskDefinition::new("early", |sink| async move {
+                sink.send(pm(20, 2).map_err(|error| DataSourceError::ReplayGap {
+                    message: error.to_string(),
+                })?)
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)?;
+                sink.send(SourceSignal::Watermark(20))
+                    .await
+                    .map_err(|_| DataSourceError::SinkClosed)?;
+                sink.send(SourceSignal::Eof)
+                    .await
+                    .map_err(|_| DataSourceError::SinkClosed)
+            }),
+        ],
+        None,
+    );
+    let merge = tokio::spawn(feed.forward(output));
+    let first = facts.recv().await.ok_or("missing first fact")?;
+    let second = facts.recv().await.ok_or("missing second fact")?;
+    merge.await??;
+    assert!(matches!(first.fact, StrategyFact::Reference(_)));
+    assert!(matches!(second.fact, StrategyFact::Market(_)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn unexpected_source_termination_fails_closed() {
+    let result = MergedFeed::from_tasks(
+        FeedMode::Live,
+        vec![SourceTaskDefinition::new("closed", |_sink| async {
+            Ok(())
+        })],
+        None,
+    )
+    .collect()
+    .await;
+    assert!(matches!(
+        result,
+        Err(DataSourceError::ReplayGap { message }) if message == "premature EOF"
+    ));
 }
 
 #[tokio::test]
@@ -153,5 +284,94 @@ async fn source_gap_aborts_before_strategy_evaluation() -> Result<(), Box<dyn st
         .await;
         assert!(matches!(result, Err(DataSourceError::ReplayGap { .. })));
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_frame_is_checked_before_its_receipt_frontier()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The first frame establishes the five-second bounded frontier only after
+    // it has been accepted; it cannot reject itself as late.
+    let facts = MergedFeed::from_fixture(
+        FeedMode::Live,
+        vec![SourceDefinition::finite(
+            "pm",
+            vec![pm_with_receipt(1_000, 1, 10_000)?, SourceSignal::Eof],
+        )],
+        None,
+    )
+    .collect()
+    .await?;
+    assert_eq!(facts.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_rejects_data_older_than_emitted_watermark() -> Result<(), Box<dyn std::error::Error>>
+{
+    let result = MergedFeed::from_fixture(
+        FeedMode::Live,
+        vec![SourceDefinition::finite(
+            "pm",
+            vec![
+                pm(10, 1)?,
+                SourceSignal::Watermark(20),
+                pm(15, 2)?,
+                SourceSignal::Eof,
+            ],
+        )],
+        None,
+    )
+    .collect()
+    .await;
+    assert!(
+        matches!(result, Err(DataSourceError::ReplayGap { message }) if message == "late record")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn backtest_health_does_not_report_live_bounded_frontier()
+-> Result<(), Box<dyn std::error::Error>> {
+    let metrics = RunMetrics::new(&RunId::new("backtest-health-frontier")?);
+    let result = MergedFeed::from_fixture(
+        FeedMode::Backtest,
+        vec![SourceDefinition::finite(
+            "pm",
+            vec![pm(10, 1)?, SourceSignal::Eof],
+        )],
+        None,
+    )
+    .with_metrics(metrics.clone())
+    .collect()
+    .await;
+    assert!(matches!(result, Err(DataSourceError::ReplayGap { .. })));
+    let health = metrics.snapshot().feed_health;
+    assert_eq!(health.len(), 1);
+    assert_eq!(health[0].watermark_ms, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_wakes_idle_merge_and_drops_source_guard()
+-> Result<(), Box<dyn std::error::Error>> {
+    let cancellation = Cancellation::new();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let source_dropped = Arc::clone(&dropped);
+    let (output, _facts) = mpsc::channel(1);
+    let feed = MergedFeed::from_tasks(
+        FeedMode::Live,
+        vec![SourceTaskDefinition::new("idle", move |_sink| async move {
+            let _probe = DropProbe(source_dropped);
+            std::future::pending::<Result<(), DataSourceError>>().await
+        })],
+        None,
+    );
+    let merge = feed.spawn(output, Some(cancellation.clone()));
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    cancellation.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(1), merge.join()).await??;
+    assert!(result.is_ok());
+    assert!(dropped.load(Ordering::SeqCst));
     Ok(())
 }
