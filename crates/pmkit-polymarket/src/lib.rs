@@ -18,6 +18,7 @@ mod execution;
 mod gamma_discovery;
 mod historical;
 mod live;
+mod orbscan;
 mod public_protocol;
 mod public_tape;
 mod public_tape_contract;
@@ -43,6 +44,10 @@ pub use historical::PolymarketHistoricalData;
 pub use live::{
     PolymarketFrameAdapter, PolymarketLiveData, RawFrameAdapterError, RawPolymarketFrameAdapter,
     parse_market_frame,
+};
+pub use orbscan::{
+    OrbscanClient, OrbscanCoverage, OrbscanError, OrbscanHistoricalDataSource, OrbscanMarket,
+    OrbscanMarketMapping, OrbscanMarketStatus, OrbscanOutcome,
 };
 pub use public_protocol::{
     PublicInboundFrame, PublicMarketEvent, PublicOutboundFrame, PublicProtocolError,
