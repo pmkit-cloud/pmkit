@@ -133,6 +133,35 @@ for live and Binance Vision `aggTrades` for history. The cache:
 Bybit and other exchanges return `HistoryUnavailable` until a matched official
 archive exists. PMKit does not use BBO, depth, or `@trade` as strategy input.
 
+### PolyBolt BTC/USD settlement oracle
+
+The authenticated `PolyBoltOracleDataSource` consumes `price.crypto.twap` for
+`btcusd` with `window_seconds: 60`, preserving exact `Decimal` prices. Its
+canonical source ID is `polymarket:polybolt:price.crypto.twap:60`; a run-local
+binding name such as `"settlement"` is separate. Declare it with
+`settlement_oracle_named(..., "BTC")` and `require_settlement_oracle(...)`.
+Live/paper runs register the source under that same name with
+`PmkitBuilder::register_oracle_source(...)`, not `reference_data_named`; recorded
+backtests replay captured facts offline and require no live credentials. Live
+connections require SDK credentials.
+There are no RTDS/RTDK compatibility aliases, decoders, or fallbacks. Current
+[Polymarket fee guidance](https://help.polymarket.com/en/articles/13364478-trading-fees)
+lists maker fees at zero. Native account adaptation records maker fills at zero
+(no maker rebates are modeled); taker fills require an explicitly zero
+`fee_rate_bps`. Missing or nonzero rates fail closed because the exact taker fee
+is unavailable; no taker-fee formula is claimed.
+
+### Recorded replay clocks
+
+`RecordedBacktest::replay_capture` dispatches one capture in writer-assigned
+ingest order, not event-time merge order. `StrategyContext.now` uses each fact's
+source timestamp; simulated fill activation uses its captured receipt timestamp.
+`activation_latency` models submission-to-fillable delay only, and simulated
+cancellation is immediate (there is no cancellation-latency model). Native
+Polymarket market-WebSocket frames require caller-supplied `MarketTokens` via
+`CaptureReplaySource::new_with_market_tokens`; token/outcome mappings are never
+inferred from labels.
+
 ### Cloud BTC 5m replay
 
 `PmKitCloudDataSource` uses the public Cloud API only. Supply an API key, then
@@ -176,12 +205,29 @@ no durable records are written and the default JSONL tape path is unchanged.
 
 ### Source eligibility and replay gaps
 
-A source used by a live strategy must have an equivalent historical adapter
-producing the same normalized record. Missing or corrupt history fails closed
-with a typed `ReplayGap`. The deterministic feed merge aborts before strategy
+A live source needs an equivalent historical adapter or a source-compatible
+recorded capture; `RecordedBacktest` is explicit and never substitutes another
+source for missing history. Binance Vision (`binance:vision:aggTrades`) and
+`pmkit-cloud` remain ordinary historical-replay sources, but `.capture` and
+`RecordedBacktest::replay_capture` reject them because archives have no original
+local receipt time. Vision reuses event time for replay receipt metadata; Cloud
+sets `receipt_time_ms` from `event_time_ms`, and `event_ordinal` is a replay rank,
+not physical transport provenance. Missing or corrupt history fails closed with
+a typed `ReplayGap`. The deterministic feed merge aborts before strategy
 evaluation on source error, premature EOF, stale reference, or late record.
 
 ### Opt-in storage
+
+`.capture(directory)` is a separate append-only, per-run raw-source spool across
+configured feeds; it requires original source bytes and records accepted source
+frames at ingress, before the event-time merge. `.storage(TapeStore)` persists PM
+envelopes and causal decisions instead. Neither enables the other. See the
+[raw capture format](docs/PMKIT_RAW_TAPE_FORMAT.md).
+For live shadow diagnostics, `PmkitBuilder::live_shadow_simulation(config)` is
+opt-in, requires a live account source, and reports `RunMetricsSnapshot::fill_drift`
+separately from actual account fills. It does not alter strategy decisions, risk,
+or venue execution; with `.capture(directory)`, actual account-source frames are
+captured alongside market data.
 
 ```rust
 use pmkit_store::TursoTapeStore;
@@ -218,14 +264,27 @@ and activity. The registry accepts only Polygon (137), the current pUSD, CTF,
 and V2 exchange contracts shown in its explicit configuration; historical V1
 exchange addresses require opt-in configuration for a backfill.
 
-`pmkit-api` exposes versioned, chain-truth positions, closed positions, trades,
-and activity with their documented offset limits. It does not expose live
-valuation, display metadata, user profiles, or signed-order lifecycle. CLOB
-`/data/orders` and `/data/order/{id}` return typed
-`NotReconstructibleFromChain` results rather than fabricated data.
-They currently exist only as compatibility debt and are removed after the
-Todo 29/30 WalletReadModel parity and deletion gate; neither is a final
-supported wallet mirror.
+`ChainTruthApiV2` is an exported Rust projection, not an HTTP router. Its balance
+models the cataloged `/v1/accounting/snapshot` response shape only. Its positions,
+trades, and activity methods return
+`{data, pagination: {limit, offset, has_more, next_cursor}}`;
+`offset` is display-only. The first request sets `limit` and filters; continue
+with the opaque `next_cursor`, preserving filters. The cursor carries its page
+size and is bound to the route, filters, and snapshot. At the end `next_cursor`
+is `null`; an empty page has `data: []`. Query limits are 1–1,000.
+Condition filters validate at most 20 distinct CTF IDs, but positions and trades
+currently refuse nonempty condition filters; activity applies them only where
+condition IDs are reconstructible. Unknown position fields are omitted; optional
+activity fields and exhausted cursors serialize as `null`, while empty pages use
+`data: []`. The status vocabulary is `OPEN`, `REDEEMABLE`,
+`REDEEMABLE_LOST`, `MERGEABLE`, and `CLOSED`; `CLOSED` means fully exited, not
+merely market-resolved. The current projection returns `OPEN` only and fails closed
+on unsupported lifecycle filters. The API does not expose live valuation,
+display metadata, user profiles, or signed-order lifecycle. CLOB
+`/data/orders` and `/data/order/{id}` return typed `NotReconstructibleFromChain`
+results rather than fabricated data. They currently exist only as compatibility
+debt and are removed after the Todo 29/30 WalletReadModel parity and deletion
+gate; neither is a final supported wallet mirror.
 
 ## Building
 

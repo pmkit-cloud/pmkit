@@ -10,14 +10,21 @@
 //! [`PmkitBuilder::storage`].
 
 mod backtest;
+pub use backtest::RecordedBacktest;
+/// Unified per-run raw source capture.
+pub mod capture;
+/// Explicit replay of raw captures in recorded ingest order.
+pub mod capture_replay;
 /// Portable causal decision snapshots and durable execution recording.
 pub mod causal;
 /// Deterministic envelope-aware source merging.
 pub mod feed;
 pub(crate) mod live;
+mod live_shadow;
 mod paper;
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -25,13 +32,13 @@ use tokio::{sync::mpsc, task::JoinSet};
 
 use pmkit_accounting::PortfolioExposure;
 use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
-use pmkit_data::SourceSignal;
-use pmkit_event::{CanonicalSourceKey, SourceEnvelope};
+use pmkit_data::{LiveOracleDataSource, SourceSignal};
+use pmkit_event::{CanonicalSourceKey, MarketEvent, PmAccountEnvelope, SourceEnvelope};
 use pmkit_exec::ExecError;
 use pmkit_manifest::build_manifest;
 use pmkit_run::LiveConsent;
 use pmkit_runtime::{RuntimeConfig, StrategyRegistration};
-use pmkit_spec::RunSpec;
+use pmkit_spec::{LiveRun, RunSpec};
 use pmkit_store::{OwnerScope, PM_ENVELOPE_VERSION, PmEnvelope, StoreError, TapeStore};
 use pmkit_strategy::Strategy;
 use thiserror::Error;
@@ -135,6 +142,14 @@ pub struct RunMetricsSnapshot {
     pub decisions: usize,
     /// Per-source feed health derived by the deterministic merge.
     pub feed_health: Vec<FeedHealthSnapshot>,
+    /// Fill comparison, present only for live runs with shadow simulation enabled.
+    pub fill_drift: Option<Result<pmkit_sim::FillDriftReport, pmkit_sim::FillDriftError>>,
+}
+
+#[derive(Debug, Default)]
+struct ShadowInputs {
+    predictions: Vec<MarketEvent>,
+    observed: Vec<PmAccountEnvelope>,
 }
 
 #[derive(Debug, Clone)]
@@ -146,10 +161,19 @@ pub(crate) struct RunMetrics {
     reconnects: Arc<AtomicUsize>,
     decisions: Arc<AtomicUsize>,
     feed_health: Arc<Mutex<Vec<FeedHealthSnapshot>>>,
+    live_shadow_simulation: Option<pmkit_sim::SimulationConfig>,
+    shadow_inputs: Option<Arc<Mutex<ShadowInputs>>>,
 }
 
 impl RunMetrics {
     fn new(run: &RunId) -> Self {
+        Self::with_live_shadow_simulation(run, None)
+    }
+
+    fn with_live_shadow_simulation(
+        run: &RunId,
+        config: Option<pmkit_sim::SimulationConfig>,
+    ) -> Self {
         Self {
             run: run.clone(),
             events_processed: Arc::new(AtomicUsize::new(0)),
@@ -158,6 +182,8 @@ impl RunMetrics {
             reconnects: Arc::new(AtomicUsize::new(0)),
             decisions: Arc::new(AtomicUsize::new(0)),
             feed_health: Arc::new(Mutex::new(Vec::new())),
+            live_shadow_simulation: config,
+            shadow_inputs: config.map(|_| Arc::new(Mutex::new(ShadowInputs::default()))),
         }
     }
 
@@ -200,7 +226,36 @@ impl RunMetrics {
         }
     }
 
+    pub(crate) fn record_shadow_predictions(&self, predictions: Vec<MarketEvent>) {
+        let Some(inputs) = &self.shadow_inputs else {
+            return;
+        };
+        match inputs.lock() {
+            Ok(mut inputs) => inputs.predictions.extend(predictions),
+            Err(poisoned) => poisoned.into_inner().predictions.extend(predictions),
+        }
+    }
+
+    pub(crate) fn record_shadow_observed(&self, envelope: PmAccountEnvelope) {
+        let Some(inputs) = &self.shadow_inputs else {
+            return;
+        };
+        match inputs.lock() {
+            Ok(mut inputs) => inputs.observed.push(envelope),
+            Err(poisoned) => poisoned.into_inner().observed.push(envelope),
+        }
+    }
+
     pub(crate) fn snapshot(&self) -> RunMetricsSnapshot {
+        let fill_drift = self.shadow_inputs.as_ref().map(|inputs| {
+            let compare = |inputs: &ShadowInputs| {
+                pmkit_sim::compare_fill_drift(&inputs.predictions, &inputs.observed)
+            };
+            match inputs.lock() {
+                Ok(inputs) => compare(&inputs),
+                Err(poisoned) => compare(&poisoned.into_inner()),
+            }
+        });
         RunMetricsSnapshot {
             run: self.run.clone(),
             events_processed: self.events_processed.load(Ordering::Relaxed),
@@ -212,6 +267,7 @@ impl RunMetrics {
                 Ok(health) => health.clone(),
                 Err(poisoned) => poisoned.into_inner().clone(),
             },
+            fill_drift,
         }
     }
 }
@@ -239,6 +295,17 @@ pub enum StartError {
     /// Two runs shared the same [`RunId`].
     #[error("duplicate run id: {0}")]
     DuplicateRunId(RunId),
+    /// An opted-in live shadow run has no authenticated account source binding.
+    #[error("live shadow simulation for run {0} requires an account data source")]
+    LiveShadowAccountSourceMissing(RunId),
+    /// A run names an oracle binding with no registered runtime source.
+    #[error("oracle source `{binding}` is not registered for run {run}")]
+    OracleSourceMissing {
+        /// The run requiring the oracle source.
+        run: RunId,
+        /// Run-local binding name, not the canonical source ID.
+        binding: String,
+    },
     /// A backtest task could not be joined safely.
     #[error("backtest task failed: {0}")]
     BacktestTask(#[source] tokio::task::JoinError),
@@ -268,6 +335,14 @@ pub enum StartError {
         run: RunId,
         /// The underlying filesystem failure.
         source: std::io::Error,
+    },
+    /// Configured raw source capture failed.
+    #[error("capture failed for run {run}: {source}")]
+    Capture {
+        /// The run whose source frame could not be captured.
+        run: RunId,
+        /// The capture or tape failure.
+        source: capture::CaptureError,
     },
     /// Configured durable PM storage failed.
     #[error("storage failed for run {run}: {source}")]
@@ -354,11 +429,32 @@ pub enum RunLifecycleEvent {
 
 /// Per-start control shared with every driver: cancellation and lifecycle
 /// subscription.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct RunControl {
     cancel: Option<Cancellation>,
     subscriber: Option<mpsc::UnboundedSender<RunLifecycleEvent>>,
     metrics: Option<RunMetrics>,
+    capture: Option<capture::CaptureRecorder>,
+    oracle_sources: Arc<HashMap<String, Arc<dyn LiveOracleDataSource>>>,
+}
+
+impl std::fmt::Debug for RunControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunControl")
+            .field("cancel", &self.cancel)
+            .field(
+                "subscriber",
+                &self.subscriber.as_ref().map(|_| "subscribed"),
+            )
+            .field("metrics", &self.metrics)
+            .field("capture", &self.capture)
+            .field(
+                "oracle_bindings",
+                &self.oracle_sources.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl RunControl {
@@ -372,12 +468,47 @@ impl RunControl {
         }
     }
 
-    pub(crate) fn for_run(&self, run: &RunId) -> Self {
+    pub(crate) fn for_run(&self, run: &RunId, capture: Option<capture::CaptureRecorder>) -> Self {
+        self.for_run_with_shadow(run, capture, None)
+    }
+
+    fn for_live_run(
+        &self,
+        run: &RunId,
+        capture: Option<capture::CaptureRecorder>,
+        config: Option<pmkit_sim::SimulationConfig>,
+    ) -> Self {
+        self.for_run_with_shadow(run, capture, config)
+    }
+
+    fn for_run_with_shadow(
+        &self,
+        run: &RunId,
+        capture: Option<capture::CaptureRecorder>,
+        config: Option<pmkit_sim::SimulationConfig>,
+    ) -> Self {
         Self {
             cancel: self.cancel.clone(),
             subscriber: self.subscriber.clone(),
-            metrics: Some(RunMetrics::new(run)),
+            metrics: Some(RunMetrics::with_live_shadow_simulation(run, config)),
+            capture,
+            oracle_sources: Arc::clone(&self.oracle_sources),
         }
+    }
+
+    pub(crate) fn live_shadow_simulation(&self) -> Option<&pmkit_sim::SimulationConfig> {
+        self.metrics.as_ref()?.live_shadow_simulation.as_ref()
+    }
+
+    pub(crate) const fn capture(&self) -> Option<&capture::CaptureRecorder> {
+        self.capture.as_ref()
+    }
+
+    pub(crate) fn oracle_source(
+        &self,
+        binding_name: &str,
+    ) -> Option<Arc<dyn LiveOracleDataSource>> {
+        self.oracle_sources.get(binding_name).cloned()
     }
 
     pub(crate) fn metrics_for(&self, run: &RunId) -> RunMetrics {
@@ -392,12 +523,15 @@ pub struct Pmkit;
 impl Pmkit {
     /// Starts a builder with the given runtime configuration.
     #[must_use]
-    pub const fn builder(config: RuntimeConfig) -> PmkitBuilder {
+    pub fn builder(config: RuntimeConfig) -> PmkitBuilder {
         PmkitBuilder {
             config,
             runs: Vec::new(),
+            live_shadow_simulation: None,
             consent: None,
             store: None,
+            capture: None,
+            oracle_sources: HashMap::new(),
             cancel: None,
             subscriber: None,
         }
@@ -408,8 +542,11 @@ impl Pmkit {
 pub struct PmkitBuilder {
     config: RuntimeConfig,
     runs: Vec<RunSpec>,
+    live_shadow_simulation: Option<pmkit_sim::SimulationConfig>,
     consent: Option<LiveConsent>,
     store: Option<Arc<dyn TapeStore>>,
+    capture: Option<capture::CaptureConfig>,
+    oracle_sources: HashMap<String, Arc<dyn LiveOracleDataSource>>,
     cancel: Option<Cancellation>,
     subscriber: Option<mpsc::UnboundedSender<RunLifecycleEvent>>,
 }
@@ -420,8 +557,14 @@ impl std::fmt::Debug for PmkitBuilder {
             .debug_struct("PmkitBuilder")
             .field("config", &self.config)
             .field("runs", &self.runs)
+            .field("live_shadow_simulation", &self.live_shadow_simulation)
             .field("consent", &self.consent)
             .field("store", &self.store.as_ref().map(|_| "configured"))
+            .field("capture", &self.capture)
+            .field(
+                "oracle_bindings",
+                &self.oracle_sources.keys().collect::<Vec<_>>(),
+            )
             .field("cancel", &self.cancel)
             .field(
                 "subscriber",
@@ -446,10 +589,40 @@ impl PmkitBuilder {
         self
     }
 
+    /// Enables an opt-in fill simulation comparison for live runs only.
+    #[must_use]
+    pub const fn live_shadow_simulation(mut self, config: pmkit_sim::SimulationConfig) -> Self {
+        self.live_shadow_simulation = Some(config);
+        self
+    }
+
     /// Opts every configured run into durable PM-envelope and causal-decision storage.
     #[must_use]
     pub fn storage(mut self, store: Arc<dyn TapeStore>) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Captures every run's original source frames to a new file under `directory`.
+    /// Files are opened when each run starts and existing files are never overwritten.
+    /// Sources without original data bytes fail at runtime with
+    /// [`capture::CaptureError::MissingRawFrame`]; bytes are never synthesized.
+    /// This is separate from `.storage(...)`, which remains PM-only causal storage.
+    #[must_use]
+    pub fn capture(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.capture = Some(capture::CaptureConfig::new(directory));
+        self
+    }
+
+    /// Registers a live oracle by its run-spec binding name (not its source ID).
+    /// Re-registering a name replaces the prior source.
+    #[must_use]
+    pub fn register_oracle_source(
+        mut self,
+        binding_name: impl Into<String>,
+        source: Arc<dyn LiveOracleDataSource>,
+    ) -> Self {
+        self.oracle_sources.insert(binding_name.into(), source);
         self
     }
 
@@ -477,8 +650,11 @@ impl PmkitBuilder {
         let Self {
             config,
             runs,
+            live_shadow_simulation,
             consent,
             store,
+            capture,
+            oracle_sources,
             cancel,
             subscriber,
         } = self;
@@ -486,17 +662,11 @@ impl PmkitBuilder {
             cancel,
             subscriber,
             metrics: None,
+            capture: None,
+            oracle_sources: Arc::new(oracle_sources),
         };
 
-        let mut seen = HashSet::new();
-        let mut report_order = Vec::with_capacity(runs.len());
-        for spec in &runs {
-            let id = run_id_of(spec);
-            if !seen.insert(id.clone()) {
-                return Err(StartError::DuplicateRunId(id.clone()));
-            }
-            report_order.push(id.clone());
-        }
+        let report_order = validate_run_specs(&runs, &control)?;
 
         let mut reports = HashMap::new();
         let mut manifests = HashMap::new();
@@ -510,7 +680,8 @@ impl PmkitBuilder {
                         collect_backtest_report(&mut backtests, &mut reports).await?;
                     }
                     let store = store.clone();
-                    let control = control.for_run(run.id());
+                    let capture = open_capture(capture.as_ref(), run.id())?;
+                    let control = control.for_run(run.id(), capture);
                     let metrics = control.metrics_for(run.id());
                     backtests.spawn(async move {
                         backtest::drive_with_control(&run, store.as_deref(), &control)
@@ -525,7 +696,8 @@ impl PmkitBuilder {
                     while !backtests.is_empty() {
                         collect_backtest_report(&mut backtests, &mut reports).await?;
                     }
-                    let control = control.for_run(run.id());
+                    let capture = open_capture(capture.as_ref(), run.id())?;
+                    let control = control.for_run(run.id(), capture);
                     let metrics = control.metrics_for(run.id());
                     let report = paper::drive_with_control(&run, store.as_deref(), &control)
                         .await
@@ -539,10 +711,13 @@ impl PmkitBuilder {
                     while !backtests.is_empty() {
                         collect_backtest_report(&mut backtests, &mut reports).await?;
                     }
-                    if consent.is_none() {
-                        return Err(StartError::LiveConsentMissing(run.id().clone()));
-                    }
-                    let control = control.for_run(run.id());
+                    validate_live_startup(
+                        &run,
+                        live_shadow_simulation.is_some(),
+                        consent.is_some(),
+                    )?;
+                    let capture = open_capture(capture.as_ref(), run.id())?;
+                    let control = control.for_live_run(run.id(), capture, live_shadow_simulation);
                     let metrics = control.metrics_for(run.id());
                     let report =
                         live::drive_with_control(&run, &config, store.as_deref(), &control)
@@ -566,6 +741,44 @@ impl PmkitBuilder {
             config,
         })
     }
+}
+
+fn validate_run_specs(runs: &[RunSpec], control: &RunControl) -> Result<Vec<RunId>, StartError> {
+    let mut seen = HashSet::new();
+    let mut report_order = Vec::with_capacity(runs.len());
+    for spec in runs {
+        let id = run_id_of(spec);
+        if !seen.insert(id.clone()) {
+            return Err(StartError::DuplicateRunId(id.clone()));
+        }
+        validate_live_oracle_sources(spec, control)?;
+        report_order.push(id.clone());
+    }
+    Ok(report_order)
+}
+
+fn validate_live_startup(run: &LiveRun, shadow: bool, consent: bool) -> Result<(), StartError> {
+    if shadow && run.account_data_ref().is_none() {
+        return Err(StartError::LiveShadowAccountSourceMissing(run.id().clone()));
+    }
+    if !consent {
+        return Err(StartError::LiveConsentMissing(run.id().clone()));
+    }
+    Ok(())
+}
+
+fn open_capture(
+    config: Option<&capture::CaptureConfig>,
+    run: &RunId,
+) -> Result<Option<capture::CaptureRecorder>, StartError> {
+    config
+        .map(|config| {
+            config.open(run).map_err(|source| StartError::Capture {
+                run: run.clone(),
+                source,
+            })
+        })
+        .transpose()
 }
 
 async fn collect_backtest_report(
@@ -652,6 +865,30 @@ fn run_id_of(spec: &RunSpec) -> &RunId {
     }
 }
 
+fn validate_live_oracle_sources(spec: &RunSpec, control: &RunControl) -> Result<(), StartError> {
+    if matches!(spec, RunSpec::Backtest(_)) {
+        return Ok(());
+    }
+    let run = run_id_of(spec);
+    for binding in spec.settlement_oracle_bindings() {
+        if control.oracle_source(binding.name()).is_none() {
+            return Err(StartError::OracleSourceMissing {
+                run: run.clone(),
+                binding: binding.name().to_owned(),
+            });
+        }
+    }
+    for requirement in spec.settlement_oracle_requirements() {
+        if control.oracle_source(requirement.name()).is_none() {
+            return Err(StartError::OracleSourceMissing {
+                run: run.clone(),
+                binding: requirement.name().to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn observe_reconnect(
     source: &SourceEnvelope,
     connection_epochs: &mut HashMap<String, i64>,
@@ -732,7 +969,10 @@ async fn store_signal(
             },
             SourceEnvelope::CexReference(_) => return Ok(()),
         },
-        SourceSignal::Watermark(_) | SourceSignal::Eof => return Ok(()),
+        SourceSignal::Watermark(_)
+        | SourceSignal::Eof
+        | SourceSignal::Gap(_)
+        | SourceSignal::Heartbeat(_) => return Ok(()),
     };
     store.store_envelope(&envelope).await
 }
@@ -794,3 +1034,121 @@ mod live_tests;
 mod paper_tests;
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+mod live_shadow_metrics_tests {
+    use super::{RunMetrics, RunMetricsSnapshot};
+    use pmkit_book::Side;
+    use pmkit_core::{MarketId, PortfolioId, RunId};
+    use pmkit_event::{
+        FillIdentity, Liquidity, MarketEvent, PmAccountEnvelope, PmAccountEvent, StreamMetadata,
+    };
+    use pmkit_market::Outcome;
+    use rust_decimal::Decimal;
+    use std::error::Error;
+
+    fn metrics(config: Option<pmkit_sim::SimulationConfig>) -> Result<RunMetrics, Box<dyn Error>> {
+        let run = RunId::new("live-shadow-metrics")?;
+        Ok(RunMetrics::with_live_shadow_simulation(&run, config))
+    }
+
+    fn predicted_fill(
+        price: Decimal,
+        size: Decimal,
+        timestamp_ms: i64,
+    ) -> Result<MarketEvent, Box<dyn Error>> {
+        Ok(MarketEvent::Fill {
+            strategy: None,
+            order_id: "venue-order-1".into(),
+            market: MarketId::new("btc-5m")?,
+            outcome: Outcome::Up,
+            price,
+            size,
+            side: Side::Buy,
+            fee: Decimal::ZERO,
+            liquidity: Liquidity::Taker,
+            timestamp_ms,
+        })
+    }
+
+    fn observed_fill(
+        price: Decimal,
+        size: Decimal,
+        timestamp_ms: i64,
+    ) -> Result<PmAccountEnvelope, Box<dyn Error>> {
+        Ok(PmAccountEnvelope {
+            portfolio: PortfolioId::new("portfolio-1")?,
+            metadata: StreamMetadata {
+                schema_version: 1,
+                source_id: "pm-account".into(),
+                source_time_ms: timestamp_ms - 2,
+                canonical_source_rank: 7,
+                receipt_time_ms: timestamp_ms + 3,
+                connection_id: "connection-1".into(),
+                connection_epoch: 4,
+                frame_sequence: 5,
+                ingest_sequence: 6,
+            },
+            raw_frame: Vec::new(),
+            fact: PmAccountEvent::Fill {
+                identity: FillIdentity::Venue("fill-1".into()),
+                strategy: None,
+                order_id: "venue-order-1".into(),
+                market: MarketId::new("btc-5m")?,
+                outcome: Outcome::Up,
+                price,
+                size,
+                side: Side::Buy,
+                fee: Decimal::ZERO,
+                liquidity: Liquidity::Taker,
+                timestamp_ms,
+            },
+        })
+    }
+
+    #[test]
+    fn disabled_shadow_metrics_remain_absent() -> Result<(), Box<dyn Error>> {
+        let metrics = metrics(None)?;
+        metrics.record_shadow_predictions(vec![predicted_fill(Decimal::ONE, Decimal::ONE, 100)?]);
+        metrics.record_shadow_observed(observed_fill(Decimal::ONE, Decimal::ONE, 100)?);
+
+        let snapshot: RunMetricsSnapshot = metrics.snapshot();
+        assert_eq!(snapshot.fill_drift, None);
+        Ok(())
+    }
+
+    #[test]
+    fn enabled_shadow_metrics_compare_fill_and_preserve_account_clocks()
+    -> Result<(), Box<dyn Error>> {
+        let metrics = metrics(Some(pmkit_sim::SimulationConfig::default()))?;
+        metrics.record_shadow_predictions(vec![predicted_fill(
+            Decimal::new(40, 2),
+            Decimal::from(3),
+            100,
+        )?]);
+        metrics.record_shadow_observed(observed_fill(Decimal::new(42, 2), Decimal::from(3), 110)?);
+
+        let Some(Ok(report)) = metrics.snapshot().fill_drift else {
+            return Err("enabled shadow metrics should return a fill-drift report".into());
+        };
+        let fill = &report.fills[0];
+        assert_eq!(fill.observed_source_time_ms, Some(108));
+        assert_eq!(fill.observed_receipt_time_ms, Some(113));
+        assert_eq!(fill.receipt_time_delta_ms, Some(13));
+        Ok(())
+    }
+
+    #[test]
+    fn comparator_overflow_is_reported_without_failing_metrics_snapshot()
+    -> Result<(), Box<dyn Error>> {
+        let metrics = metrics(Some(pmkit_sim::SimulationConfig::default()))?;
+        metrics.record_shadow_predictions(vec![predicted_fill(
+            Decimal::MAX,
+            Decimal::from(2),
+            100,
+        )?]);
+
+        assert!(matches!(metrics.snapshot().fill_drift, Some(Err(_))));
+        Ok(())
+    }
+}

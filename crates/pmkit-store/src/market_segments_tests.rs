@@ -216,3 +216,67 @@ async fn snapshot_segments_do_not_merge() -> Result<(), Box<dyn std::error::Erro
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn repeated_source_ranks_export_as_stable_increasing_ordinals()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let scope = OwnerScope::new(
+        PortfolioId::new("repeated-rank-export")?,
+        RunId::new("fixture")?,
+    );
+    let store = TursoTapeStore::open_local(directory.path().join("export.db")).await?;
+    let mut up = snapshot_envelope(scope.clone(), SNAPSHOT_A, 0)?;
+    up.frame_sequence = 1;
+    up.normalized["payload"] = json!({
+        "event_type": "best_bid_ask",
+        "asset_id": "token-up",
+        "outcome": "up",
+        "best_bid": "0.40",
+        "best_ask": "0.60"
+    });
+    let mut down = snapshot_envelope(scope.clone(), SNAPSHOT_A, 0)?;
+    down.frame_sequence = 2;
+    down.ingest_sequence = 2;
+    down.normalized["payload"] = json!({
+        "event_type": "best_bid_ask",
+        "asset_id": "token-down",
+        "outcome": "down",
+        "best_bid": "0.30",
+        "best_ask": "0.70"
+    });
+
+    store.store_envelope(&up).await?;
+    store.store_envelope(&down).await?;
+    assert!(matches!(
+        store.store_envelope(&up).await,
+        Err(StoreError::DuplicateSourceIdentity)
+    ));
+
+    let manifest = decode_sealed_closed_day_manifest(json!({
+        "version": 2,
+        "day": "1970-01-01",
+        "day_seal": "sealed"
+    }))?;
+    let first = super::export_market_segments_with_artifacts(&store, &scope, &manifest).await?;
+    let second = super::export_market_segments_with_artifacts(&store, &scope, &manifest).await?;
+    drop(store);
+    assert_eq!(first, second);
+    assert_eq!(first.segments.len(), 1);
+
+    let body = String::from_utf8(first.segments[0].bytes.clone())?;
+    let rows = body
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["event_time_ms"], 1_000);
+    assert_eq!(rows[1]["event_time_ms"], 1_000);
+    assert_eq!(rows[0]["event_ordinal"], 0);
+    assert_eq!(rows[1]["event_ordinal"], 1);
+    assert_ne!(
+        rows[0]["payload"]["asset_id"],
+        rows[1]["payload"]["asset_id"]
+    );
+    Ok(())
+}

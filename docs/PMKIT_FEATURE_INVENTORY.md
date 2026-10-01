@@ -49,6 +49,11 @@ repository, not the long-term target.
 - Book walking and fill application.
 - Kelly sizing, post-only clamping, drawdown penalty, budget caps, VPIN, and OFI.
 - Fee rates, maker rebates, taker fees, effective cost.
+- Current [official Polymarket fee guidance](https://help.polymarket.com/en/articles/13364478-trading-fees)
+  lists maker fees at zero. Native account adaptation records maker fills at
+  zero (no maker rebates are modeled); taker fills require an explicitly zero
+  `fee_rate_bps`. Missing or nonzero rates fail closed because the exact taker
+  fee is unavailable; no taker-fee formula is claimed.
 - GBM/LMSR fair value, probability gaps, logits, sigmoid, normal-CDF approximation,
   momentum, and probability blending.
 
@@ -205,6 +210,13 @@ repository, not the long-term target.
 - Raw market/account frame interception.
 - Store-before-adapt behavior.
 - Historical cursor source backed by stored PM envelopes.
+- Direct authenticated PolyBolt BTC/USD 60-second oracle on `price.crypto.twap`
+  (`btcusd`), preserving exact `Decimal` values under canonical source ID
+  `polymarket:polybolt:price.crypto.twap:60`. The run-local binding name is
+  separate and is shared by `settlement_oracle_named`,
+  `require_settlement_oracle`, and `register_oracle_source`. Live connection
+  requires caller-supplied SDK credentials; captured oracle facts replay
+  offline. No RTDS/RTDK alias, compatibility decoder, or fallback is provided.
 - Gamma SDK client in `pmkit-api` for market metadata and token/outcome helpers.
 
 **Crates:** `pmkit-polymarket`, `pmkit-api`.
@@ -291,6 +303,20 @@ repository, not the long-term target.
 - Canonical chain log/checkpoint storage.
 - Reorg replacement segments.
 - Storage opt-in; CEX events are not stored.
+- `PmkitBuilder::capture(directory)` writes an append-only per-run raw,
+  multi-source spool in writer-assigned ingest order, capturing accepted source
+  frames at ingress before event-time merging. It is separate from
+  `.storage(TapeStore)` PM-envelope and causal-decision storage. Frames without
+  original bytes fail rather than being synthesized. See
+  [`PMKIT_RAW_TAPE_FORMAT.md`](PMKIT_RAW_TAPE_FORMAT.md).
+- `RecordedBacktest::replay_capture` consumes capture order directly, without
+  event-time merging. Strategy time uses each fact's source timestamp; recorded
+  fill activation uses receipt time. `activation_latency` models
+  submission-to-fillable delay only, and simulated cancellation is immediate (no
+  cancel-latency model). Native PM market-WebSocket frames require caller-supplied
+  `MarketTokens` via `CaptureReplaySource::new_with_market_tokens`; PolyBolt
+  replay needs no live credentials and token/outcome mappings are never inferred
+  from labels.
 - Reliable raw-frame collector (`pmkit-collector`): transport-agnostic
   reconnect with fresh per-epoch connection identity, subscription sharding,
   bounded-channel backpressure, heartbeats, and graceful drain/flush over the
@@ -307,6 +333,16 @@ repository, not the long-term target.
 - Encryption.
 - Multi-process writer guarantees.
 - Venue order-ID recovery remains partial: a generic consumer exists, but no concrete Polymarket status query does yet.
+- Automatic runtime raw-capture rotation/recovery is not claimed: capture opens
+  a new per-run file. `RawCaptureReader` still provides the documented prefix/tail
+  recovery for an unterminated final record. Blanket replay guarantees are not
+  claimed; native decoding is source-specific, while other source IDs remain
+  witness-backed rather than protocol-verified.
+- Binance Vision (`binance:vision:aggTrades`) and `pmkit-cloud` remain ordinary
+  historical-replay sources, but capture and recorded-capture replay reject them
+  because original local receipt time is unknown. Vision reuses event time for
+  replay receipt metadata; Cloud uses `event_time_ms` for `receipt_time_ms`, and
+  `event_ordinal` is a replay rank, not physical transport provenance.
 
 ### Deliberately absent
 
@@ -334,8 +370,20 @@ Those belong in a separate reliability-focused collector/storage project.
 - Canonical checkpoints and reorg replacement segments.
 - Wallet reconstruction of collateral, token positions, settlement, trades, and
   activity.
-- Chain-truth API for positions, closed positions, trades, activity, balance, and
-  pagination.
+- Exported Rust projection `ChainTruthApiV2` for positions, trades, activity,
+  and balance; it is not an HTTP router. Its balance models the cataloged
+  `/v1/accounting/snapshot` response shape only. Paginated methods return
+  `{data, pagination: {limit, offset, has_more, next_cursor}}`; `offset` is
+  display-only. The first request sets `limit` (1–1,000) and filters; continuation
+  uses the opaque cursor, which carries the page size and binds route, filters,
+  and snapshot. Exhausted cursors serialize as `null`, empty pages as `data: []`.
+- Condition filters validate at most 20 distinct CTF IDs, but positions and
+  trades currently refuse nonempty condition filters; activity filters only
+  where condition IDs are reconstructible. Unknown position metadata/flags are
+  omitted rather than guessed; optional activity fields serialize as `null`.
+  `CLOSED` means fully exited, not merely market-resolved; the current
+  projection returns `OPEN` only and refuses other lifecycle filters. Full
+  display-metadata parity is unavailable.
 - Typed `NotReconstructibleFromChain` responses for off-chain-only order data.
   `/data/orders` and `/data/order/{id}` currently exist only as compatibility
   debt; Todos 29/30 remove them after the WalletReadModel parity and deletion

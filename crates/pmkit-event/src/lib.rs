@@ -316,6 +316,24 @@ pub enum CexReferenceEvent {
         /// Event timestamp in milliseconds.
         timestamp_ms: i64,
     },
+    /// A 60-second oracle TWAP snapshot.
+    Twap60sSnapshot {
+        /// Underlying asset.
+        asset: Asset,
+        /// Exact TWAP value.
+        price: Decimal,
+        /// Oracle timestamp in milliseconds.
+        timestamp_ms: i64,
+    },
+    /// An update to the 60-second oracle TWAP.
+    Twap60sUpdate {
+        /// Underlying asset.
+        asset: Asset,
+        /// Exact TWAP value.
+        price: Decimal,
+        /// Oracle timestamp in milliseconds.
+        timestamp_ms: i64,
+    },
 }
 
 /// Metadata retained for every received stream frame.
@@ -370,6 +388,8 @@ pub struct PmAccountEnvelope {
 pub struct CexReferenceEnvelope {
     /// Preserved transport metadata.
     pub metadata: StreamMetadata,
+    /// Exact source frame bytes before normalization, when available.
+    pub raw_frame: Vec<u8>,
     /// Normalized CEX reference fact.
     pub fact: CexReferenceEvent,
 }

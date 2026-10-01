@@ -2,14 +2,14 @@ use super::{
     PaperReport, RunControl, RunLifecycleEvent, StartError, StrategyInstance,
     instantiate_strategies, observe_reconnect, store_signal, validate_account_owner,
 };
-use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
+use crate::feed::{FeedError, FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_accounting::{
     ExposureReservation, PortfolioExposure, PositionExposure, aggregate_exposure,
 };
 use pmkit_book::{OrderBookL2, Position};
 use pmkit_event::{CexReferenceEvent, MarketEvent, PmAccountEvent, SourceEnvelope, StrategyFact};
 use pmkit_exec::{ExecError, Executor, OrderId};
-use pmkit_market::Outcome;
+use pmkit_market::{Asset, Outcome};
 use pmkit_paper::{PaperExecutor, PaperLedgerEntry, PaperLedgerError};
 use pmkit_sim::SimulationConfig;
 use pmkit_spec::PaperRun;
@@ -689,6 +689,49 @@ pub async fn drive_with_control(
             reference.subscribe_reference(sink).await
         }));
     }
+    for requirement in run.settlement_oracle_requirements() {
+        if !run.settlement_oracle_bindings().iter().any(|binding| {
+            binding.name() == requirement.name()
+                && binding.market() == requirement.market()
+                && !binding.asset().trim().is_empty()
+        }) {
+            return Err(StartError::Source {
+                run: run.id().clone(),
+                source: pmkit_data::DataSourceError::Unavailable {
+                    message: format!(
+                        "required settlement oracle `{}` for market `{}` has no asset binding",
+                        requirement.name(),
+                        requirement.market(),
+                    ),
+                },
+            });
+        }
+    }
+    for binding in run.settlement_oracle_bindings() {
+        let source = control.oracle_source(binding.name()).ok_or_else(|| {
+            StartError::OracleSourceMissing {
+                run: run.id().clone(),
+                binding: binding.name().to_owned(),
+            }
+        })?;
+        let asset = binding
+            .asset()
+            .parse::<Asset>()
+            .map_err(|error| StartError::Source {
+                run: run.id().clone(),
+                source: pmkit_data::DataSourceError::Unavailable {
+                    message: format!(
+                        "invalid asset `{}` for settlement oracle binding `{}`: {error}",
+                        binding.asset(),
+                        binding.name(),
+                    ),
+                },
+            })?;
+        let name = binding.name().to_owned();
+        sources.push(SourceTaskDefinition::new(name, move |sink| async move {
+            source.subscribe_oracle(asset, sink).await
+        }));
+    }
     if let Some(account) = run.account_data_ref() {
         let account = account.clone();
         let portfolio = run.portfolio().clone();
@@ -697,8 +740,10 @@ pub async fn drive_with_control(
             move |sink| async move { account.subscribe_account(portfolio, sink).await },
         ));
     }
-    let feed = MergedFeed::from_tasks(FeedMode::Paper, sources, None).with_metrics(metrics.clone());
-    let merge = tokio::spawn(async move { feed.forward(event_tx).await });
+    let feed = MergedFeed::from_tasks(FeedMode::Paper, sources, None)
+        .with_metrics(metrics.clone())
+        .with_capture(control.capture().cloned());
+    let merge = tokio::spawn(async move { feed.forward_run(event_tx).await });
 
     let mut fills = paper.fill_count();
     metrics.set_fills(fills);
@@ -754,7 +799,9 @@ pub async fn drive_with_control(
         if let SourceEnvelope::CexReference(envelope) = &merged.source {
             cex_metrics.observe(&envelope.fact);
             let timestamp_ms = match &envelope.fact {
-                CexReferenceEvent::Trade { timestamp_ms, .. } => *timestamp_ms,
+                CexReferenceEvent::Trade { timestamp_ms, .. }
+                | CexReferenceEvent::Twap60sSnapshot { timestamp_ms, .. }
+                | CexReferenceEvent::Twap60sUpdate { timestamp_ms, .. } => *timestamp_ms,
             };
             update_loss_breach(
                 &paper,
@@ -976,9 +1023,15 @@ pub async fn drive_with_control(
                 message: format!("merged feed task failed: {error}"),
             },
         })?
-        .map_err(|source| StartError::Source {
-            run: run.id().clone(),
-            source,
+        .map_err(|source| match source {
+            FeedError::Source(source) => StartError::Source {
+                run: run.id().clone(),
+                source,
+            },
+            FeedError::Capture(source) => StartError::Capture {
+                run: run.id().clone(),
+                source,
+            },
         })?;
     drain_fills(&mut fill_rx);
     fills = paper.fill_count();

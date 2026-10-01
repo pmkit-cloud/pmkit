@@ -19,8 +19,12 @@ use pmkit_math::fill::walk_book;
 use rust_decimal::Decimal;
 
 mod fee;
+mod fill_drift;
 
 pub use fee::{FeeModel, FeeModelError};
+pub use fill_drift::{
+    FillDrift, FillDriftError, FillDriftReport, FillDriftStatus, compare_fill_drift,
+};
 pub use pmkit_math::fees::MarketCategory;
 
 type BookKey = (MarketId, Outcome);
@@ -501,5 +505,7 @@ impl SimEngine {
     }
 }
 
+#[cfg(test)]
+mod cancel_latency_tests;
 #[cfg(test)]
 mod tests;

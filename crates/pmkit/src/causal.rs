@@ -45,7 +45,10 @@ impl CexTradeMetricsState {
             qty,
             is_buyer_maker,
             ..
-        } = event;
+        } = event
+        else {
+            return;
+        };
         if let Some(previous) = self.last_price {
             self.momentum = *price - previous;
         }
@@ -173,7 +176,8 @@ pub enum RiskVerdict {
 /// A risk verdict linked to the action's index in its strategy evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionRiskVerdict {
-    /// The zero-based action index returned by the strategy.
+    /// The zero-based ordinal among placement verdicts in the strategy evaluation.
+    /// Cancellations don't count; each `ReplaceQuotes` placement has its own ordinal.
     pub action_index: u32,
     /// The decision made by the risk gate.
     pub verdict: RiskVerdict,
@@ -543,4 +547,41 @@ fn order_payload(action_index: u32, submitted_ms: i64, order: &PlaceOrder) -> Va
 
 fn decimal_option(value: Option<Decimal>) -> Option<String> {
     value.map(|decimal| decimal.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use pmkit_event::CexReferenceEvent;
+    use pmkit_market::{Asset, Exchange};
+    use rust_decimal::Decimal;
+
+    use super::CexTradeMetricsState;
+
+    #[test]
+    fn twap_events_do_not_change_trade_metrics() {
+        let mut state = CexTradeMetricsState::default();
+        state.observe(&CexReferenceEvent::Trade {
+            asset: Asset::Btc,
+            exchange: Exchange::Binance,
+            aggregate_trade_id: 1,
+            price: Decimal::new(100, 0),
+            qty: Decimal::new(2, 0),
+            is_buyer_maker: false,
+            timestamp_ms: 1,
+        });
+        let after_trade = state.snapshot();
+
+        state.observe(&CexReferenceEvent::Twap60sSnapshot {
+            asset: Asset::Btc,
+            price: Decimal::new(200, 0),
+            timestamp_ms: 2,
+        });
+        state.observe(&CexReferenceEvent::Twap60sUpdate {
+            asset: Asset::Btc,
+            price: Decimal::new(300, 0),
+            timestamp_ms: 3,
+        });
+
+        assert_eq!(state.snapshot(), after_trade);
+    }
 }

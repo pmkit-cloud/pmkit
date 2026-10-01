@@ -3752,6 +3752,7 @@ dependencies = [
  "pmkit-market",
  "pmkit-money",
  "pmkit-paper",
+ "pmkit-polymarket",
  "pmkit-run",
  "pmkit-runtime",
  "pmkit-sim",
@@ -3790,6 +3791,7 @@ dependencies = [
  "polymarket_client_sdk_v2",
  "rust_decimal",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
 ]
@@ -3964,6 +3966,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
  "turso",
  "zstd",
 ]

@@ -1,0 +1,16 @@
+{
+  "data": [
+    {
+      "proxy_wallet": "0x00000000000000000000000000000000000000aa",
+      "token_id": "token-1",
+      "current_size": "1",
+      "status": "OPEN"
+    }
+  ],
+  "pagination": {
+    "limit": 100,
+    "offset": 0,
+    "has_more": false,
+    "next_cursor": null
+  }
+}

@@ -14,12 +14,15 @@ use pmkit_event::{
 use serde_json::json;
 
 mod raw;
+mod run_capture;
 mod spool;
 mod spool_closed;
 mod spool_fs;
 mod spool_record;
 mod spool_recovery;
 
+#[cfg(test)]
+mod run_capture_tests;
 #[cfg(test)]
 mod spool_closed_tests;
 #[cfg(test)]
@@ -30,6 +33,11 @@ mod spool_tests;
 pub use raw::{
     RAW_TAPE_SCHEMA_VERSION, RawJsonLinesTape, RawTapeError, RawTapeRecord, RawTapeSink,
     decode_raw_record, recoverable_raw_tape_prefix,
+};
+pub use run_capture::{
+    CaptureTransport, GapRange, GapSequenceDomain, RAW_CAPTURE_SCHEMA_VERSION, RawCaptureDraft,
+    RawCaptureError, RawCapturePayload, RawCaptureReader, RawCaptureRecord, RawCaptureRecovery,
+    RawCaptureWriter, recover_raw_capture_prefix,
 };
 pub use spool::{
     RAW_SPOOL_SCHEMA_VERSION, RecoveryUncertainty, SpoolCheckpoint, SpoolChunk, SpoolError,
@@ -364,6 +372,26 @@ pub fn reference_envelope_json(envelope: &CexReferenceEnvelope) -> serde_json::V
             "qty": qty.to_string(),
             "is_buyer_maker": is_buyer_maker,
         }),
+        CexReferenceEvent::Twap60sSnapshot {
+            asset,
+            price,
+            timestamp_ms,
+        } => json!({
+            "kind": "reference_twap_60s_snapshot",
+            "ts": timestamp_ms,
+            "asset": asset.to_string(),
+            "price": price.to_string(),
+        }),
+        CexReferenceEvent::Twap60sUpdate {
+            asset,
+            price,
+            timestamp_ms,
+        } => json!({
+            "kind": "reference_twap_60s_update",
+            "ts": timestamp_ms,
+            "asset": asset.to_string(),
+            "price": price.to_string(),
+        }),
     };
     envelope_json(&envelope.metadata, &payload)
 }
@@ -385,10 +413,13 @@ fn envelope_json(metadata: &StreamMetadata, payload: &serde_json::Value) -> serd
 
 #[cfg(test)]
 mod tests {
-    use super::{JsonLinesTape, UserTapeSink, account_envelope_json};
+    use super::{JsonLinesTape, UserTapeSink, account_envelope_json, reference_envelope_json};
     use pmkit_core::{MarketId, PortfolioId};
-    use pmkit_event::{PmAccountEnvelope, PmAccountEvent, SettlementIdentity, StreamMetadata};
-    use pmkit_market::Outcome;
+    use pmkit_event::{
+        CexReferenceEnvelope, CexReferenceEvent, PmAccountEnvelope, PmAccountEvent,
+        SettlementIdentity, StreamMetadata,
+    };
+    use pmkit_market::{Asset, Outcome};
     use rust_decimal::Decimal;
 
     #[test]
@@ -426,6 +457,44 @@ mod tests {
         assert!(lines[0].contains("\"frame_sequence\":4"));
         assert!(lines[0].contains("\"ingest_sequence\":3"));
         Ok(())
+    }
+
+    #[test]
+    fn oracle_snapshot_and_update_keep_distinct_json_kinds() {
+        let metadata = StreamMetadata {
+            schema_version: 1,
+            source_id: "polybolt:oracle".into(),
+            source_time_ms: 1,
+            canonical_source_rank: 0,
+            receipt_time_ms: 2,
+            connection_id: "oracle-1".into(),
+            connection_epoch: 3,
+            frame_sequence: 4,
+            ingest_sequence: 5,
+        };
+        let snapshot = reference_envelope_json(&CexReferenceEnvelope {
+            metadata: metadata.clone(),
+            raw_frame: b"snapshot bytes".to_vec(),
+            fact: CexReferenceEvent::Twap60sSnapshot {
+                asset: Asset::Btc,
+                price: Decimal::from(42),
+                timestamp_ms: 1,
+            },
+        });
+        let update = reference_envelope_json(&CexReferenceEnvelope {
+            metadata,
+            raw_frame: b"update bytes".to_vec(),
+            fact: CexReferenceEvent::Twap60sUpdate {
+                asset: Asset::Btc,
+                price: Decimal::from(43),
+                timestamp_ms: 2,
+            },
+        });
+
+        assert_eq!(snapshot["payload"]["kind"], "reference_twap_60s_snapshot");
+        assert_eq!(snapshot["payload"]["price"], "42");
+        assert_eq!(update["payload"]["kind"], "reference_twap_60s_update");
+        assert_eq!(update["payload"]["price"], "43");
     }
 
     #[test]

@@ -2,21 +2,23 @@ use super::{
     BacktestReport, RunControl, RunLifecycleEvent, StartError, StrategyInstance,
     instantiate_strategies, observe_reconnect, store_signal,
 };
-use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
+use crate::capture_replay::CaptureReplaySource;
+use crate::feed::{FeedError, FeedMode, MergedFeed, SourceTaskDefinition};
 use pmkit_accounting::{
     ExposureReservation, PortfolioExposure, PositionExposure, aggregate_exposure,
 };
 use pmkit_book::OrderBookL2;
-use pmkit_core::MarketId;
-use pmkit_data::ReplayQuery;
+use pmkit_core::{MarketId, RunId};
+use pmkit_data::{ReplayQuery, SourceSignal};
 use pmkit_event::{CexReferenceEvent, MarketEvent, SourceEnvelope, StrategyFact};
-use pmkit_market::Outcome;
+use pmkit_market::{Asset, Outcome};
 use pmkit_sim::{SimEngine, SimulationConfig};
 use pmkit_spec::BacktestRun;
 use pmkit_store::{OwnerScope, TapeStore};
 use pmkit_strategy::{Action, LogicalTimestamp, StrategyContext};
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::BufRead;
 
 #[expect(
     clippy::too_many_lines,
@@ -27,7 +29,7 @@ pub async fn drive_with_control(
     store: Option<&dyn TapeStore>,
     control: &RunControl,
 ) -> Result<BacktestReport, StartError> {
-    let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
+    let strategies = instantiate_strategies(run.strategies(), run.id())?;
     let metrics = control.metrics_for(run.id());
 
     let markets = strategies
@@ -44,6 +46,30 @@ pub async fn drive_with_control(
         retrieval_wait: run.replay().retrieval_wait(),
     };
     let primary_query = query.clone();
+    for requirement in run.settlement_oracle_requirements() {
+        let binding = run.settlement_oracle_bindings().iter().any(|binding| {
+            binding.name() == requirement.name()
+                && binding.market() == requirement.market()
+                && !binding.asset().trim().is_empty()
+        });
+        let historical_source = run
+            .replay()
+            .reference_source_refs()
+            .iter()
+            .any(|(name, _)| name == requirement.name());
+        if !binding || !historical_source {
+            return Err(StartError::Source {
+                run: run.id().clone(),
+                source: pmkit_data::DataSourceError::Unavailable {
+                    message: format!(
+                        "required settlement oracle `{}` for market `{}` needs a matching asset binding and named historical replay source",
+                        requirement.name(),
+                        requirement.market(),
+                    ),
+                },
+            });
+        }
+    }
     let mut sources = vec![SourceTaskDefinition::new("pm", move |sink| async move {
         source.replay(primary_query, sink).await
     })];
@@ -60,27 +86,12 @@ pub async fn drive_with_control(
         sources,
         Some(run.replay().to().timestamp_millis()),
     )
-    .with_metrics(metrics.clone());
-    let replay = tokio::spawn(async move { feed.forward(tx).await });
+    .with_metrics(metrics.clone())
+    .with_capture(control.capture().cloned());
+    let replay = tokio::spawn(async move { feed.forward_run(tx).await });
 
-    // ponytail: fee category fixed to Crypto; positions tracked from fills.
-    let simulation = run.simulation();
-    let simulation_config = SimulationConfig {
-        activation_latency_ms: i64::try_from(simulation.activation_latency.as_millis())
-            .unwrap_or(i64::MAX),
-        maker_queue_ahead_bps: simulation.maker_queue_ahead_bps,
-        slippage_bps: simulation.slippage_bps,
-        market_impact_bps: simulation.market_impact_bps,
-        fee_model: Some(simulation.resolved_fee_model()),
-        market_limits: simulation.market_limits,
-    };
-    let mut sim = SimEngine::with_fee_config("bt", 0, simulation_config);
-    let mut positions_by_market: HashMap<MarketId, Vec<pmkit_book::Position>> = HashMap::new();
-    let mut marks: HashMap<(MarketId, Outcome), Decimal> = HashMap::new();
-    let mut strategy_books = vec![OrderBookL2::default(); strategies.len()];
-    let mut connection_epochs = HashMap::new();
-    let mut cex_metrics = crate::causal::CexTradeMetricsState::default();
-    let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
+    let mut processor =
+        BacktestProcessor::new(run, store, strategies, metrics.clone(), HashSet::new());
     control.emit(RunLifecycleEvent::Started {
         run: run.id().clone(),
     });
@@ -88,14 +99,7 @@ pub async fn drive_with_control(
         control.emit(RunLifecycleEvent::Cancelled {
             run: run.id().clone(),
         });
-        let metrics = metrics.snapshot();
-        return Ok(BacktestReport {
-            run: run.id().clone(),
-            events_processed: metrics.events_processed,
-            fills: metrics.fills,
-            metrics,
-            exposure: report_exposure(&positions_by_market, &marks, &sim.open_orders()),
-        });
+        return Ok(processor.report());
     }
 
     while let Some(merged) = rx.recv().await {
@@ -103,81 +107,465 @@ pub async fn drive_with_control(
             control.emit(RunLifecycleEvent::Cancelled {
                 run: run.id().clone(),
             });
-            let metrics = metrics.snapshot();
-            return Ok(BacktestReport {
-                run: run.id().clone(),
-                events_processed: metrics.events_processed,
-                fills: metrics.fills,
-                metrics,
-                exposure: report_exposure(&positions_by_market, &marks, &sim.open_orders()),
-            });
+            return Ok(processor.report());
         }
-        if observe_reconnect(&merged.source, &mut connection_epochs) {
-            metrics.reconnect();
-        }
-        store_signal(
-            store,
-            &scope,
-            &pmkit_data::SourceSignal::Data(Box::new(merged.source.clone())),
-        )
+        processor
+            .process_signal(control, SourceSignal::Data(Box::new(merged.source)), false)
+            .await?;
+    }
+
+    replay
         .await
-        .map_err(|source| StartError::Storage {
+        .map_err(|error| StartError::Source {
             run: run.id().clone(),
-            source,
+            source: pmkit_data::DataSourceError::ReplayGap {
+                message: format!("merged feed task failed: {error}"),
+            },
+        })?
+        .map_err(|error| match error {
+            FeedError::Source(source) => StartError::Source {
+                run: run.id().clone(),
+                source,
+            },
+            FeedError::Capture(source) => StartError::Capture {
+                run: run.id().clone(),
+                source,
+            },
         })?;
-        if let SourceEnvelope::CexReference(envelope) = &merged.source {
-            cex_metrics.observe(&envelope.fact);
-            let timestamp_ms = match &envelope.fact {
-                CexReferenceEvent::Trade { timestamp_ms, .. } => *timestamp_ms,
-            };
+    control.emit(RunLifecycleEvent::Completed {
+        run: run.id().clone(),
+    });
+    Ok(processor.report())
+}
+
+/// A backtest that consumes one raw capture directly in its writer-assigned order.
+///
+/// The run's configured primary historical source is replaced by the capture;
+/// named reference histories are rejected rather than silently mixed in.
+pub struct RecordedBacktest<'a, R: BufRead + Send + 'static> {
+    run: &'a BacktestRun,
+    source: CaptureReplaySource<R>,
+}
+
+impl<R: BufRead + Send + 'static> std::fmt::Debug for RecordedBacktest<'_, R> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecordedBacktest")
+            .field("run_id", self.run.id())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, R: BufRead + Send + 'static> RecordedBacktest<'a, R> {
+    /// Creates a recorded-order backtest from a template run and one capture source.
+    #[must_use]
+    pub const fn replay_capture(run: &'a BacktestRun, source: CaptureReplaySource<R>) -> Self {
+        Self { run, source }
+    }
+
+    /// Replays the capture without requiring internal runtime controls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if validation, strategy initialization, replay, capture, or storage fails.
+    pub async fn drive(self, store: Option<&dyn TapeStore>) -> Result<BacktestReport, StartError> {
+        self.drive_with_control(store, &RunControl::default()).await
+    }
+
+    pub(crate) async fn drive_with_control(
+        self,
+        store: Option<&dyn TapeStore>,
+        control: &RunControl,
+    ) -> Result<BacktestReport, StartError> {
+        let required_oracles = validate_recorded_run(self.run)?;
+        let strategies = instantiate_strategies(self.run.strategies(), self.run.id())?;
+        let metrics = control.metrics_for(self.run.id());
+        let mut processor =
+            BacktestProcessor::new(self.run, store, strategies, metrics, required_oracles);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+        let replay = tokio::spawn(self.source.replay_recorded_order(tx));
+        let mut eof_seen = false;
+        control.emit(RunLifecycleEvent::Started {
+            run: self.run.id().clone(),
+        });
+
+        while let Some(signal) = rx.recv().await {
+            if control.is_cancelled() {
+                control.emit(RunLifecycleEvent::Cancelled {
+                    run: self.run.id().clone(),
+                });
+                replay.abort();
+                let _ = replay.await;
+                return Ok(processor.report());
+            }
+            if eof_seen {
+                replay.abort();
+                let _ = replay.await;
+                return Err(recorded_source_error(
+                    self.run.id(),
+                    "capture emitted a signal after EOF",
+                ));
+            }
+            eof_seen = matches!(signal, SourceSignal::Eof);
+            if let Err(source) =
+                crate::capture::capture_merged_source_signal(control.capture(), &signal)
+            {
+                replay.abort();
+                let _ = replay.await;
+                return Err(StartError::Capture {
+                    run: self.run.id().clone(),
+                    source,
+                });
+            }
+            if let Err(error) = processor.process_signal(control, signal, true).await {
+                replay.abort();
+                let _ = replay.await;
+                return Err(error);
+            }
+        }
+
+        replay
+            .await
+            .map_err(|error| {
+                recorded_source_error(
+                    self.run.id(),
+                    &format!("capture replay task failed: {error}"),
+                )
+            })?
+            .map_err(|source| StartError::Source {
+                run: self.run.id().clone(),
+                source,
+            })?;
+        if !eof_seen {
+            return Err(recorded_source_error(
+                self.run.id(),
+                "capture ended without an orderly EOF signal",
+            ));
+        }
+        processor.validate_observed_oracles()?;
+        control.emit(RunLifecycleEvent::Completed {
+            run: self.run.id().clone(),
+        });
+        Ok(processor.report())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RequiredOracle {
+    name: String,
+    market: MarketId,
+    asset: Asset,
+    source_id: String,
+}
+
+fn validate_recorded_run(run: &BacktestRun) -> Result<HashSet<RequiredOracle>, StartError> {
+    if !run.replay().reference_source_refs().is_empty() {
+        return Err(recorded_source_error(
+            run.id(),
+            "recorded backtests cannot combine a capture with independent reference histories",
+        ));
+    }
+    let mut required = HashSet::new();
+    for requirement in run.settlement_oracle_requirements() {
+        let binding = run.settlement_oracle_bindings().iter().find(|binding| {
+            binding.name() == requirement.name() && binding.market() == requirement.market()
+        });
+        let Some(binding) = binding else {
+            return Err(recorded_source_error(
+                run.id(),
+                &format!(
+                    "required settlement oracle `{}` for market `{}` has no matching capture binding",
+                    requirement.name(),
+                    requirement.market(),
+                ),
+            ));
+        };
+        if binding.name().trim().is_empty() || binding.asset().trim().is_empty() {
+            return Err(recorded_source_error(
+                run.id(),
+                &format!(
+                    "required settlement oracle `{}` for market `{}` needs a nonblank name and asset binding",
+                    requirement.name(),
+                    requirement.market(),
+                ),
+            ));
+        }
+        let asset = binding.asset().parse::<Asset>().map_err(|error| {
+            recorded_source_error(
+                run.id(),
+                &format!(
+                    "required settlement oracle `{}` has an invalid asset binding: {error}",
+                    requirement.name(),
+                ),
+            )
+        })?;
+        required.insert(RequiredOracle {
+            name: binding.name().to_owned(),
+            market: binding.market().clone(),
+            asset,
+            source_id: binding.source_id().to_owned(),
+        });
+    }
+    Ok(required)
+}
+
+fn recorded_source_error(run: &RunId, message: &str) -> StartError {
+    StartError::Source {
+        run: run.clone(),
+        source: pmkit_data::DataSourceError::ReplayGap {
+            message: message.to_owned(),
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EventClocks {
+    strategy_ms: i64,
+    activation_ms: i64,
+}
+
+const fn strategy_timestamp_ms(source: &SourceEnvelope) -> Option<i64> {
+    match source {
+        SourceEnvelope::PmMarket(envelope) => match &envelope.fact {
+            MarketEvent::BookUpdate { timestamp_ms, .. } => Some(*timestamp_ms),
+            _ => None,
+        },
+        SourceEnvelope::CexReference(envelope) => Some(match &envelope.fact {
+            CexReferenceEvent::Trade { timestamp_ms, .. }
+            | CexReferenceEvent::Twap60sSnapshot { timestamp_ms, .. }
+            | CexReferenceEvent::Twap60sUpdate { timestamp_ms, .. } => *timestamp_ms,
+        }),
+        SourceEnvelope::PmAccount(_) => None,
+    }
+}
+
+struct BacktestProcessor<'a> {
+    run: &'a BacktestRun,
+    store: Option<&'a dyn TapeStore>,
+    scope: OwnerScope,
+    metrics: crate::RunMetrics,
+    simulation_config: SimulationConfig,
+    strategies: Vec<StrategyInstance>,
+    sim: SimEngine,
+    positions_by_market: HashMap<MarketId, Vec<pmkit_book::Position>>,
+    marks: HashMap<(MarketId, Outcome), Decimal>,
+    strategy_books: Vec<OrderBookL2>,
+    connection_epochs: HashMap<String, i64>,
+    cex_metrics: crate::causal::CexTradeMetricsState,
+    required_oracles: HashSet<RequiredOracle>,
+    observed_oracles: HashSet<RequiredOracle>,
+}
+
+impl<'a> BacktestProcessor<'a> {
+    fn new(
+        run: &'a BacktestRun,
+        store: Option<&'a dyn TapeStore>,
+        strategies: Vec<StrategyInstance>,
+        metrics: crate::RunMetrics,
+        required_oracles: HashSet<RequiredOracle>,
+    ) -> Self {
+        // ponytail: fee category fixed to Crypto; positions tracked from fills.
+        let simulation = run.simulation();
+        let simulation_config = SimulationConfig {
+            activation_latency_ms: i64::try_from(simulation.activation_latency.as_millis())
+                .unwrap_or(i64::MAX),
+            maker_queue_ahead_bps: simulation.maker_queue_ahead_bps,
+            slippage_bps: simulation.slippage_bps,
+            market_impact_bps: simulation.market_impact_bps,
+            fee_model: Some(simulation.resolved_fee_model()),
+            market_limits: simulation.market_limits,
+        };
+        Self {
+            run,
+            store,
+            scope: OwnerScope::new(run.portfolio().clone(), run.id().clone()),
+            metrics,
+            simulation_config,
+            strategy_books: vec![OrderBookL2::default(); strategies.len()],
+            strategies,
+            sim: SimEngine::with_fee_config("bt", 0, simulation_config),
+            positions_by_market: HashMap::new(),
+            marks: HashMap::new(),
+            connection_epochs: HashMap::new(),
+            cex_metrics: crate::causal::CexTradeMetricsState::default(),
+            required_oracles,
+            observed_oracles: HashSet::new(),
+        }
+    }
+
+    async fn process_signal(
+        &mut self,
+        _control: &RunControl,
+        signal: SourceSignal,
+        recorded_order: bool,
+    ) -> Result<(), StartError> {
+        store_signal(self.store, &self.scope, &signal)
+            .await
+            .map_err(|source| StartError::Storage {
+                run: self.run.id().clone(),
+                source,
+            })?;
+        match signal {
+            SourceSignal::Data(source) => {
+                if observe_reconnect(&source, &mut self.connection_epochs) {
+                    self.metrics.reconnect();
+                }
+                if recorded_order && matches!(source.as_ref(), SourceEnvelope::PmAccount(_)) {
+                    return Err(recorded_source_error(
+                        self.run.id(),
+                        "recorded PM account facts are unsupported because backtest order acknowledgements cannot be reconstructed safely",
+                    ));
+                }
+                if recorded_order {
+                    self.observe_oracle(&source);
+                }
+                if matches!(source.as_ref(), SourceEnvelope::PmMarket(_)) {
+                    self.metrics.event();
+                }
+                if let Some(strategy_ms) = strategy_timestamp_ms(&source) {
+                    let activation_ms = if recorded_order {
+                        source.metadata().receipt_time_ms
+                    } else {
+                        strategy_ms
+                    };
+                    self.process_fact(
+                        *source,
+                        EventClocks {
+                            strategy_ms,
+                            activation_ms,
+                        },
+                    )
+                    .await?;
+                }
+            }
+            SourceSignal::Gap(gap) => {
+                let range = gap.range.map_or_else(
+                    || "unknown sequence range".to_owned(),
+                    |range| {
+                        format!(
+                            "{:?} sequences {}..={}",
+                            range.domain, range.first_missing, range.last_missing
+                        )
+                    },
+                );
+                return Err(recorded_source_error(
+                    self.run.id(),
+                    &format!(
+                        "recorded capture gap for {} ({range}): {}",
+                        gap.source_id, gap.reason,
+                    ),
+                ));
+            }
+            SourceSignal::Heartbeat(_) | SourceSignal::Watermark(_) | SourceSignal::Eof => {}
+        }
+        Ok(())
+    }
+
+    fn observe_oracle(&mut self, source: &SourceEnvelope) {
+        let SourceEnvelope::CexReference(envelope) = source else {
+            return;
+        };
+        let asset = match &envelope.fact {
+            CexReferenceEvent::Twap60sSnapshot { asset, .. }
+            | CexReferenceEvent::Twap60sUpdate { asset, .. } => *asset,
+            CexReferenceEvent::Trade { .. } => return,
+        };
+        self.observed_oracles.extend(
+            self.required_oracles
+                .iter()
+                .filter(|required| {
+                    required.source_id == envelope.metadata.source_id && required.asset == asset
+                })
+                .cloned(),
+        );
+    }
+
+    fn validate_observed_oracles(&self) -> Result<(), StartError> {
+        let missing = self
+            .required_oracles
+            .difference(&self.observed_oracles)
+            .map(|required| {
+                format!(
+                    "{} for market {} ({})",
+                    required.name, required.market, required.asset
+                )
+            })
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(recorded_source_error(
+            self.run.id(),
+            &format!(
+                "capture ended without required settlement oracle facts: {}",
+                missing.join(", "),
+            ),
+        ))
+    }
+
+    async fn process_fact(
+        &mut self,
+        source: SourceEnvelope,
+        clocks: EventClocks,
+    ) -> Result<(), StartError> {
+        if let SourceEnvelope::CexReference(envelope) = &source {
+            self.cex_metrics.observe(&envelope.fact);
+            let fact = StrategyFact::Reference(envelope.fact.clone());
             let (added, rejected, decisions, evaluations) =
                 run_strategies(&mut RunStrategiesInputs {
-                    strategies: &mut strategies,
-                    fact: &merged.fact,
+                    strategies: &mut self.strategies,
+                    fact: &fact,
                     market: None,
                     book: None,
                     event_stream: "reference",
-                    strategy_books: &mut strategy_books,
-                    positions_by_market: &mut positions_by_market,
-                    timestamp_ms,
-                    sim: &mut sim,
+                    strategy_books: &mut self.strategy_books,
+                    positions_by_market: &mut self.positions_by_market,
+                    clocks,
+                    sim: &mut self.sim,
                 });
-            metrics.add_fills(added);
-            metrics.add_rejected(rejected);
-            metrics.add_decisions(decisions);
-            if let Some(store) = store {
+            self.metrics.add_fills(added);
+            self.metrics.add_rejected(rejected);
+            self.metrics.add_decisions(decisions);
+            if let Some(store) = self.store {
                 for evaluation in evaluations {
                     let identity = crate::causal::strategy_decision_identity(
-                        &scope,
+                        &self.scope,
                         "backtest-reference",
                         &evaluation.strategy,
                         &evaluation.market,
                         &evaluation.event_stream,
-                        timestamp_ms,
+                        clocks.strategy_ms,
                         &envelope.metadata,
                     );
                     crate::causal::record_book_decision(
                         store,
                         &identity,
                         &evaluation.book,
-                        cex_metrics.snapshot(),
+                        self.cex_metrics.snapshot(),
                         evaluation.verdicts,
-                        Some(simulation_config),
+                        Some(self.simulation_config),
                     )
                     .await
                     .map_err(|source| StartError::Storage {
-                        run: run.id().clone(),
+                        run: self.run.id().clone(),
                         source,
                     })?;
                 }
             }
-            continue;
+            return Ok(());
         }
-        let SourceEnvelope::PmMarket(envelope) = merged.source else {
-            continue;
+        self.process_market_fact(source, clocks).await
+    }
+
+    async fn process_market_fact(
+        &mut self,
+        source: SourceEnvelope,
+        clocks: EventClocks,
+    ) -> Result<(), StartError> {
+        let SourceEnvelope::PmMarket(envelope) = source else {
+            return Ok(());
         };
         let event = envelope.fact;
-        metrics.event();
         if let MarketEvent::BookUpdate {
             market,
             outcome,
@@ -193,82 +581,77 @@ pub async fn drive_with_control(
                 last_trade_price: None,
             };
             if let Some(mark) = book.mid_price() {
-                marks.insert((market.clone(), *outcome), mark);
+                self.marks.insert((market.clone(), *outcome), mark);
             } else {
-                marks.remove(&(market.clone(), *outcome));
+                self.marks.remove(&(market.clone(), *outcome));
             }
-            sim.update_book(market, *outcome, book.clone());
-            let drained = sim.drain_fills();
-            metrics.add_fills(absorb_market_fills(&drained, &mut positions_by_market));
+            let mut simulation_book = book.clone();
+            simulation_book.timestamp_ms = clocks.activation_ms;
+            self.sim.update_book(market, *outcome, simulation_book);
+            let drained = self.sim.drain_fills();
+            self.metrics
+                .add_fills(absorb_market_fills(&drained, &mut self.positions_by_market));
             let fact = StrategyFact::Market(event.clone());
             let event_stream = format!("market:{market}:{}", outcome.to_string().to_lowercase());
             let (added, rejected, decisions, evaluations) =
                 run_strategies(&mut RunStrategiesInputs {
-                    strategies: &mut strategies,
+                    strategies: &mut self.strategies,
                     fact: &fact,
                     market: Some(market),
                     book: Some(&book),
                     event_stream: &event_stream,
-                    strategy_books: &mut strategy_books,
-                    positions_by_market: &mut positions_by_market,
-                    timestamp_ms: *timestamp_ms,
-                    sim: &mut sim,
+                    strategy_books: &mut self.strategy_books,
+                    positions_by_market: &mut self.positions_by_market,
+                    clocks,
+                    sim: &mut self.sim,
                 });
-            metrics.add_fills(added);
-            metrics.add_rejected(rejected);
-            metrics.add_decisions(decisions);
-            if let Some(store) = store {
+            self.metrics.add_fills(added);
+            self.metrics.add_rejected(rejected);
+            self.metrics.add_decisions(decisions);
+            if let Some(store) = self.store {
                 for evaluation in evaluations {
                     let identity = crate::causal::strategy_decision_identity(
-                        &scope,
+                        &self.scope,
                         "backtest-market",
                         &evaluation.strategy,
                         &evaluation.market,
                         &evaluation.event_stream,
-                        *timestamp_ms,
+                        clocks.strategy_ms,
                         &envelope.metadata,
                     );
                     crate::causal::record_book_decision(
                         store,
                         &identity,
                         &evaluation.book,
-                        cex_metrics.snapshot(),
+                        self.cex_metrics.snapshot(),
                         evaluation.verdicts,
-                        Some(simulation_config),
+                        Some(self.simulation_config),
                     )
                     .await
                     .map_err(|source| StartError::Storage {
-                        run: run.id().clone(),
+                        run: self.run.id().clone(),
                         source,
                     })?;
                 }
             }
         }
+        Ok(())
     }
 
-    replay
-        .await
-        .map_err(|error| StartError::Source {
-            run: run.id().clone(),
-            source: pmkit_data::DataSourceError::ReplayGap {
-                message: format!("merged feed task failed: {error}"),
-            },
-        })?
-        .map_err(|source| StartError::Source {
-            run: run.id().clone(),
-            source,
-        })?;
-    control.emit(RunLifecycleEvent::Completed {
-        run: run.id().clone(),
-    });
-    let metrics = metrics.snapshot();
-    Ok(BacktestReport {
-        run: run.id().clone(),
-        events_processed: metrics.events_processed,
-        fills: metrics.fills,
-        metrics,
-        exposure: report_exposure(&positions_by_market, &marks, &sim.open_orders()),
-    })
+    fn report(&self) -> BacktestReport {
+        let metrics = self.metrics.snapshot();
+        BacktestReport {
+            run: self.run.id().clone(),
+            events_processed: metrics.events_processed,
+            fills: metrics.fills,
+            metrics,
+            exposure: report_exposure(
+                &self.positions_by_market,
+                &self.marks,
+                &self.sim.open_orders(),
+            ),
+        }
+    }
 }
 
 fn absorb_market_fills(
@@ -333,7 +716,7 @@ struct RunStrategiesInputs<'a> {
     event_stream: &'a str,
     strategy_books: &'a mut [OrderBookL2],
     positions_by_market: &'a mut HashMap<MarketId, Vec<pmkit_book::Position>>,
-    timestamp_ms: i64,
+    clocks: EventClocks,
     sim: &'a mut SimEngine,
 }
 
@@ -372,7 +755,7 @@ fn run_strategies(
             market: &instance.market,
             book,
             positions,
-            now: LogicalTimestamp::from_millis(inputs.timestamp_ms),
+            now: LogicalTimestamp::from_millis(inputs.clocks.strategy_ms),
         };
         decisions += 1;
         let mut verdicts = Vec::new();
@@ -383,7 +766,7 @@ fn run_strategies(
                         inputs.sim,
                         &instance.id,
                         order,
-                        inputs.timestamp_ms,
+                        inputs.clocks.activation_ms,
                         &mut verdicts,
                         &mut rejected,
                     ),
@@ -399,7 +782,7 @@ fn run_strategies(
                                 inputs.sim,
                                 &instance.id,
                                 order,
-                                inputs.timestamp_ms,
+                                inputs.clocks.activation_ms,
                                 &mut verdicts,
                                 &mut rejected,
                             );

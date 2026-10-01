@@ -10,7 +10,7 @@ impl VerifiedBinanceArchiveCache {
     pub(super) async fn replay_key(
         &self,
         key: ArchiveKey,
-    ) -> Result<Vec<pmkit_event::CexReferenceEvent>, DataSourceError> {
+    ) -> Result<Vec<(pmkit_event::CexReferenceEvent, Vec<u8>)>, DataSourceError> {
         let lock = self.lock_key(key).await?;
         let _guard = lock;
         let paths = self.paths(key);

@@ -1,25 +1,28 @@
 use crate::{
-    Pmkit, RunReport,
+    Pmkit, RunReport, StartError,
     test_support::{BuyFactory, config, risk},
 };
 use async_trait::async_trait;
 use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
 use pmkit_data::{
-    DataSourceError, LiveAccountDataSource, LiveCexDataSource, LiveDataSource, SourceSignal,
+    DataSourceError, LiveAccountDataSource, LiveCexDataSource, LiveDataSource,
+    LiveOracleDataSource, SourceSignal,
 };
 use pmkit_event::{
     CexReferenceEnvelope, CexReferenceEvent, MarketEvent, PmAccountEnvelope, PmAccountEvent,
-    SourceEnvelope, StreamMetadata,
+    PmMarketEnvelope, SourceEnvelope, StreamMetadata,
 };
-use pmkit_market::{Asset, Exchange, Outcome};
+use pmkit_market::{Asset, Outcome};
 use pmkit_money::Money;
 use pmkit_runtime::{PartialRiskLimits, RiskLimitOverrides, StrategyRegistration};
-use pmkit_spec::{ConservativeV1Config, PaperRun};
+use pmkit_spec::{ConservativeV1Config, POLYBOLT_ORACLE_SOURCE_ID, PaperRun};
 use pmkit_store::{OwnerScope, TapeStore, TursoTapeStore};
 use pmkit_strategy::{
     Action, Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
 };
+use pmkit_tape::{RawCapturePayload, RawCaptureReader};
 use rust_decimal::Decimal;
+use std::io::BufReader;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::{
     Arc,
@@ -28,9 +31,17 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
+const ORACLE_BINDING: &str = "polybolt:oracle";
+const ORACLE_FRAME: &[u8] = br#"{"oracle":"twap60s","price":"0.42"}"#;
+const CEX_LIQUIDITY_BOOK_FRAME: &[u8] = br#"{"event_type":"book","market":"0x0000000000000000000000000000000000000000000000000000000000000001","asset_id":"1","timestamp":"0","bids":[{"price":"0.38","size":"2"}],"asks":[{"price":"0.39","size":"2"}]}"#;
+
 struct ScriptedLive;
 
 struct BothOutcomesLive;
+
+struct NoEventLive;
+
+struct CexLiquidityLive;
 
 struct ScriptedReferenceLive;
 
@@ -44,6 +55,10 @@ struct ReferenceBuyerFactory {
     nonempty_books: Arc<AtomicUsize>,
 }
 
+struct CexOrderStrategy(Arc<AtomicUsize>);
+
+struct CexOrderFactory(Arc<AtomicUsize>);
+
 struct StaleMarkLive;
 
 struct RiskSequenceLive {
@@ -53,6 +68,22 @@ struct RiskSequenceLive {
 struct FailingLive;
 
 struct MismatchedAccountSource;
+
+struct ScriptedOracle {
+    frames: Vec<OracleFrame>,
+    gap_before_frames: bool,
+}
+
+struct OracleFrame {
+    frame_sequence: i64,
+    ingest_sequence: u64,
+    timestamp_ms: i64,
+    raw_frame: Vec<u8>,
+}
+
+struct OracleProbe(Arc<AtomicUsize>);
+
+struct OracleProbeFactory(Arc<AtomicUsize>);
 
 struct CancelLive;
 
@@ -153,6 +184,27 @@ impl StrategyFactory for MultiQuoteFactory {
     }
 }
 
+impl Strategy for OracleProbe {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        if matches!(
+            context.fact,
+            pmkit_event::StrategyFact::Reference(CexReferenceEvent::Twap60sUpdate {
+                asset: Asset::Btc,
+                ..
+            })
+        ) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(Actions::none())
+    }
+}
+
+impl StrategyFactory for OracleProbeFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(OracleProbe(Arc::clone(&self.0))))
+    }
+}
+
 impl Strategy for CancelAfterPlace {
     fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
         self.seen += 1;
@@ -215,6 +267,30 @@ impl StrategyFactory for ReferenceBuyerFactory {
     }
 }
 
+impl Strategy for CexOrderStrategy {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        if !matches!(context.fact, pmkit_event::StrategyFact::Reference(_)) {
+            return Ok(Actions::none());
+        }
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Ok(Actions::place(pmkit_exec::PlaceOrder {
+            market: context.market.clone(),
+            outcome: Outcome::Up,
+            side: pmkit_book::Side::Buy,
+            price: Decimal::new(40, 2),
+            qty: Decimal::ONE,
+            post_only: false,
+            tif: pmkit_exec::TimeInForce::Gtc,
+        }))
+    }
+}
+
+impl StrategyFactory for CexOrderFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(CexOrderStrategy(Arc::clone(&self.0))))
+    }
+}
+
 #[async_trait]
 impl LiveDataSource for CancelLive {
     async fn subscribe(
@@ -261,13 +337,10 @@ impl LiveCexDataSource for ScriptedReferenceLive {
                     frame_sequence: 1,
                     ingest_sequence: 1,
                 },
-                fact: CexReferenceEvent::Trade {
+                raw_frame: br#"{"oracle":"twap60s","price":"0.42"}"#.to_vec(),
+                fact: CexReferenceEvent::Twap60sUpdate {
                     asset: Asset::Btc,
-                    exchange: Exchange::Binance,
-                    aggregate_trade_id: 1,
                     price: Decimal::new(42, 2),
-                    qty: Decimal::ONE,
-                    is_buyer_maker: false,
                     timestamp_ms: 1,
                 },
             },
@@ -277,6 +350,58 @@ impl LiveCexDataSource for ScriptedReferenceLive {
         sink.send(SourceSignal::Watermark(i64::MAX))
             .await
             .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+#[async_trait]
+impl LiveOracleDataSource for ScriptedOracle {
+    async fn subscribe_oracle(
+        &self,
+        asset: Asset,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        if self.gap_before_frames {
+            sink.send(SourceSignal::Gap(pmkit_data::SourceGap {
+                source_id: POLYBOLT_ORACLE_SOURCE_ID.to_owned(),
+                detected_at_ms: 1, /*explicit syntheticclock fixture*/
+                metadata: None,
+                raw_frame: Vec::new(),
+                range: None,
+                unresolved_count: None,
+                reason: "scripted oracle gap".into(),
+            }))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        }
+        for frame in &self.frames {
+            sink.send(SourceSignal::Data(Box::new(SourceEnvelope::CexReference(
+                CexReferenceEnvelope {
+                    metadata: StreamMetadata {
+                        schema_version: 1,
+                        source_id: POLYBOLT_ORACLE_SOURCE_ID.to_owned(),
+                        source_time_ms: frame.timestamp_ms,
+                        canonical_source_rank: 1,
+                        receipt_time_ms: frame.timestamp_ms,
+                        connection_id: "paper-oracle".into(),
+                        connection_epoch: 0,
+                        frame_sequence: frame.frame_sequence,
+                        ingest_sequence: frame.ingest_sequence,
+                    },
+                    raw_frame: frame.raw_frame.clone(),
+                    fact: CexReferenceEvent::Twap60sUpdate {
+                        asset,
+                        price: Decimal::new(42, 2),
+                        timestamp_ms: frame.timestamp_ms,
+                    },
+                },
+            ))))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        }
+        // Paper receipt-order feeds must accept finite oracle sources without watermarks.
         sink.send(SourceSignal::Eof)
             .await
             .map_err(|_| DataSourceError::SinkClosed)
@@ -318,6 +443,64 @@ impl LiveAccountDataSource for MismatchedAccountSource {
         ))))
         .await
         .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+#[async_trait]
+impl LiveDataSource for NoEventLive {
+    async fn subscribe(
+        &self,
+        _market: MarketId,
+        _outcome: Outcome,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
+#[async_trait]
+impl LiveDataSource for CexLiquidityLive {
+    async fn subscribe(
+        &self,
+        market: MarketId,
+        outcome: Outcome,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        if outcome == Outcome::Up {
+            sink.send(SourceSignal::Data(Box::new(SourceEnvelope::PmMarket(
+                PmMarketEnvelope {
+                    metadata: StreamMetadata {
+                        schema_version: 1,
+                        source_id: "polymarket:market-ws".into(),
+                        source_time_ms: 0,
+                        canonical_source_rank: 0,
+                        receipt_time_ms: 0,
+                        connection_id: "paper-cex-market".into(),
+                        connection_epoch: 0,
+                        frame_sequence: 1,
+                        ingest_sequence: 1,
+                    },
+                    raw_frame: CEX_LIQUIDITY_BOOK_FRAME.to_vec(),
+                    fact: MarketEvent::BookUpdate {
+                        market,
+                        outcome,
+                        bids: vec![(Decimal::new(38, 2), Decimal::from(2))],
+                        asks: vec![(Decimal::new(39, 2), Decimal::from(2))],
+                        timestamp_ms: 0,
+                    },
+                },
+            ))))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        }
         sink.send(SourceSignal::Watermark(i64::MAX))
             .await
             .map_err(|_| DataSourceError::SinkClosed)?;
@@ -574,6 +757,394 @@ async fn paper_delivers_reference_facts_with_latest_market_context()
         report.fills, 1,
         "reference actions should reach paper execution"
     );
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
+async fn paper_cex_verdicts_are_scoped_to_each_strategy_decision()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let run_id = RunId::new("paper-cex-strategies")?;
+    let portfolio = PortfolioId::new("alice")?;
+    let market = MarketId::new("btc-5m")?;
+    let rejected_id = StrategyId::new("cex-rejected")?;
+    let accepted_id = StrategyId::new("cex-accepted")?;
+    let rejected_calls = Arc::new(AtomicUsize::new(0));
+    let accepted_calls = Arc::new(AtomicUsize::new(0));
+    let store =
+        Arc::new(TursoTapeStore::open_local(directory.path().join("cex-decisions.db")).await?);
+    let mut rejected_overrides = RiskLimitOverrides::default();
+    rejected_overrides.per_strategy.insert(
+        rejected_id.clone(),
+        PartialRiskLimits {
+            max_order_notional: Some(Money::ZERO),
+            ..PartialRiskLimits::default()
+        },
+    );
+    let run = PaperRun::new(
+        run_id.clone(),
+        portfolio.clone(),
+        Money::usdc(10_000),
+        risk()?,
+        Arc::new(CexLiquidityLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .reference_data(Arc::new(ScriptedReferenceLive))
+    .strategy(
+        StrategyRegistration::new(
+            rejected_id.clone(),
+            market.clone(),
+            Arc::new(CexOrderFactory(Arc::clone(&rejected_calls))),
+        )
+        .risk_overrides(rejected_overrides),
+    )
+    .strategy(StrategyRegistration::new(
+        accepted_id.clone(),
+        market,
+        Arc::new(CexOrderFactory(Arc::clone(&accepted_calls))),
+    ));
+
+    let app = Pmkit::builder(config()?)
+        .storage(store.clone())
+        .capture(directory.path())
+        .run(run)
+        .start()
+        .await?;
+    let RunReport::Paper(report) = app.wait_for(run_id.clone()).await? else {
+        return Err("expected a paper report".into());
+    };
+    assert_eq!(report.metrics.rejected, 1);
+    assert_eq!(report.fills, 1);
+    assert_eq!(rejected_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(accepted_calls.load(Ordering::Relaxed), 1);
+
+    let file = std::fs::File::open(directory.path().join(format!("run-{run_id}.jsonl")))?;
+    let mut capture = RawCaptureReader::new(BufReader::new(file));
+    let mut records = Vec::new();
+    while let Some(record) = capture.next_record()? {
+        records.push(record);
+    }
+    let cex_records = records
+        .iter()
+        .filter(|record| record.capture.source_id == "binance-live")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cex_records.len(),
+        1,
+        "CEX event was not captured exactly once"
+    );
+    assert_eq!(
+        cex_records[0].capture.payload,
+        RawCapturePayload::Frame {
+            raw_bytes: br#"{"oracle":"twap60s","price":"0.42"}"#.to_vec(),
+        }
+    );
+    let book_record = records
+        .iter()
+        .find(|record| record.capture.source_id == "polymarket:market-ws")
+        .ok_or("native PM book frame was not captured")?;
+    assert_eq!(
+        book_record.capture.payload,
+        RawCapturePayload::Frame {
+            raw_bytes: CEX_LIQUIDITY_BOOK_FRAME.to_vec(),
+        }
+    );
+
+    assert_cex_decisions_are_strategy_scoped(&store, portfolio, run_id, &rejected_id, &accepted_id)
+        .await?;
+    drop(store);
+    Ok(())
+}
+
+async fn assert_cex_decisions_are_strategy_scoped(
+    store: &TursoTapeStore,
+    portfolio: PortfolioId,
+    run_id: RunId,
+    rejected_id: &StrategyId,
+    accepted_id: &StrategyId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let scope = OwnerScope::new(portfolio, run_id);
+    let decisions = store.read_decisions(&scope).await?;
+    let warmup_decisions = decisions
+        .iter()
+        .filter(|decision| {
+            decision.payload["snapshot"].is_object()
+                && decision
+                    .identity
+                    .correlation_id
+                    .starts_with("paper-market:")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(warmup_decisions.len(), 2);
+    for decision in &warmup_decisions {
+        assert_eq!(decision.payload["snapshot"]["pm_book"]["best_bid"], "0.38");
+        assert_eq!(decision.payload["snapshot"]["pm_book"]["best_ask"], "0.39");
+        assert_eq!(decision.payload["decision"]["kind"], "no_action");
+    }
+    let cex_decisions = decisions
+        .iter()
+        .filter(|decision| {
+            decision.payload["snapshot"].is_object()
+                && decision
+                    .identity
+                    .correlation_id
+                    .contains(":source:12:binance-live:")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(cex_decisions.len(), 2);
+    assert_ne!(
+        cex_decisions[0].identity.correlation_id,
+        cex_decisions[1].identity.correlation_id
+    );
+    for (strategy, expected_kind, expected_reason) in [
+        (rejected_id, "rejected", Some("risk gate")),
+        (accepted_id, "accepted", None),
+    ] {
+        let id = strategy.to_string();
+        let decision = cex_decisions
+            .iter()
+            .find(|decision| {
+                decision
+                    .identity
+                    .correlation_id
+                    .contains(&format!("strategy:{}:{id}:market:", id.len()))
+            })
+            .ok_or("missing strategy-scoped CEX decision")?;
+        assert_eq!(
+            decision.identity.correlation_id,
+            format!(
+                "paper-reference:strategy:{}:{id}:market:6:btc-5m:source:12:binance-live:connection:9:reference:epoch:0:frame:1:ingest:1:stream:9:reference:event:1",
+                id.len()
+            )
+        );
+        let verdicts = decision.payload["decision"]["risk"]
+            .as_array()
+            .ok_or("missing stored risk verdict")?;
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0]["action_index"], 0);
+        assert_eq!(verdicts[0]["verdict"]["kind"], expected_kind);
+        if let Some(reason) = expected_reason {
+            assert_eq!(verdicts[0]["verdict"]["reason"], reason);
+        }
+    }
+    let placements = decisions
+        .iter()
+        .filter(|decision| {
+            decision.payload["record_type"] == "paper_ledger"
+                && decision.payload["event"]["kind"] == "order_placed"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(
+        placements[0].payload["event"]["order"]["strategy"],
+        "cex-accepted"
+    );
+    Ok(())
+}
+
+fn oracle_frame(frame_sequence: i64, ingest_sequence: u64, timestamp_ms: i64) -> OracleFrame {
+    OracleFrame {
+        frame_sequence,
+        ingest_sequence,
+        timestamp_ms,
+        raw_frame: ORACLE_FRAME.to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn paper_registered_oracle_is_delivered_and_captured_once()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let run_id = RunId::new("paper-oracle")?;
+    let market = MarketId::new("btc-5m")?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let run = PaperRun::new(
+        run_id.clone(),
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        risk()?,
+        Arc::new(NoEventLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .settlement_oracle_named(ORACLE_BINDING, market.clone(), "BTC")
+    .require_settlement_oracle(ORACLE_BINDING, market.clone())
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("oracle-probe")?,
+        market,
+        Arc::new(OracleProbeFactory(Arc::clone(&calls))),
+    ));
+
+    let app = Pmkit::builder(config()?)
+        .capture(directory.path())
+        .register_oracle_source(
+            ORACLE_BINDING,
+            Arc::new(ScriptedOracle {
+                frames: vec![oracle_frame(1, 1, 1)],
+                gap_before_frames: false,
+            }),
+        )
+        .run(run)
+        .start()
+        .await?;
+    let RunReport::Paper(report) = app.wait_for(run_id.clone()).await? else {
+        return Err("expected a paper report".into());
+    };
+
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(report.events_processed, 0);
+    let file = std::fs::File::open(directory.path().join(format!("run-{run_id}.jsonl")))?;
+    let mut capture = RawCaptureReader::new(BufReader::new(file));
+    let record = capture
+        .next_record()?
+        .ok_or("oracle frame was not captured")?;
+    assert_eq!(record.capture.source_id, POLYBOLT_ORACLE_SOURCE_ID);
+    assert_eq!(
+        record.capture.payload,
+        RawCapturePayload::Frame {
+            raw_bytes: ORACLE_FRAME.to_vec(),
+        }
+    );
+    assert!(
+        capture.next_record()?.is_none(),
+        "oracle frame was captured twice"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn paper_oracle_gap_is_captured_and_fails_before_strategy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let run_id = RunId::new("paper-oracle-gap")?;
+    let market = MarketId::new("btc-5m")?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let run = PaperRun::new(
+        run_id.clone(),
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        risk()?,
+        Arc::new(NoEventLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .settlement_oracle_named(ORACLE_BINDING, market.clone(), "BTC")
+    .require_settlement_oracle(ORACLE_BINDING, market.clone())
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("oracle-probe")?,
+        market,
+        Arc::new(OracleProbeFactory(Arc::clone(&calls))),
+    ));
+
+    let error = Pmkit::builder(config()?)
+        .capture(directory.path())
+        .register_oracle_source(
+            ORACLE_BINDING,
+            Arc::new(ScriptedOracle {
+                frames: vec![oracle_frame(2, 2, 2)],
+                gap_before_frames: true,
+            }),
+        )
+        .run(run)
+        .start()
+        .await
+        .err()
+        .ok_or("oracle gap unexpectedly completed")?;
+    assert!(matches!(
+        error,
+        StartError::RunFailed { diagnostics, source }
+            if diagnostics.decisions == 0
+                && matches!(
+                    source.as_ref(),
+                    StartError::Source {
+                        source: DataSourceError::ReplayGap { .. },
+                        ..
+                    }
+                )
+    ));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+    let file = std::fs::File::open(directory.path().join(format!("run-{run_id}.jsonl")))?;
+    let mut capture = RawCaptureReader::new_audit(BufReader::new(file));
+    let gap = capture
+        .next_record()?
+        .ok_or("oracle gap was not captured")?;
+    assert_eq!(gap.ingest_sequence, 0);
+    assert_eq!(gap.capture.source_id, POLYBOLT_ORACLE_SOURCE_ID);
+    assert_eq!(
+        gap.capture.payload,
+        RawCapturePayload::Gap {
+            range: None,
+            unresolved_count: None,
+            reason: "scripted oracle gap".into(),
+            raw_frame: Vec::new(),
+        }
+    );
+    assert!(capture.next_record()?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn paper_does_not_substitute_a_named_cex_source_for_a_missing_oracle()
+-> Result<(), Box<dyn std::error::Error>> {
+    let market = MarketId::new("btc-5m")?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let run = PaperRun::new(
+        RunId::new("paper-missing-oracle")?,
+        PortfolioId::new("alice")?,
+        Money::usdc(10_000),
+        risk()?,
+        Arc::new(NoEventLive),
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .reference_data_named(ORACLE_BINDING, Arc::new(ScriptedReferenceLive))
+    .settlement_oracle_named(ORACLE_BINDING, market.clone(), "BTC")
+    .require_settlement_oracle(ORACLE_BINDING, market.clone())
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("oracle-probe")?,
+        market,
+        Arc::new(OracleProbeFactory(Arc::clone(&calls))),
+    ));
+
+    let error = Pmkit::builder(config()?)
+        .run(run)
+        .start()
+        .await
+        .err()
+        .ok_or("run without a registered live oracle unexpectedly completed")?;
+
+    assert!(matches!(
+        error,
+        StartError::OracleSourceMissing { binding, .. } if binding == ORACLE_BINDING
+    ));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
     Ok(())
 }
 

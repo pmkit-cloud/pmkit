@@ -67,6 +67,8 @@ pub enum BinanceAggTradeParseError {
 
 const VISION_MICROSECOND_THRESHOLD: i64 = 1_735_689_600_000_000;
 pub const BINANCE_REFERENCE_SOURCE_ID: &str = "binance:aggTrade";
+/// Canonical source ID for Binance Vision `aggTrades` rows, which have no real historical receipt time.
+pub const BINANCE_VISION_SOURCE_ID: &str = "binance:vision:aggTrades";
 
 #[derive(Debug, Clone, Copy)]
 struct BinanceAggTradeFields {
@@ -185,7 +187,12 @@ const fn binance_trade_from_fields(
 pub fn reference_trade_identity(fact: &CexReferenceEvent) -> Result<(i64, u64), DataSourceError> {
     let CexReferenceEvent::Trade {
         aggregate_trade_id, ..
-    } = fact;
+    } = fact
+    else {
+        return Err(DataSourceError::ReplayGap {
+            message: "Binance trade identity requested for a non-trade event".into(),
+        });
+    };
     Ok((
         i64::try_from(*aggregate_trade_id).map_err(|_| DataSourceError::ReplayGap {
             message: "Binance aggregate trade ID exceeds frame range".into(),
@@ -223,12 +230,10 @@ mod tests {
 
     #[test]
     fn binance_agg_trade_matches_vision_row() -> Result<(), Box<dyn std::error::Error>> {
-        let live =
-            parse_binance_agg_trade_live(include_str!("../fixtures/agg_trade.json"), Asset::Btc)?;
-        let history = parse_binance_vision_agg_trade_row(
-            include_str!("../fixtures/agg_trades.csv").trim(),
-            Asset::Btc,
-        )?;
+        let live_payload = include_str!("../fixtures/agg_trade.json");
+        let live = parse_binance_agg_trade_live(live_payload, Asset::Btc)?;
+        let history_row = include_str!("../fixtures/agg_trades.csv").trim();
+        let history = parse_binance_vision_agg_trade_row(history_row, Asset::Btc)?;
 
         assert_eq!(live, history);
         let live_envelope = CexReferenceEnvelope {
@@ -243,6 +248,7 @@ mod tests {
                 frame_sequence: 12345,
                 ingest_sequence: 12345,
             },
+            raw_frame: live_payload.as_bytes().to_vec(),
             fact: live,
         };
         let history_envelope = CexReferenceEnvelope {
@@ -257,9 +263,12 @@ mod tests {
                 frame_sequence: 12345,
                 ingest_sequence: 12345,
             },
+            raw_frame: history_row.as_bytes().to_vec(),
             fact: history,
         };
 
+        assert_eq!(live_envelope.raw_frame, live_payload.as_bytes());
+        assert_eq!(history_envelope.raw_frame, history_row.as_bytes());
         assert_eq!(live_envelope.fact, history_envelope.fact);
         assert_ne!(
             live_envelope.metadata.receipt_time_ms,
@@ -313,6 +322,9 @@ mod tests {
         assert_eq!(live, history);
         let timestamp_ms = match history {
             CexReferenceEvent::Trade { timestamp_ms, .. } => timestamp_ms,
+            CexReferenceEvent::Twap60sSnapshot { .. } | CexReferenceEvent::Twap60sUpdate { .. } => {
+                return Err("expected Binance trade fact".into());
+            }
         };
         assert_eq!(timestamp_ms, 1_735_689_600_123);
         Ok(())
@@ -327,6 +339,14 @@ mod tests {
         )?;
 
         assert!(matches!(reference_trade_identity(&fact), Ok((7, 7))));
+        assert!(matches!(
+            reference_trade_identity(&CexReferenceEvent::Twap60sSnapshot {
+                asset: Asset::Btc,
+                price: rust_decimal::Decimal::new(42, 2),
+                timestamp_ms: 1_735_689_600_123,
+            }),
+            Err(DataSourceError::ReplayGap { .. })
+        ));
         assert_eq!(BINANCE_REFERENCE_SOURCE_ID, "binance:aggTrade");
         Ok(())
     }

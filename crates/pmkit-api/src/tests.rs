@@ -2,13 +2,14 @@ use pmkit_store::{Address, ChainCheckpoint, ChainId, WalletPosition, WalletSnaps
 use rust_decimal::Decimal;
 
 use crate::{
-    ChainTruthApiV1, DataOrdersQuery, NotReconstructibleFromChain, PositionsQuery, QueryError,
+    ChainTruthApiV2, DataOrdersQuery, NotReconstructibleFromChain, PositionStatus, PositionsQuery,
+    QueryError,
 };
 
 #[test]
-fn clob_compatible_wallet_reads_match_fixtures() -> Result<(), Box<dyn std::error::Error>> {
-    // Given: a deterministic, chain-reconstructed wallet snapshot.
-    let snapshot = WalletSnapshot {
+fn v2_positions_use_cursor_pages_and_keep_accounting_snapshot()
+-> Result<(), Box<dyn std::error::Error>> {
+    let api = ChainTruthApiV2::from_snapshot(WalletSnapshot {
         wallet: Address::new("0x00000000000000000000000000000000000000aa")?,
         canonical_tip: Some(ChainCheckpoint::new(ChainId::POLYGON, 1, "0xblock")),
         collateral_balance: Decimal::ZERO,
@@ -25,39 +26,39 @@ fn clob_compatible_wallet_reads_match_fixtures() -> Result<(), Box<dyn std::erro
         settled_collateral: Decimal::ZERO,
         trades: Vec::new(),
         activity: Vec::new(),
-    };
-    let api = ChainTruthApiV1::from_snapshot(snapshot);
+    });
+    let query = PositionsQuery::new("0x00000000000000000000000000000000000000aa", 1)?;
 
-    // When: positions are requested with Data API offset semantics.
-    let response = api.positions(&PositionsQuery::new(
-        "0x00000000000000000000000000000000000000aa",
-        1,
-        1,
-    )?)?;
+    let first = api.positions(&query)?;
+    assert_eq!(first.data.len(), 1);
+    assert_eq!(first.data[0].token_id, "no");
+    assert_eq!(first.data[0].status, PositionStatus::Open);
+    assert_eq!(first.data[0].current_size, Decimal::ONE);
+    assert_eq!(first.data[0].condition_id, None);
+    assert_eq!(first.data[0].redeemable, None);
+    assert!(first.pagination.has_more);
+    assert_eq!(first.pagination.offset, 0);
+    let cursor = first.pagination.next_cursor.ok_or("missing next cursor")?;
 
-    // Then: the response preserves only chain-provable CLOB-compatible fields.
-    assert_eq!(response.len(), 1);
-    assert_eq!(
-        response[0].proxy_wallet,
-        "0x00000000000000000000000000000000000000aa"
-    );
-    assert_eq!(response[0].asset, "yes");
+    let mut next_query = query.clone();
+    next_query.cursor = Some(cursor);
+    let second = api.positions(&next_query)?;
+    assert_eq!(second.data.len(), 1);
+    assert_eq!(second.data[0].token_id, "yes");
+    assert_eq!(second.pagination.offset, 1);
+    assert!(!second.pagination.has_more);
+    assert_eq!(second.pagination.next_cursor, None);
     assert_eq!(api.balance().balance, Decimal::ZERO);
-    assert_eq!(
-        api.positions(&PositionsQuery::new(
-            "0x00000000000000000000000000000000000000bb",
-            1,
-            0
-        )?),
-        Err(QueryError::WalletMismatch)
-    );
+
+    let mut mismatched = query;
+    mismatched.user = "0x00000000000000000000000000000000000000bb".into();
+    assert_eq!(api.positions(&mismatched), Err(QueryError::WalletMismatch));
     Ok(())
 }
 
 #[test]
-fn offchain_order_is_not_reconstructible_from_chain() -> Result<(), Box<dyn std::error::Error>> {
-    // Given: a chain-truth API without offchain CLOB order lifecycle data.
-    let api = ChainTruthApiV1::from_snapshot(WalletSnapshot {
+fn unsupported_position_status_is_not_guessed() -> Result<(), Box<dyn std::error::Error>> {
+    let api = ChainTruthApiV2::from_snapshot(WalletSnapshot {
         wallet: Address::new("0x00000000000000000000000000000000000000aa")?,
         canonical_tip: None,
         collateral_balance: Decimal::ZERO,
@@ -66,11 +67,29 @@ fn offchain_order_is_not_reconstructible_from_chain() -> Result<(), Box<dyn std:
         trades: Vec::new(),
         activity: Vec::new(),
     });
+    let mut query = PositionsQuery::new("0x00000000000000000000000000000000000000aa", 100)?;
+    query.status = Some(PositionStatus::Mergeable);
+    assert_eq!(
+        api.positions(&query),
+        Err(QueryError::PositionLifecycleNotReconstructible)
+    );
+    Ok(())
+}
 
-    // When: CLOB orders are requested.
-    let result = api.data_orders(&DataOrdersQuery::default());
-
-    // Then: the API refuses fabrication with its typed result.
-    assert_eq!(result, Err(NotReconstructibleFromChain::Orders));
+#[test]
+fn offchain_order_is_not_reconstructible_from_chain() -> Result<(), Box<dyn std::error::Error>> {
+    let api = ChainTruthApiV2::from_snapshot(WalletSnapshot {
+        wallet: Address::new("0x00000000000000000000000000000000000000aa")?,
+        canonical_tip: None,
+        collateral_balance: Decimal::ZERO,
+        positions: Vec::new(),
+        settled_collateral: Decimal::ZERO,
+        trades: Vec::new(),
+        activity: Vec::new(),
+    });
+    assert_eq!(
+        api.data_orders(&DataOrdersQuery::default()),
+        Err(NotReconstructibleFromChain::Orders)
+    );
     Ok(())
 }

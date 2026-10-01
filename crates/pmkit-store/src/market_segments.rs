@@ -186,12 +186,7 @@ fn materialize_envelope(
         return Err(storage_error("portable market metadata is malformed"));
     }
     let minute_start = envelope.source_timestamp_ms / UTC_MINUTE_MS * UTC_MINUTE_MS;
-    let row = json!({
-        "event_time_ms": envelope.source_timestamp_ms,
-        "event_ordinal": envelope.canonical_source_rank,
-        "payload": envelope.normalized.get("payload").cloned().unwrap_or(Value::Null),
-    });
-    segments
+    let segment = segments
         .entry(SegmentPartition {
             market_id: metadata.market_id.clone(),
             minute_start_ms: minute_start,
@@ -201,9 +196,15 @@ fn materialize_envelope(
             metadata,
             legacy_coverage,
             rows: Vec::new(),
-        })
-        .rows
-        .push(row);
+        });
+    // Portable rows have no source-rank field; ordinal is their stable replay-order position.
+    let event_ordinal = i64::try_from(segment.rows.len())
+        .map_err(|_| storage_error("portable event ordinal is invalid"))?;
+    segment.rows.push(json!({
+        "event_time_ms": envelope.source_timestamp_ms,
+        "event_ordinal": event_ordinal,
+        "payload": envelope.normalized.get("payload").cloned().unwrap_or(Value::Null),
+    }));
     Ok(())
 }
 
