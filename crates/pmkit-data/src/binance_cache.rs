@@ -121,6 +121,19 @@ impl VerifiedBinanceArchiveCache {
         asset: Asset,
         date: NaiveDate,
     ) -> Result<Vec<CexReferenceEvent>, DataSourceError> {
+        Ok(self
+            .replay_rows(asset, date)
+            .await?
+            .into_iter()
+            .map(|(fact, _)| fact)
+            .collect())
+    }
+
+    pub(crate) async fn replay_rows(
+        &self,
+        asset: Asset,
+        date: NaiveDate,
+    ) -> Result<Vec<(CexReferenceEvent, Vec<u8>)>, DataSourceError> {
         self.replay_key(ArchiveKey { asset, date }).await
     }
 }

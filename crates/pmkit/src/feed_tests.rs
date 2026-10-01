@@ -9,7 +9,9 @@ use pmkit_event::{
 use pmkit_market::{Asset, Exchange, Outcome};
 use rust_decimal::Decimal;
 
+mod capture_order;
 mod health;
+mod merge;
 mod mode_parity;
 
 fn metadata(source_id: &str, timestamp_ms: i64, rank: i64, sequence: i64) -> StreamMetadata {
@@ -46,6 +48,7 @@ fn cex(timestamp_ms: i64, aggregate_trade_id: u64) -> SourceSignal {
     SourceSignal::Data(Box::new(SourceEnvelope::CexReference(
         CexReferenceEnvelope {
             metadata: metadata("binance", timestamp_ms, 2, 0),
+            raw_frame: Vec::new(),
             fact: CexReferenceEvent::Trade {
                 asset: Asset::Btc,
                 exchange: Exchange::Binance,

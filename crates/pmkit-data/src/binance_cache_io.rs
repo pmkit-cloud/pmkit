@@ -86,7 +86,7 @@ pub(super) async fn read_verified(
     paths: &ArchivePaths,
     asset: Asset,
     limits: BinanceArchiveLimits,
-) -> Result<Option<Vec<CexReferenceEvent>>, DataSourceError> {
+) -> Result<Option<Vec<(CexReferenceEvent, Vec<u8>)>>, DataSourceError> {
     let Some(checksum) = read_checksum(&paths.checksum).await? else {
         return Ok(None);
     };
@@ -102,7 +102,7 @@ pub(super) async fn parse_archive(
     path: PathBuf,
     asset: Asset,
     limits: BinanceArchiveLimits,
-) -> Result<Vec<CexReferenceEvent>, DataSourceError> {
+) -> Result<Vec<(CexReferenceEvent, Vec<u8>)>, DataSourceError> {
     spawn_blocking(move || parse_archive_sync(&path, asset, limits))
         .await
         .map_err(gap)?
@@ -175,7 +175,7 @@ fn parse_archive_sync(
     path: &Path,
     asset: Asset,
     limits: BinanceArchiveLimits,
-) -> Result<Vec<CexReferenceEvent>, DataSourceError> {
+) -> Result<Vec<(CexReferenceEvent, Vec<u8>)>, DataSourceError> {
     let file = std::fs::File::open(path).map_err(gap)?;
     let mut archive = zip::ZipArchive::new(file).map_err(gap)?;
     if archive.len() != 1 {
@@ -209,7 +209,8 @@ fn parse_archive_sync(
         if csv_bytes > limits.csv_bytes {
             return Err(gap("CSV exceeds configured limit"));
         }
-        records.push(parse_binance_vision_agg_trade_row(line.trim_end(), asset).map_err(gap)?);
+        let fact = parse_binance_vision_agg_trade_row(line.trim_end(), asset).map_err(gap)?;
+        records.push((fact, line.as_bytes().to_vec()));
     }
     Ok(records)
 }

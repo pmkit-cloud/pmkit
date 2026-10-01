@@ -1,12 +1,12 @@
 use std::fmt;
 use std::sync::Arc;
 
-use pmkit_core::{PortfolioId, RunId};
+use pmkit_core::{MarketId, PortfolioId, RunId};
 use pmkit_data::{LiveAccountDataSource, LiveCexDataSource, LiveDataSource};
 use pmkit_money::Money;
 use pmkit_runtime::{RiskLimits, StrategyRegistration};
 
-use crate::ConservativeV1Config;
+use crate::{ConservativeV1Config, SettlementOracleBinding, SettlementOracleRequirement};
 
 /// A paper run: live data, simulated execution.
 pub struct PaperRun {
@@ -19,6 +19,8 @@ pub struct PaperRun {
     reference_data: Vec<(String, Arc<dyn LiveCexDataSource>)>,
     simulation: ConservativeV1Config,
     strategies: Vec<StrategyRegistration>,
+    settlement_oracle_bindings: Vec<SettlementOracleBinding>,
+    settlement_oracle_requirements: Vec<SettlementOracleRequirement>,
 }
 
 impl PaperRun {
@@ -42,6 +44,8 @@ impl PaperRun {
             reference_data: Vec::new(),
             simulation,
             strategies: Vec::new(),
+            settlement_oracle_bindings: Vec::new(),
+            settlement_oracle_requirements: Vec::new(),
         }
     }
 
@@ -74,6 +78,27 @@ impl PaperRun {
     #[must_use]
     pub fn strategy(mut self, registration: StrategyRegistration) -> Self {
         self.strategies.push(registration);
+        self
+    }
+
+    /// Declares the oracle asset mapping for one market under a stable binding name.
+    #[must_use]
+    pub fn settlement_oracle_named(
+        mut self,
+        name: impl Into<String>,
+        market: MarketId,
+        asset: impl Into<String>,
+    ) -> Self {
+        self.settlement_oracle_bindings
+            .push(SettlementOracleBinding::new(name, market, asset));
+        self
+    }
+
+    /// Marks a named settlement-oracle binding as required for one market.
+    #[must_use]
+    pub fn require_settlement_oracle(mut self, name: impl Into<String>, market: MarketId) -> Self {
+        self.settlement_oracle_requirements
+            .push(SettlementOracleRequirement::new(name, market));
         self
     }
 
@@ -138,6 +163,18 @@ impl PaperRun {
     #[must_use]
     pub fn strategies(&self) -> &[StrategyRegistration] {
         &self.strategies
+    }
+
+    /// Returns declared settlement-oracle market mappings.
+    #[must_use]
+    pub fn settlement_oracle_bindings(&self) -> &[SettlementOracleBinding] {
+        &self.settlement_oracle_bindings
+    }
+
+    /// Returns required settlement-oracle bindings.
+    #[must_use]
+    pub fn settlement_oracle_requirements(&self) -> &[SettlementOracleRequirement] {
+        &self.settlement_oracle_requirements
     }
 }
 

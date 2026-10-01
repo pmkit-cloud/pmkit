@@ -140,7 +140,11 @@ pub const fn fact_timestamp(fact: &StrategyFact) -> i64 {
             | PmAccountEvent::OrderStatus { timestamp_ms, .. }
             | PmAccountEvent::Settlement { timestamp_ms, .. },
         )
-        | StrategyFact::Reference(CexReferenceEvent::Trade { timestamp_ms, .. }) => *timestamp_ms,
+        | StrategyFact::Reference(
+            CexReferenceEvent::Trade { timestamp_ms, .. }
+            | CexReferenceEvent::Twap60sSnapshot { timestamp_ms, .. }
+            | CexReferenceEvent::Twap60sUpdate { timestamp_ms, .. },
+        ) => *timestamp_ms,
     }
 }
 

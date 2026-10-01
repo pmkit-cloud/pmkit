@@ -2,104 +2,117 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use thiserror::Error;
 
-/// A position query with the official Data API offset shape.
+/// A lifecycle status accepted by the v2 positions route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PositionStatus {
+    /// A held position, including holdings whose market has resolved.
+    Open,
+    /// A position eligible for redemption.
+    Redeemable,
+    /// A losing position held after resolution.
+    RedeemableLost,
+    /// Complementary positions that can be merged.
+    Mergeable,
+    /// A position that has been exited or settled.
+    Closed,
+}
+
+/// A v2 unified positions query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionsQuery {
     /// The required proxy wallet.
     pub user: String,
-    /// The page size, capped at the official 500 rows.
+    /// The page size, capped at 1,000 rows.
     pub limit: usize,
-    /// The zero-based page offset.
-    pub offset: usize,
+    /// Optional v2 position lifecycle filter (defaults to `OPEN`).
+    pub status: Option<PositionStatus>,
+    /// Optional CTF condition IDs; at most 20 distinct values are accepted.
+    pub condition: Vec<String>,
+    /// Optional event ID filter.
+    pub event_id: Option<String>,
+    /// Opaque cursor returned by a previous page.
+    pub cursor: Option<String>,
 }
 
 impl PositionsQuery {
-    /// Validates a position page query.
+    /// Creates a positions query for `user` with no filters or cursor.
     ///
     /// # Errors
-    ///
-    /// Returns [`QueryError`] for an empty user or a limit above 500.
-    pub fn new(user: impl Into<String>, limit: usize, offset: usize) -> Result<Self, QueryError> {
-        page_query(user, limit, offset, 500).map(|(user, limit, offset)| Self {
+    /// Returns [`QueryError`] when the user is empty or `limit` exceeds 1,000.
+    pub fn new(user: impl Into<String>, limit: usize) -> Result<Self, QueryError> {
+        let (user, limit) = page_query(user, limit)?;
+        Ok(Self {
             user,
             limit,
-            offset,
+            status: None,
+            condition: Vec::new(),
+            event_id: None,
+            cursor: None,
         })
     }
 }
 
-/// A closed-position query with the official Data API offset shape.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClosedPositionsQuery {
-    /// The required proxy wallet.
-    pub user: String,
-    /// The page size, capped at the official 50 rows.
-    pub limit: usize,
-    /// The zero-based page offset.
-    pub offset: usize,
-}
-
-impl ClosedPositionsQuery {
-    /// Validates a closed-position page query.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`QueryError`] for an empty user or a limit above 50.
-    pub fn new(user: impl Into<String>, limit: usize, offset: usize) -> Result<Self, QueryError> {
-        page_query(user, limit, offset, 50).map(|(user, limit, offset)| Self {
-            user,
-            limit,
-            offset,
-        })
-    }
-}
-
-/// A trade query with the official Data API offset shape.
+/// A v2 trades query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TradesQuery {
     /// The required proxy wallet.
     pub user: String,
-    /// The page size, capped at the official 10,000 rows.
+    /// The page size, capped at 1,000 rows.
     pub limit: usize,
-    /// The zero-based page offset.
-    pub offset: usize,
+    /// Optional CTF condition IDs; at most 20 distinct values are accepted.
+    pub condition: Vec<String>,
+    /// Optional event ID filter.
+    pub event_id: Option<String>,
+    /// Opaque cursor returned by a previous page.
+    pub cursor: Option<String>,
 }
 
 impl TradesQuery {
-    /// Validates a trade page query.
+    /// Creates a trades query for `user` with no filters or cursor.
     ///
     /// # Errors
-    /// Returns [`QueryError`] for an empty user or a limit above 10,000.
-    pub fn new(user: impl Into<String>, limit: usize, offset: usize) -> Result<Self, QueryError> {
-        page_query(user, limit, offset, 10_000).map(|(user, limit, offset)| Self {
+    /// Returns [`QueryError`] when the user is empty or `limit` exceeds 1,000.
+    pub fn new(user: impl Into<String>, limit: usize) -> Result<Self, QueryError> {
+        let (user, limit) = page_query(user, limit)?;
+        Ok(Self {
             user,
             limit,
-            offset,
+            condition: Vec::new(),
+            event_id: None,
+            cursor: None,
         })
     }
 }
 
-/// An activity query with the official Data API offset shape.
+/// A v2 activity query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivityQuery {
     /// The required proxy wallet.
     pub user: String,
-    /// The page size, capped at the official 500 rows.
+    /// The page size, capped at 1,000 rows.
     pub limit: usize,
-    /// The zero-based page offset.
-    pub offset: usize,
+    /// Optional CTF condition IDs; at most 20 distinct values are accepted.
+    pub condition: Vec<String>,
+    /// Optional event ID filter.
+    pub event_id: Option<String>,
+    /// Opaque cursor returned by a previous page.
+    pub cursor: Option<String>,
 }
 
 impl ActivityQuery {
-    /// Validates an activity page query.
+    /// Creates an activity query for `user` with no filters or cursor.
     ///
     /// # Errors
-    /// Returns [`QueryError`] for an empty user or a limit above 500.
-    pub fn new(user: impl Into<String>, limit: usize, offset: usize) -> Result<Self, QueryError> {
-        page_query(user, limit, offset, 500).map(|(user, limit, offset)| Self {
+    /// Returns [`QueryError`] when the user is empty or `limit` exceeds 1,000.
+    pub fn new(user: impl Into<String>, limit: usize) -> Result<Self, QueryError> {
+        let (user, limit) = page_query(user, limit)?;
+        Ok(Self {
             user,
             limit,
-            offset,
+            condition: Vec::new(),
+            event_id: None,
+            cursor: None,
         })
     }
 }
@@ -122,33 +135,67 @@ pub struct DataOrderQuery {
     pub id: String,
 }
 
-/// A chain-proven current outcome-token position.
+/// A v2 response envelope for non-paginated data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+pub struct DataResponse<T> {
+    /// The response data, or `null` for a miss.
+    pub data: T,
+}
+
+/// A page of v2-shaped chain-truth rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CursorPage<T> {
+    /// The page data; empty results serialize as `[]`.
+    pub data: Vec<T>,
+    /// Cursor metadata for the next page.
+    pub pagination: Pagination,
+}
+
+/// Cursor and display-only offset metadata for a paginated response.
+///
+/// Cursors are non-secret, deterministic, build-local consistency markers; they
+/// are not signed and must not be used for authorization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Pagination {
+    /// The page size.
+    pub limit: usize,
+    /// The display-only position of the page in its filtered snapshot.
+    pub offset: usize,
+    /// Whether another page is available.
+    pub has_more: bool,
+    /// The opaque cursor for the next page, or `null` when exhausted.
+    pub next_cursor: Option<String>,
+}
+
+/// A sparse chain-proven position row using v2 field names.
+///
+/// Only held-token fields are reconstructed here. Valuation fields are omitted;
+/// condition IDs and lifecycle flags are omitted when chain truth cannot establish them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ChainTruthPosition {
     /// The proxy wallet.
     pub proxy_wallet: String,
+    /// The CTF condition identifier, omitted when asset metadata is unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition_id: Option<String>,
     /// The outcome token identifier.
-    pub asset: String,
+    pub token_id: String,
     /// The canonical ERC-1155 balance.
-    pub size: Decimal,
-}
-
-/// A chain-proven settled condition, without offchain display metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChainTruthClosedPosition {
-    /// The proxy wallet.
-    pub proxy_wallet: String,
-    /// The CTF condition identifier.
-    pub condition_id: String,
-    /// The redeemed CTF collateral.
-    pub settled_collateral: Decimal,
+    pub current_size: Decimal,
+    /// The v2 lifecycle status supported by this chain-truth projection.
+    pub status: PositionStatus,
+    /// Whether the position can currently be redeemed, omitted when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redeemable: Option<bool>,
+    /// Whether the position can currently be merged, omitted when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mergeable: Option<bool>,
 }
 
 /// A chain-proven exchange fill.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct ChainTruthTrade {
     /// The wallet that participated in the fill.
     pub proxy_wallet: String,
@@ -172,7 +219,7 @@ pub struct ChainTruthTrade {
 
 /// A chain-proven protocol activity row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct ChainTruthActivity {
     /// The proxy wallet.
     pub proxy_wallet: String,
@@ -211,35 +258,60 @@ pub enum NotReconstructibleFromChain {
     Order,
 }
 
-/// Query validation failure.
+/// Query validation or chain-truth reconstruction failure.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum QueryError {
     /// The wallet query was empty.
     #[error("user must not be empty")]
     EmptyUser,
-    /// The page size exceeds the endpoint's documented cap.
-    #[error("limit exceeds endpoint maximum of {maximum}")]
-    LimitTooLarge {
-        /// The endpoint-specific maximum.
+    /// A page size is outside the v2 range.
+    #[error("limit must be between 1 and {maximum}")]
+    InvalidLimit {
+        /// The v2 maximum page size.
+        maximum: usize,
+    },
+    /// A condition filter contained an empty ID.
+    #[error("condition IDs must not be empty")]
+    EmptyCondition,
+    /// The event ID filter was empty.
+    #[error("event_id must not be empty")]
+    EmptyEventId,
+    /// Too many distinct condition IDs were requested.
+    #[error("condition filter exceeds the maximum of {maximum} distinct IDs")]
+    TooManyConditions {
+        /// The maximum number of distinct condition IDs.
         maximum: usize,
     },
     /// The requested user is not the wallet used to build this projection.
     #[error("user does not match the reconstructed wallet")]
     WalletMismatch,
+    /// The cursor is invalid or belongs to a different snapshot, route, or filter.
+    #[error("cursor is invalid or does not match this snapshot, route, or filter")]
+    InvalidCursor,
+    /// Position lifecycle requires resolution and asset-condition data absent from chain truth.
+    #[error("requested position status is not reconstructible from this chain-truth snapshot")]
+    PositionLifecycleNotReconstructible,
+    /// A route's condition filter cannot be evaluated from its chain-truth records.
+    #[error("condition filter is not reconstructible for {route}")]
+    ConditionFilterNotReconstructible {
+        /// The v2 route whose condition filter cannot be evaluated.
+        route: &'static str,
+    },
+    /// Event IDs are not present in the chain-truth records for a route.
+    #[error("event_id filter is not reconstructible for {route}")]
+    EventIdFilterNotReconstructible {
+        /// The v2 route whose event ID filter cannot be evaluated.
+        route: &'static str,
+    },
 }
 
-fn page_query(
-    user: impl Into<String>,
-    limit: usize,
-    offset: usize,
-    maximum: usize,
-) -> Result<(String, usize, usize), QueryError> {
+fn page_query(user: impl Into<String>, limit: usize) -> Result<(String, usize), QueryError> {
     let user = user.into();
     if user.trim().is_empty() {
         return Err(QueryError::EmptyUser);
     }
-    if limit > maximum {
-        return Err(QueryError::LimitTooLarge { maximum });
+    if !(1..=1_000).contains(&limit) {
+        return Err(QueryError::InvalidLimit { maximum: 1_000 });
     }
-    Ok((user, limit, offset))
+    Ok((user, limit))
 }

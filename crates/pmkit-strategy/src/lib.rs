@@ -11,8 +11,11 @@ use pmkit_event::StrategyFact;
 use pmkit_exec::{OrderId, PlaceOrder};
 use thiserror::Error;
 
-/// A logical timestamp in milliseconds (system clock for live, simulated time
-/// for paper and backtest).
+/// The logical strategy clock matches the normalized source event timestamp
+/// supplied by the driver.
+///
+/// Actual receipt time remains separate transport metadata; live delivery may
+/// follow receipt order without changing `now`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LogicalTimestamp(pub i64);
 

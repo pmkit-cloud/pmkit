@@ -5,14 +5,17 @@ use crate::{
 };
 use async_trait::async_trait;
 use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
-use pmkit_data::{DataSourceError, HistoricalDataSource, ReplayQuery, SourceSignal};
+use pmkit_data::{
+    DataSourceError, HistoricalDataSource, ReplayQuery, SourceSignal, parse_binance_agg_trade_live,
+};
 use pmkit_event::{
     CexReferenceEnvelope, CexReferenceEvent, MarketEvent, PmMarketEnvelope, SourceEnvelope,
-    StreamMetadata,
+    StrategyFact, StreamMetadata,
 };
 use pmkit_exec::MarketLimits;
 use pmkit_market::{Asset, Exchange, Outcome};
 use pmkit_money::Money;
+use pmkit_polymarket::MarketTokens;
 use pmkit_run::{EvidenceRequirement, RetrievalWait};
 use pmkit_runtime::StrategyRegistration;
 use pmkit_spec::{BacktestRun, ConservativeV1Config, ReplaySpec};
@@ -20,8 +23,10 @@ use pmkit_store::{OwnerScope, TapeStore, TursoTapeStore};
 use pmkit_strategy::{
     Action, Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
 };
+use pmkit_tape::{CaptureTransport, RawCaptureDraft, RawCapturePayload, RawCaptureWriter};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -31,6 +36,10 @@ use tokio::sync::mpsc::Sender;
 
 struct ScriptedHistory {
     ticks: Vec<i64>,
+}
+
+struct MarketFactsHistory {
+    market: MarketId,
 }
 
 struct BothOutcomesHistory;
@@ -70,6 +79,10 @@ struct RestThenCancelFactory;
 struct PositionProbe(Arc<Mutex<Vec<usize>>>);
 
 struct PositionProbeFactory(Arc<Mutex<Vec<usize>>>);
+
+struct RecordedFactProbe(Arc<Mutex<Vec<(StrategyFact, i64)>>>);
+
+struct RecordedFactProbeFactory(Arc<Mutex<Vec<(StrategyFact, i64)>>>);
 
 impl Strategy for Taker {
     fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
@@ -210,6 +223,68 @@ impl StrategyFactory for PositionProbeFactory {
     }
 }
 
+impl Strategy for RecordedFactProbe {
+    fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+        self.0
+            .lock()
+            .map_err(|_| StrategyError {
+                message: "recorded fact probe lock poisoned".into(),
+            })?
+            .push((context.fact.clone(), context.now.as_millis()));
+        Ok(Actions::none())
+    }
+}
+
+impl StrategyFactory for RecordedFactProbeFactory {
+    fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+        Ok(Box::new(RecordedFactProbe(Arc::clone(&self.0))))
+    }
+}
+
+#[async_trait]
+impl HistoricalDataSource for MarketFactsHistory {
+    async fn replay(
+        &self,
+        _query: ReplayQuery,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError> {
+        for fact in [
+            MarketEvent::BookUpdate {
+                market: self.market.clone(),
+                outcome: Outcome::Up,
+                bids: vec![(Decimal::new(49, 2), Decimal::from(2))],
+                asks: vec![(Decimal::new(51, 2), Decimal::from(3))],
+                timestamp_ms: 100,
+            },
+            MarketEvent::BestBidAsk {
+                market: self.market.clone(),
+                outcome: Outcome::Up,
+                bid: Decimal::new(50, 2),
+                ask: Decimal::new(51, 2),
+                timestamp_ms: 101,
+            },
+            MarketEvent::LastTrade {
+                market: self.market.clone(),
+                outcome: Outcome::Up,
+                price: Decimal::new(505, 3),
+                side: pmkit_book::Side::Sell,
+                size: Decimal::new(125, 2),
+                timestamp_ms: 102,
+            },
+        ] {
+            sink.send(SourceSignal::market_event(fact))
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)?;
+        }
+        sink.send(SourceSignal::Watermark(i64::MAX))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+        sink.send(SourceSignal::Eof)
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)
+    }
+}
+
 #[async_trait]
 impl HistoricalDataSource for ScriptedReference {
     async fn replay(
@@ -230,6 +305,7 @@ impl HistoricalDataSource for ScriptedReference {
                     frame_sequence: 7,
                     ingest_sequence: 7,
                 },
+                raw_frame: br#"{"e":"aggTrade","a":7}"#.to_vec(),
                 fact: CexReferenceEvent::Trade {
                     asset: Asset::Btc,
                     exchange: Exchange::Binance,
@@ -385,6 +461,141 @@ impl HistoricalDataSource for ScriptedHistory {
             .map_err(|_| DataSourceError::SinkClosed)?;
         Ok(())
     }
+}
+
+fn native_book_capture(
+    market: &MarketId,
+    source_time_ms: i64,
+    receipt_time_ms: i64,
+    ask_price: Decimal,
+    ordinal: u64,
+) -> Result<RawCaptureDraft, std::num::TryFromIntError> {
+    let fact = MarketEvent::BookUpdate {
+        market: market.clone(),
+        outcome: Outcome::Up,
+        bids: vec![(Decimal::new(3, 1), Decimal::ONE)],
+        asks: vec![(ask_price, Decimal::ONE)],
+        timestamp_ms: source_time_ms,
+    };
+    let raw_bytes = format!(
+        r#"{{"event_type":"book","market":"0x0000000000000000000000000000000000000000000000000000000000000001","asset_id":"1","timestamp":"{source_time_ms}","bids":[{{"price":"0.3","size":"1"}}],"asks":[{{"price":"{ask_price}","size":"1"}}]}}"#
+    )
+    .into_bytes();
+    native_market_capture(fact, receipt_time_ms, ordinal, 1, raw_bytes)
+}
+
+fn native_market_capture(
+    fact: MarketEvent,
+    receipt_time_ms: i64,
+    ordinal: u64,
+    source_ingest_sequence: u64,
+    raw_bytes: Vec<u8>,
+) -> Result<RawCaptureDraft, std::num::TryFromIntError> {
+    const SOURCE_ID: &str = "polymarket:market-ws";
+    let metadata = StreamMetadata {
+        schema_version: 3,
+        source_id: SOURCE_ID.to_owned(),
+        source_time_ms: fact.timestamp_ms(),
+        canonical_source_rank: 1,
+        receipt_time_ms,
+        connection_id: "recorded-pm".to_owned(),
+        connection_epoch: 0,
+        frame_sequence: i64::try_from(ordinal)?,
+        ingest_sequence: source_ingest_sequence,
+    };
+    let envelope = PmMarketEnvelope {
+        metadata: metadata.clone(),
+        raw_frame: Vec::new(),
+        fact,
+    };
+
+    Ok(RawCaptureDraft {
+        schema_version: metadata.schema_version,
+        source_id: metadata.source_id,
+        canonical_source_rank: metadata.canonical_source_rank,
+        receipt_time_ms,
+        transport: Some(CaptureTransport {
+            source_time_ms: Some(metadata.source_time_ms),
+            connection_id: metadata.connection_id,
+            connection_epoch: 0,
+            frame_sequence: ordinal,
+            ingest_sequence: source_ingest_sequence,
+        }),
+        normalized_projection: Some(pmkit_tape::market_envelope_json(&envelope)),
+        payload: RawCapturePayload::Frame { raw_bytes },
+    })
+}
+
+fn native_binance_trade_capture(
+    source_time_ms: i64,
+    receipt_time_ms: i64,
+) -> Result<RawCaptureDraft, Box<dyn std::error::Error>> {
+    const SOURCE_ID: &str = "binance:aggTrade";
+    const RAW_FRAME: &str =
+        r#"{"e":"aggTrade","a":7,"p":"0.6","q":"1","f":7,"l":7,"T":50,"m":false}"#;
+    let source_ingest_sequence = 1;
+    let fact = parse_binance_agg_trade_live(RAW_FRAME, Asset::Btc)?;
+    let envelope = CexReferenceEnvelope {
+        metadata: StreamMetadata {
+            schema_version: 3,
+            source_id: SOURCE_ID.to_owned(),
+            source_time_ms,
+            canonical_source_rank: 1,
+            receipt_time_ms,
+            connection_id: "recorded-binance-btcusdt".to_owned(),
+            connection_epoch: 0,
+            frame_sequence: 0,
+            ingest_sequence: source_ingest_sequence,
+        },
+        raw_frame: RAW_FRAME.as_bytes().to_vec(),
+        fact,
+    };
+
+    Ok(RawCaptureDraft {
+        schema_version: envelope.metadata.schema_version,
+        source_id: SOURCE_ID.to_owned(),
+        canonical_source_rank: envelope.metadata.canonical_source_rank,
+        receipt_time_ms,
+        transport: Some(CaptureTransport {
+            source_time_ms: Some(source_time_ms),
+            connection_id: envelope.metadata.connection_id.clone(),
+            connection_epoch: 0,
+            frame_sequence: 0,
+            ingest_sequence: source_ingest_sequence,
+        }),
+        normalized_projection: Some(pmkit_tape::reference_envelope_json(&envelope)),
+        payload: RawCapturePayload::Frame {
+            raw_bytes: envelope.raw_frame,
+        },
+    })
+}
+
+fn market_fact_probe_run(
+    id: &str,
+    replay: ReplaySpec,
+    market: MarketId,
+    observed: Arc<Mutex<Vec<(StrategyFact, i64)>>>,
+) -> Result<BacktestRun, Box<dyn std::error::Error>> {
+    Ok(BacktestRun::new(
+        RunId::new(id)?,
+        PortfolioId::new("research")?,
+        replay,
+        Money::usdc(1_000),
+        risk()?,
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("market-fact-probe")?,
+        market,
+        Arc::new(RecordedFactProbeFactory(observed)),
+    )))
 }
 
 fn backtest_run() -> Result<BacktestRun, Box<dyn std::error::Error>> {
@@ -561,6 +772,225 @@ async fn backtest_delivers_reference_facts_with_latest_market_context()
         report.fills, 1,
         "reference actions should reach the simulator"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn historical_backtest_counts_all_market_facts_once_without_non_book_callbacks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let market = MarketId::new("btc-5m")?;
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let replay = ReplaySpec::new(
+        Arc::new(MarketFactsHistory {
+            market: market.clone(),
+        }),
+        "2026-01-01T00:00:00Z".parse()?,
+        "2026-02-01T00:00:00Z".parse()?,
+        EvidenceRequirement::CorroboratedOnly,
+        RetrievalWait::ReturnPending,
+    );
+    let run = market_fact_probe_run("bt-market-facts", replay, market, Arc::clone(&observed))?;
+    let app = Pmkit::builder(config()?).run(run).start().await?;
+    let RunReport::Backtest(report) = app.wait_for(RunId::new("bt-market-facts")?).await? else {
+        return Err("expected a backtest report".into());
+    };
+
+    assert_eq!(report.events_processed, 3);
+    assert_eq!(report.metrics.events_processed, 3);
+    assert_eq!(report.metrics.decisions, 1);
+    let observed = observed
+        .lock()
+        .map_err(|_| "recorded fact probe lock poisoned")?
+        .clone();
+    assert_eq!(observed.len(), 1);
+    assert!(matches!(
+        &observed[0].0,
+        StrategyFact::Market(MarketEvent::BookUpdate { .. })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn recorded_backtest_counts_all_native_market_facts_once_without_non_book_callbacks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let market = MarketId::new("btc-5m")?;
+    let mut writer = RawCaptureWriter::new(Vec::new());
+    writer.append(native_book_capture(
+        &market,
+        100,
+        1_000,
+        Decimal::new(4, 1),
+        0,
+    )?)?;
+    writer.append(native_market_capture(
+        MarketEvent::BestBidAsk {
+            market: market.clone(),
+            outcome: Outcome::Up,
+            bid: Decimal::new(50, 2),
+            ask: Decimal::new(51, 2),
+            timestamp_ms: 101,
+        },
+        1_100,
+        1,
+        2,
+        br#"{"event_type":"best_bid_ask","market":"0x0000000000000000000000000000000000000000000000000000000000000001","asset_id":"1","best_bid":"0.50","best_ask":"0.51","spread":"0.01","timestamp":"101"}"#.to_vec(),
+    )?)?;
+    writer.append(native_market_capture(
+        MarketEvent::LastTrade {
+            market: market.clone(),
+            outcome: Outcome::Up,
+            price: Decimal::new(505, 3),
+            side: pmkit_book::Side::Sell,
+            size: Decimal::new(125, 2),
+            timestamp_ms: 102,
+        },
+        1_200,
+        2,
+        3,
+        br#"{"event_type":"last_trade_price","market":"0x0000000000000000000000000000000000000000000000000000000000000001","asset_id":"1","price":"0.505","side":"SELL","size":"1.25","timestamp":"102"}"#.to_vec(),
+    )?)?;
+    let capture = writer.into_inner();
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let replay = ReplaySpec::new(
+        Arc::new(ScriptedHistory { ticks: Vec::new() }),
+        "2026-01-01T00:00:00Z".parse()?,
+        "2026-02-01T00:00:00Z".parse()?,
+        EvidenceRequirement::CorroboratedOnly,
+        RetrievalWait::ReturnPending,
+    );
+    let run = market_fact_probe_run(
+        "bt-recorded-market-facts",
+        replay,
+        market.clone(),
+        Arc::clone(&observed),
+    )?;
+    let tokens = MarketTokens::new(market.clone(), "1".parse()?, "2".parse()?);
+    let report = crate::RecordedBacktest::replay_capture(
+        &run,
+        crate::capture_replay::CaptureReplaySource::new_with_market_tokens(
+            Cursor::new(capture),
+            HashMap::from([(market, tokens)]),
+        ),
+    )
+    .drive(None)
+    .await?;
+
+    assert_eq!(report.events_processed, 3);
+    assert_eq!(report.metrics.events_processed, 3);
+    assert_eq!(report.metrics.decisions, 1);
+    let observed = observed
+        .lock()
+        .map_err(|_| "recorded fact probe lock poisoned")?
+        .clone();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0].1, 100);
+    assert!(matches!(
+        &observed[0].0,
+        StrategyFact::Market(MarketEvent::BookUpdate {
+            timestamp_ms: 100,
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn recorded_backtest_preserves_native_market_order_and_strategy_clock()
+-> Result<(), Box<dyn std::error::Error>> {
+    let market = MarketId::new("btc-5m")?;
+    let mut writer = RawCaptureWriter::new(Vec::new());
+    writer.append(native_book_capture(
+        &market,
+        100,
+        1_000,
+        Decimal::new(4, 1),
+        0,
+    )?)?;
+    writer.append(native_binance_trade_capture(50, 1_100)?)?;
+    let capture = writer.into_inner();
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let replay = ReplaySpec::new(
+        Arc::new(ScriptedHistory { ticks: Vec::new() }),
+        "2026-01-01T00:00:00Z".parse()?,
+        "2026-02-01T00:00:00Z".parse()?,
+        EvidenceRequirement::CorroboratedOnly,
+        RetrievalWait::ReturnPending,
+    );
+    let run = BacktestRun::new(
+        RunId::new("bt-recorded-order")?,
+        PortfolioId::new("research")?,
+        replay,
+        Money::usdc(1_000),
+        risk()?,
+        ConservativeV1Config {
+            activation_latency: Duration::ZERO,
+            maker_queue_ahead_bps: 0,
+            slippage_bps: 0,
+            market_impact_bps: 0,
+            fee_model: None,
+            market_limits: None,
+        },
+    )
+    .strategy(StrategyRegistration::new(
+        StrategyId::new("recorded-fact-probe")?,
+        market.clone(),
+        Arc::new(RecordedFactProbeFactory(Arc::clone(&observed))),
+    ));
+    let tokens = MarketTokens::new(market.clone(), "1".parse()?, "2".parse()?);
+    let report = crate::RecordedBacktest::replay_capture(
+        &run,
+        crate::capture_replay::CaptureReplaySource::new_with_market_tokens(
+            Cursor::new(capture),
+            HashMap::from([(market.clone(), tokens)]),
+        ),
+    )
+    .drive(None)
+    .await?;
+
+    assert_eq!(report.events_processed, 1);
+    let observed = observed
+        .lock()
+        .map_err(|_| "recorded fact probe lock poisoned")?;
+    assert_eq!(observed.len(), 2);
+    assert_eq!(observed[0].1, 100);
+    let StrategyFact::Market(MarketEvent::BookUpdate {
+        market: fact_market,
+        outcome: Outcome::Up,
+        asks,
+        timestamp_ms,
+        ..
+    }) = &observed[0].0
+    else {
+        return Err(format!(
+            "expected a native PM book fact first, got {:?}",
+            observed[0].0
+        )
+        .into());
+    };
+    assert_eq!(fact_market, &market);
+    assert_eq!(*timestamp_ms, 100);
+    assert_eq!(asks[0].0, Decimal::new(4, 1));
+
+    assert_eq!(observed[1].1, 50);
+    let StrategyFact::Reference(CexReferenceEvent::Trade {
+        asset: Asset::Btc,
+        exchange: Exchange::Binance,
+        price,
+        timestamp_ms,
+        ..
+    }) = &observed[1].0
+    else {
+        return Err(format!(
+            "expected a Binance reference trade second, got {:?}",
+            observed[1].0
+        )
+        .into());
+    };
+    assert_eq!(*timestamp_ms, 50);
+    assert_eq!(*price, Decimal::new(6, 1));
+    drop(observed);
     Ok(())
 }
 
@@ -1121,3 +1551,18 @@ async fn lifecycle_events_are_published() -> Result<(), Box<dyn std::error::Erro
     );
     Ok(())
 }
+
+#[path = "backtest_tests/recorded_receipt.rs"]
+mod recorded_receipt;
+
+#[path = "backtest_tests/recorded_oracle.rs"]
+mod recorded_oracle;
+
+#[path = "backtest_tests/recorded_oracle_eof.rs"]
+mod recorded_oracle_eof;
+
+#[path = "backtest_tests/recorded_reference_source.rs"]
+mod recorded_reference_source;
+
+#[path = "backtest_tests/recorded_account.rs"]
+mod recorded_account;

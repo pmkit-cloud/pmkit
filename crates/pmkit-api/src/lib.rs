@@ -4,14 +4,14 @@ mod api;
 mod gamma;
 mod types;
 
-pub use api::ChainTruthApiV1;
+pub use api::ChainTruthApiV2;
 pub use gamma::{
     DiscoveryError as GammaDiscoveryError, GammaClient, GammaMarket, GammaPageRequest,
 };
 pub use types::{
-    ActivityQuery, ChainTruthActivity, ChainTruthBalance, ChainTruthClosedPosition,
-    ChainTruthPosition, ChainTruthTrade, ClosedPositionsQuery, DataOrderQuery, DataOrdersQuery,
-    NotReconstructibleFromChain, PositionsQuery, QueryError, TradesQuery,
+    ActivityQuery, ChainTruthActivity, ChainTruthBalance, ChainTruthPosition, ChainTruthTrade,
+    CursorPage, DataOrderQuery, DataOrdersQuery, DataResponse, NotReconstructibleFromChain,
+    Pagination, PositionStatus, PositionsQuery, QueryError, TradesQuery,
 };
 
 #[cfg(test)]

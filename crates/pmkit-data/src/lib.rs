@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use pmkit_core::{MarketId, PortfolioId};
 use pmkit_event::{MarketEvent, PmMarketEnvelope, SourceEnvelope, StreamMetadata};
-use pmkit_market::{Exchange, Outcome};
+use pmkit_market::{Asset, Exchange, Outcome};
 use pmkit_run::{EvidenceRequirement, RetrievalWait};
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
@@ -35,7 +35,7 @@ pub mod binance_cache_test_support;
 mod binance_cache_tests;
 
 pub use binance::{
-    BinanceAggTradeParseError, CexHistorySource, binance_history_source,
+    BINANCE_VISION_SOURCE_ID, BinanceAggTradeParseError, CexHistorySource, binance_history_source,
     parse_binance_agg_trade_live, parse_binance_vision_agg_trade_row,
 };
 pub use binance_cache::{BinanceArchiveLimits, CachePolicy, VerifiedBinanceArchiveCache};
@@ -123,11 +123,67 @@ pub enum DataSourceError {
     },
 }
 
+/// Which sequence numbering a known missing range uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapSequenceDomain {
+    /// The reporting connection's transport frame ordinal (`StreamMetadata::frame_sequence`).
+    Transport,
+    /// The source's application-level sequence; do not compare it with transport frame numbers.
+    Channel,
+}
+
+/// Exact inclusive missing-sequence bounds in one sequence domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GapRange {
+    /// The sequence numbering used by these bounds.
+    pub domain: GapSequenceDomain,
+    /// First missing sequence, inclusive.
+    pub first_missing: u64,
+    /// Last missing sequence, inclusive.
+    pub last_missing: u64,
+}
+
+/// A source discontinuity with only its actually known provenance and bounds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceGap {
+    /// Logical subscription ID used for routing and logging. When `metadata` is
+    /// present, this must match the reporting publisher's `metadata.source_id`.
+    pub source_id: String,
+    /// Receipt time of the real reporting frame, or local UTC detection time
+    /// when no reporting frame exists; never an invented timestamp.
+    pub detected_at_ms: i64,
+    /// Metadata from the real frame that reported this gap. `None` for local
+    /// detection without a reporting frame; never the last-observed frame's metadata.
+    pub metadata: Option<StreamMetadata>,
+    /// Exact bytes of the reporting frame. May be empty for a genuinely empty
+    /// native payload; must be empty when `metadata` is `None`.
+    pub raw_frame: Vec<u8>,
+    /// Exact inclusive missing bounds when known; `None` does not imply known bounds.
+    pub range: Option<GapRange>,
+    /// Reported loss count when known even if exact bounds are not; never invented.
+    pub unresolved_count: Option<u64>,
+    /// Why the discontinuity was reported or locally detected.
+    pub reason: String,
+}
+
+/// An exact source frame carrying transport liveness or control evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceHeartbeat {
+    /// Transport metadata for the liveness or control frame.
+    pub metadata: StreamMetadata,
+    /// Exact source bytes of the frame, before parsing or normalization.
+    pub raw_frame: Vec<u8>,
+}
+
 /// A source lifecycle signal consumed by the deterministic merge boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceSignal {
     /// An envelope carrying a normalized fact and transport identity.
     Data(Box<SourceEnvelope>),
+    /// A reported or locally detected source discontinuity with only evidenced bounds and counts.
+    Gap(SourceGap),
+    /// Transport-level liveness or control only; not event-time completeness or strategy evaluation.
+    Heartbeat(SourceHeartbeat),
     /// The source guarantees it will not later emit at or before this timestamp.
     Watermark(i64),
     /// The source intentionally completed its finite stream.
@@ -222,6 +278,17 @@ pub trait LiveAccountDataSource: Send + Sync {
 pub trait LiveCexDataSource: Send + Sync {
     /// Subscribes to one reference asset until the stream ends or the sink closes.
     async fn subscribe_reference(&self, sink: Sender<SourceSignal>) -> Result<(), DataSourceError>;
+}
+
+/// A live source of 60-second oracle TWAP snapshots and updates.
+#[async_trait]
+pub trait LiveOracleDataSource: Send + Sync {
+    /// Subscribes to oracle TWAP facts for `asset` until the stream ends or the sink closes.
+    async fn subscribe_oracle(
+        &self,
+        asset: Asset,
+        sink: Sender<SourceSignal>,
+    ) -> Result<(), DataSourceError>;
 }
 
 #[cfg(test)]

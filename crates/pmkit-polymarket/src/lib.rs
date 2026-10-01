@@ -18,6 +18,8 @@ mod execution;
 mod gamma_discovery;
 mod historical;
 mod live;
+mod polybolt;
+mod polybolt_source;
 mod public_protocol;
 mod public_tape;
 mod public_tape_contract;
@@ -41,8 +43,16 @@ pub use execution::PolymarketExecutor;
 pub use gamma_discovery::GammaDiscovery;
 pub use historical::PolymarketHistoricalData;
 pub use live::{
-    PolymarketFrameAdapter, PolymarketLiveData, RawFrameAdapterError, RawPolymarketFrameAdapter,
-    parse_market_frame,
+    MarketFrameDecoder, PolymarketFrameAdapter, PolymarketLiveData, RawFrameAdapterError,
+    RawPolymarketFrameAdapter, parse_market_frame,
+};
+pub use polybolt::{
+    POLYBOLT_ENDPOINT, POLYBOLT_SOURCE_ID, POLYBOLT_TWAP_CHANNEL, PolyBoltClient, PolyBoltControl,
+    PolyBoltControlKind, PolyBoltDecoder, PolyBoltError, PolyBoltEvent, PolyBoltGap, PolyBoltItem,
+    PolyBoltRawFrame, PolyBoltRecord, PolyBoltTwapPrice,
+};
+pub use polybolt_source::{
+    POLYBOLT_ORACLE_SOURCE_ID, PolyBoltOracleDataSource, PolyBoltOracleSourceError,
 };
 pub use public_protocol::{
     PublicInboundFrame, PublicMarketEvent, PublicOutboundFrame, PublicProtocolError,

@@ -1,11 +1,15 @@
-use pmkit_event::{MarketEvent, SourceEnvelope};
+use pmkit_book::Side;
+use pmkit_core::MarketId;
+use pmkit_event::{MarketEvent, SourceEnvelope, StreamMetadata};
+use pmkit_market::Outcome;
+use rust_decimal::Decimal;
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 
 use super::cloud_test_support::{Response, TestServer};
 use super::{CloudApiKey, CloudReplayQuery, PmKitCloudDataSource};
 use crate::{DataSourceError, HistoricalDataSource, ReplayQuery, SourceSignal};
-use pmkit_core::MarketId;
 use pmkit_run::{EvidenceRequirement, RetrievalWait};
 
 #[tokio::test]
@@ -137,6 +141,10 @@ async fn hot_segment_is_verified_decoded_and_cached() -> Result<(), Box<dyn std:
                         return Err("Cloud replay emitted a non-market envelope".into());
                     }
                 },
+                SourceSignal::Gap(_) => return Err("Cloud replay emitted a gap".into()),
+                SourceSignal::Heartbeat(heartbeat) => {
+                    terminal.push(SourceSignal::Heartbeat(heartbeat));
+                }
                 SourceSignal::Watermark(timestamp_ms) => {
                     terminal.push(SourceSignal::Watermark(timestamp_ms));
                 }
@@ -165,6 +173,190 @@ async fn hot_segment_is_verified_decoded_and_cached() -> Result<(), Box<dyn std:
                     && !request.path.contains("secret-value")
             )
     );
+    server.join()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cloud_rows_match_polymarket_public_capture() -> Result<(), Box<dyn std::error::Error>> {
+    let cloud_rows = include_bytes!("../fixtures/cloud_parity_rows.jsonl");
+    let pm_capture = include_bytes!("../fixtures/polymarket_public_capture.jsonl");
+    let expected = project_public_capture(pm_capture)?;
+    let rows: Vec<_> = cloud_rows
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(rows.len(), expected.len());
+
+    let encoded = zstd::stream::encode_all(cloud_rows.as_slice(), 0)?;
+    let logical_sha = digest(cloud_rows);
+    let encoded_sha = digest(&encoded);
+    let page = segment_page(
+        "hot",
+        cloud_rows.len(),
+        &logical_sha,
+        encoded.len(),
+        &encoded_sha,
+        None,
+    )
+    .replace("\"rows\":1", "\"rows\":3")
+    .replace("token-up", "1")
+    .replace("token-down", "2");
+    let mut server = TestServer::new(vec![
+        Response::json(200, available_coverage()),
+        Response::json(200, &page),
+        Response::bytes(200, encoded, &encoded_sha, &logical_sha),
+    ])?;
+    let source = PmKitCloudDataSource::with_base_url(
+        CloudApiKey::new("secret-value")?,
+        &format!("{}/v1", server.url),
+    )?;
+    let (tx, mut rx) = mpsc::channel(8);
+    source.replay_cloud(query(), tx).await?;
+
+    let mut actual = Vec::new();
+    let mut terminal = Vec::new();
+    while let Some(signal) = rx.recv().await {
+        match signal {
+            SourceSignal::Data(envelope) => match *envelope {
+                SourceEnvelope::PmMarket(envelope) => {
+                    let index = actual.len();
+                    let canonical_source_rank = i64::try_from(index)?;
+                    let ingest_sequence = u64::try_from(index)?;
+                    assert_eq!(envelope.raw_frame, rows[index]);
+                    assert_eq!(
+                        envelope.metadata,
+                        StreamMetadata {
+                            schema_version: 1,
+                            source_id: "pmkit-cloud".into(),
+                            source_time_ms: expected[index].timestamp_ms(),
+                            canonical_source_rank,
+                            receipt_time_ms: expected[index].timestamp_ms(),
+                            connection_id: "segment-market-1".into(),
+                            connection_epoch: 0,
+                            frame_sequence: canonical_source_rank,
+                            ingest_sequence,
+                        }
+                    );
+                    actual.push(envelope.fact);
+                }
+                SourceEnvelope::PmAccount(_) | SourceEnvelope::CexReference(_) => {
+                    return Err("Cloud replay emitted a non-market envelope".into());
+                }
+            },
+            SourceSignal::Gap(_) => return Err("Cloud replay emitted a gap".into()),
+            SourceSignal::Heartbeat(heartbeat) => {
+                terminal.push(SourceSignal::Heartbeat(heartbeat));
+            }
+            SourceSignal::Watermark(timestamp_ms) => {
+                terminal.push(SourceSignal::Watermark(timestamp_ms));
+            }
+            SourceSignal::Eof => terminal.push(SourceSignal::Eof),
+        }
+    }
+    assert_eq!(actual, expected);
+    assert_eq!(
+        terminal,
+        vec![SourceSignal::Watermark(60_000), SourceSignal::Eof]
+    );
+    assert_eq!(server.calls(), 3);
+    server.join()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_contiguous_event_ordinals_preserve_replay_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let logical = br#"{"event_time_ms":1000,"event_ordinal":6,"payload":{"event_type":"book","asset_id":"token-up","bids":[{"price":"0.49","size":"2"}],"asks":[{"price":"0.51","size":"3"}]}}
+{"event_time_ms":1000,"event_ordinal":10,"payload":{"event_type":"book","asset_id":"token-up","bids":[{"price":"0.49","size":"2"}],"asks":[{"price":"0.51","size":"3"}]}}
+{"event_time_ms":1000,"event_ordinal":20,"payload":{"event_type":"book","asset_id":"token-up","bids":[{"price":"0.49","size":"2"}],"asks":[{"price":"0.51","size":"3"}]}}
+"#;
+    let rows: Vec<_> = logical
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(rows.len(), 3);
+    let expected_fact = MarketEvent::BookUpdate {
+        market: MarketId::new("market-1")?,
+        outcome: Outcome::Up,
+        bids: vec![(Decimal::new(49, 2), Decimal::new(2, 0))],
+        asks: vec![(Decimal::new(51, 2), Decimal::new(3, 0))],
+        timestamp_ms: 1000,
+    };
+
+    let encoded = zstd::stream::encode_all(logical.as_slice(), 0)?;
+    let logical_sha = digest(logical);
+    let encoded_sha = digest(&encoded);
+    let page = segment_page(
+        "hot",
+        logical.len(),
+        &logical_sha,
+        encoded.len(),
+        &encoded_sha,
+        None,
+    )
+    .replace("\"rows\":1", "\"rows\":3")
+    .replace("\"to_ts_ms\":1000", "\"to_ts_ms\":3000");
+    let mut server = TestServer::new(vec![
+        Response::json(200, available_coverage()),
+        Response::json(200, &page),
+        Response::bytes(200, encoded, &encoded_sha, &logical_sha),
+    ])?;
+    let source = PmKitCloudDataSource::with_base_url(
+        CloudApiKey::new("secret-value")?,
+        &format!("{}/v1", server.url),
+    )?;
+    let (tx, mut rx) = mpsc::channel(8);
+    source.replay_cloud(query(), tx).await?;
+
+    let mut actual = Vec::new();
+    let mut terminal = Vec::new();
+    while let Some(signal) = rx.recv().await {
+        match signal {
+            SourceSignal::Data(envelope) => match *envelope {
+                SourceEnvelope::PmMarket(envelope) => {
+                    let index = actual.len();
+                    let raw_row = rows
+                        .get(index)
+                        .ok_or("Cloud replay emitted more rows than the synthetic input")?;
+                    let (canonical_source_rank, ingest_sequence) = match index {
+                        0 => (6_i64, 0_u64),
+                        1 => (10, 1),
+                        2 => (20, 2),
+                        _ => return Err("Cloud replay emitted an unexpected row index".into()),
+                    };
+                    assert_eq!(envelope.raw_frame.as_slice(), *raw_row);
+                    assert_eq!(&envelope.fact, &expected_fact);
+                    assert_eq!(envelope.metadata.source_time_ms, 1000);
+                    assert_eq!(envelope.metadata.receipt_time_ms, 1000);
+                    assert_eq!(
+                        envelope.metadata.canonical_source_rank,
+                        canonical_source_rank
+                    );
+                    assert_eq!(envelope.metadata.frame_sequence, canonical_source_rank);
+                    assert_eq!(envelope.metadata.ingest_sequence, ingest_sequence);
+                    actual.push(envelope.fact);
+                }
+                SourceEnvelope::PmAccount(_) | SourceEnvelope::CexReference(_) => {
+                    return Err("Cloud replay emitted a non-market envelope".into());
+                }
+            },
+            SourceSignal::Gap(_) => return Err("Cloud replay emitted a gap".into()),
+            SourceSignal::Heartbeat(heartbeat) => {
+                terminal.push(SourceSignal::Heartbeat(heartbeat));
+            }
+            SourceSignal::Watermark(timestamp_ms) => {
+                terminal.push(SourceSignal::Watermark(timestamp_ms));
+            }
+            SourceSignal::Eof => terminal.push(SourceSignal::Eof),
+        }
+    }
+    assert_eq!(actual.len(), 3);
+    assert_eq!(
+        terminal,
+        vec![SourceSignal::Watermark(60_000), SourceSignal::Eof]
+    );
+    assert_eq!(server.calls(), 3);
     server.join()?;
     Ok(())
 }
@@ -234,8 +426,7 @@ async fn coverage_exposes_concrete_instances_without_listing_segments()
     Ok(())
 }
 
-#[tokio::test]
-async fn historical_replay_allows_single_source_and_emits_one_terminal_pair_for_multiple_markets()
+async fn historical_replay_emits_one_terminal_pair_for_multiple_markets_impl()
 -> Result<(), Box<dyn std::error::Error>> {
     let logical = br#"{"event_time_ms":1000,"event_ordinal":7,"payload":{"event_type":"book","asset_id":"token-up","bids":[],"asks":[]}}
 "#;
@@ -295,6 +486,10 @@ async fn historical_replay_allows_single_source_and_emits_one_terminal_pair_for_
     while let Some(signal) = rx.recv().await {
         match signal {
             SourceSignal::Data(_) => events += 1,
+            SourceSignal::Gap(_) => return Err("Cloud replay emitted a gap".into()),
+            SourceSignal::Heartbeat(heartbeat) => {
+                terminal.push(SourceSignal::Heartbeat(heartbeat));
+            }
             SourceSignal::Watermark(timestamp_ms) => {
                 terminal.push(SourceSignal::Watermark(timestamp_ms));
             }
@@ -309,6 +504,18 @@ async fn historical_replay_allows_single_source_and_emits_one_terminal_pair_for_
     assert_eq!(server.calls(), 6);
     server.join()?;
     Ok(())
+}
+
+#[tokio::test]
+async fn historical_replay_allows_single_source_and_emits_one_terminal_pair_for_multiple_markets()
+-> Result<(), Box<dyn std::error::Error>> {
+    historical_replay_emits_one_terminal_pair_for_multiple_markets_impl().await
+}
+
+#[tokio::test]
+async fn historical_replay_emits_one_terminal_pair_for_multiple_markets()
+-> Result<(), Box<dyn std::error::Error>> {
+    historical_replay_emits_one_terminal_pair_for_multiple_markets_impl().await
 }
 
 #[tokio::test]
@@ -382,7 +589,10 @@ async fn cumulative_segment_cap_rejects_the_page_before_emitting_its_events()
     while let Some(signal) = rx.recv().await {
         match signal {
             SourceSignal::Data(_) => data_signals += 1,
-            SourceSignal::Watermark(_) | SourceSignal::Eof => terminal_signals += 1,
+            SourceSignal::Gap(_)
+            | SourceSignal::Heartbeat(_)
+            | SourceSignal::Watermark(_)
+            | SourceSignal::Eof => terminal_signals += 1,
         }
     }
     assert_eq!(
@@ -438,7 +648,10 @@ async fn cumulative_segment_key_budget_rejects_a_page_before_its_events()
     while let Some(signal) = rx.recv().await {
         match signal {
             SourceSignal::Data(_) => data_signals += 1,
-            SourceSignal::Watermark(_) | SourceSignal::Eof => terminal_signals += 1,
+            SourceSignal::Gap(_)
+            | SourceSignal::Heartbeat(_)
+            | SourceSignal::Watermark(_)
+            | SourceSignal::Eof => terminal_signals += 1,
         }
     }
     assert_eq!(
@@ -505,6 +718,84 @@ fn metadata_listing_page(segments: &str, next_cursor: Option<&str>) -> String {
     let next_cursor =
         next_cursor.map_or_else(|| "null".to_owned(), |cursor| format!("\"{cursor}\""));
     format!(r#"{{"next_cursor":{next_cursor},"segments":[{segments}]}}"#)
+}
+
+/// Normalize these raw public-market fixture frames into the Cloud test's
+/// market/token mapping. This is a golden projection witness, not the PM
+/// adapter's production decoder (which depends on this crate).
+fn project_public_capture(frames: &[u8]) -> Result<Vec<MarketEvent>, Box<dyn std::error::Error>> {
+    frames
+        .split(|byte| *byte == b'\n')
+        .filter(|frame| !frame.is_empty())
+        .map(|raw| -> Result<MarketEvent, Box<dyn std::error::Error>> {
+            let frame: Value = serde_json::from_slice(raw)?;
+            let timestamp_ms = frame
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .ok_or("public capture fixture must have a string timestamp")?
+                .parse::<i64>()?;
+            let market = MarketId::new("market-1")?;
+            let outcome = match frame.get("asset_id").and_then(Value::as_str) {
+                Some("1") => Outcome::Up,
+                Some("2") => Outcome::Down,
+                _ => return Err("public capture fixture has an unmapped token".into()),
+            };
+            let decimal = |value: &Value,
+                           key: &str|
+             -> Result<Decimal, Box<dyn std::error::Error>> {
+                value
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("public capture fixture is missing string field {key}"))?
+                    .parse::<Decimal>()
+                    .map_err(|error| {
+                        format!("public capture fixture has invalid {key}: {error}").into()
+                    })
+            };
+            let levels =
+                |key: &str| -> Result<Vec<(Decimal, Decimal)>, Box<dyn std::error::Error>> {
+                    frame
+                        .get(key)
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            format!("public capture fixture is missing array field {key}")
+                        })?
+                        .iter()
+                        .map(|level| Ok((decimal(level, "price")?, decimal(level, "size")?)))
+                        .collect()
+                };
+
+            Ok(match frame.get("event_type").and_then(Value::as_str) {
+                Some("book") => MarketEvent::BookUpdate {
+                    market,
+                    outcome,
+                    bids: levels("bids")?,
+                    asks: levels("asks")?,
+                    timestamp_ms,
+                },
+                Some("best_bid_ask") => MarketEvent::BestBidAsk {
+                    market,
+                    outcome,
+                    bid: decimal(&frame, "best_bid")?,
+                    ask: decimal(&frame, "best_ask")?,
+                    timestamp_ms,
+                },
+                Some("last_trade_price") => MarketEvent::LastTrade {
+                    market,
+                    outcome,
+                    price: decimal(&frame, "price")?,
+                    side: match frame.get("side").and_then(Value::as_str) {
+                        Some("BUY") => Side::Buy,
+                        Some("SELL") => Side::Sell,
+                        _ => return Err("public capture fixture has an invalid trade side".into()),
+                    },
+                    size: decimal(&frame, "size")?,
+                    timestamp_ms,
+                },
+                _ => return Err("public capture fixture has an unsupported event type".into()),
+            })
+        })
+        .collect()
 }
 
 fn available_coverage() -> &'static str {

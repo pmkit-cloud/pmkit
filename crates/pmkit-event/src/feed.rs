@@ -28,6 +28,19 @@ pub enum CanonicalSourceKey {
         /// Exchange aggregate-trade identity.
         aggregate_trade_id: u64,
     },
+    /// Sequenced CEX reference-frame ordering identity, used for oracle updates.
+    CexReference {
+        /// Source timestamp in milliseconds.
+        source_timestamp_ms: i64,
+        /// Configured deterministic rank.
+        canonical_source_rank: i64,
+        /// Stable source identity.
+        source_id: String,
+        /// Connection generation.
+        connection_epoch: i64,
+        /// Frame position in the connection generation.
+        frame_sequence: i64,
+    },
 }
 
 impl PartialOrd for CanonicalSourceKey {
@@ -76,8 +89,27 @@ impl Ord for CanonicalSourceKey {
                     ..
                 },
             ) => left_id.cmp(right_id),
-            (Self::Pm { .. }, Self::Cex { .. }) => std::cmp::Ordering::Less,
-            (Self::Cex { .. }, Self::Pm { .. }) => std::cmp::Ordering::Greater,
+            (
+                Self::CexReference {
+                    source_id: left_source,
+                    connection_epoch: left_epoch,
+                    frame_sequence: left_frame,
+                    ..
+                },
+                Self::CexReference {
+                    source_id: right_source,
+                    connection_epoch: right_epoch,
+                    frame_sequence: right_frame,
+                    ..
+                },
+            ) => left_source
+                .cmp(right_source)
+                .then_with(|| left_epoch.cmp(right_epoch))
+                .then_with(|| left_frame.cmp(right_frame)),
+            (Self::Pm { .. }, Self::Cex { .. } | Self::CexReference { .. })
+            | (Self::Cex { .. }, Self::CexReference { .. }) => std::cmp::Ordering::Less,
+            (Self::Cex { .. } | Self::CexReference { .. }, Self::Pm { .. })
+            | (Self::CexReference { .. }, Self::Cex { .. }) => std::cmp::Ordering::Greater,
         }
     }
 }
@@ -94,6 +126,10 @@ impl CanonicalSourceKey {
             | Self::Cex {
                 source_timestamp_ms,
                 ..
+            }
+            | Self::CexReference {
+                source_timestamp_ms,
+                ..
             } => *source_timestamp_ms,
         }
     }
@@ -105,6 +141,10 @@ impl CanonicalSourceKey {
                 ..
             }
             | Self::Cex {
+                canonical_source_rank,
+                ..
+            }
+            | Self::CexReference {
                 canonical_source_rank,
                 ..
             } => *canonical_source_rank,
@@ -153,16 +193,22 @@ impl SourceEnvelope {
                 connection_epoch: metadata.connection_epoch,
                 frame_sequence: metadata.frame_sequence,
             },
-            Self::CexReference(CexReferenceEnvelope {
-                fact:
-                    CexReferenceEvent::Trade {
-                        aggregate_trade_id, ..
-                    },
-                ..
-            }) => CanonicalSourceKey::Cex {
-                source_timestamp_ms: metadata.source_time_ms,
-                canonical_source_rank: metadata.canonical_source_rank,
-                aggregate_trade_id: *aggregate_trade_id,
+            Self::CexReference(envelope) => match &envelope.fact {
+                CexReferenceEvent::Trade {
+                    aggregate_trade_id, ..
+                } => CanonicalSourceKey::Cex {
+                    source_timestamp_ms: metadata.source_time_ms,
+                    canonical_source_rank: metadata.canonical_source_rank,
+                    aggregate_trade_id: *aggregate_trade_id,
+                },
+                CexReferenceEvent::Twap60sSnapshot { .. }
+                | CexReferenceEvent::Twap60sUpdate { .. } => CanonicalSourceKey::CexReference {
+                    source_timestamp_ms: metadata.source_time_ms,
+                    canonical_source_rank: metadata.canonical_source_rank,
+                    source_id: metadata.source_id.clone(),
+                    connection_epoch: metadata.connection_epoch,
+                    frame_sequence: metadata.frame_sequence,
+                },
             },
         }
     }

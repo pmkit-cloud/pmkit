@@ -3,7 +3,8 @@ use super::{
     instantiate_strategies, observe_reconnect, store_signal as persist_signal,
     validate_account_owner,
 };
-use crate::feed::{FeedMode, MergedFeed, SourceTaskDefinition};
+use crate::feed::{FeedError, FeedMode, MergedFeed, SourceTaskDefinition};
+use crate::live_shadow::LiveShadow;
 use pmkit_accounting::{ExposureReservation, aggregate_exposure};
 use pmkit_book::{OrderBookL2, Side};
 use pmkit_event::{
@@ -11,7 +12,7 @@ use pmkit_event::{
     StreamMetadata,
 };
 use pmkit_exec::{ExecError, Executor, OrderId, OrderStatus, PlaceOrder};
-use pmkit_market::Outcome;
+use pmkit_market::{Asset, Outcome};
 use pmkit_runtime::{LiveOrderPolicy, RuntimeConfig, StrategyRegistration};
 use pmkit_spec::LiveRun;
 use pmkit_store::{CausalIdentity, OwnerScope, ReplayItem, StoreError, TapeStore};
@@ -219,7 +220,11 @@ async fn shutdown_orders(
     }
 }
 
-fn sources(run: &LiveRun, strategies: &[StrategyInstance]) -> Vec<SourceTaskDefinition> {
+fn sources(
+    run: &LiveRun,
+    strategies: &[StrategyInstance],
+    control: &RunControl,
+) -> Result<Vec<SourceTaskDefinition>, StartError> {
     let mut subscribed = HashSet::new();
     let mut sources = Vec::new();
     for instance in strategies {
@@ -235,7 +240,57 @@ fn sources(run: &LiveRun, strategies: &[StrategyInstance]) -> Vec<SourceTaskDefi
             }));
         }
     }
-    for (name, reference) in run.reference_data_refs() {
+    for binding in run.settlement_oracle_bindings() {
+        let source = control.oracle_source(binding.name()).ok_or_else(|| {
+            StartError::OracleSourceMissing {
+                run: run.id().clone(),
+                binding: binding.name().to_owned(),
+            }
+        })?;
+        let asset = binding
+            .asset()
+            .parse::<Asset>()
+            .map_err(|_| StartError::Source {
+                run: run.id().clone(),
+                source: pmkit_data::DataSourceError::Unavailable {
+                    message: format!(
+                        "invalid asset `{}` for settlement oracle binding `{}`",
+                        binding.asset(),
+                        binding.name()
+                    ),
+                },
+            })?;
+        let name = binding.name().to_owned();
+        sources.push(SourceTaskDefinition::new(name, move |sink| async move {
+            source.subscribe_oracle(asset, sink).await
+        }));
+    }
+    for requirement in run.settlement_oracle_requirements() {
+        if !run.settlement_oracle_bindings().iter().any(|binding| {
+            binding.name() == requirement.name() && binding.market() == requirement.market()
+        }) {
+            return Err(StartError::Source {
+                run: run.id().clone(),
+                source: pmkit_data::DataSourceError::Unavailable {
+                    message: format!(
+                        "required settlement oracle `{}` has no asset mapping for market `{}`",
+                        requirement.name(),
+                        requirement.market()
+                    ),
+                },
+            });
+        }
+    }
+    let oracle_names: HashSet<_> = run
+        .settlement_oracle_bindings()
+        .iter()
+        .map(pmkit_spec::SettlementOracleBinding::name)
+        .collect();
+    for (name, reference) in run
+        .reference_data_refs()
+        .iter()
+        .filter(|(name, _)| !oracle_names.contains(&name.as_str()))
+    {
         let name = name.clone();
         let reference = reference.clone();
         sources.push(SourceTaskDefinition::new(name, move |sink| async move {
@@ -250,7 +305,7 @@ fn sources(run: &LiveRun, strategies: &[StrategyInstance]) -> Vec<SourceTaskDefi
             move |sink| async move { account.subscribe_account(portfolio, sink).await },
         ));
     }
-    sources
+    Ok(sources)
 }
 
 fn report(
@@ -454,6 +509,8 @@ struct LiveSubmitContext<'a> {
     identity: &'a CausalIdentity,
     market: &'a pmkit_core::MarketId,
     timestamp_ms: i64,
+    receipt_time_ms: i64,
+    shadow: Option<&'a mut LiveShadow>,
     max_open_orders: usize,
     portfolio_daily_pnl: Option<rust_decimal::Decimal>,
     effective_limits: &'a pmkit_runtime::RiskLimits,
@@ -495,6 +552,9 @@ async fn cancel_live_order(
         run: context.run.id().clone(),
         source,
     })?;
+    if let Some(shadow) = context.shadow.as_deref_mut() {
+        shadow.cancel_venue_order(&order_id.0);
+    }
     context.reservations.remove(&order_id.0);
     context.open_orders.remove(order_id);
     Ok(())
@@ -623,6 +683,15 @@ async fn submit_live_order(
     .await;
     match placement {
         Ok(Some(order_id)) => {
+            if let Some(shadow) = context.shadow.as_deref_mut() {
+                let predictions = shadow.submit_for_venue(
+                    order,
+                    context.strategy.clone(),
+                    context.receipt_time_ms,
+                    &order_id,
+                );
+                context.metrics.record_shadow_predictions(predictions);
+            }
             context
                 .verdicts
                 .push(crate::causal::ActionRiskVerdict::accepted(action_index));
@@ -900,6 +969,19 @@ async fn drive_with_control_and_rate_limits(
     rate_limits: OrderRateLimits,
 ) -> Result<LiveReport, StartError> {
     let metrics = control.metrics_for(run.id());
+    let mut shadow = control
+        .live_shadow_simulation()
+        .copied()
+        .map(LiveShadow::new);
+    if shadow.is_some() && run.account_data_ref().is_none() {
+        return Err(StartError::Source {
+            run: run.id().clone(),
+            source: pmkit_data::DataSourceError::Unavailable {
+                message: "live shadow simulation requires an authenticated PM account source"
+                    .to_owned(),
+            },
+        });
+    }
     let effective_limits_by_strategy: HashMap<_, _> = run
         .strategies()
         .iter()
@@ -915,6 +997,7 @@ async fn drive_with_control_and_rate_limits(
         })
         .collect();
     let mut strategies = instantiate_strategies(run.strategies(), run.id())?;
+    let source_definitions = sources(run, &strategies, control)?;
     let executor = run.executor().clone();
     let limits = run.risk().clone();
     let scope = OwnerScope::new(run.portfolio().clone(), run.id().clone());
@@ -933,9 +1016,10 @@ async fn drive_with_control_and_rate_limits(
     let fill_authority = DurableFillAuthority::for_run(run);
     let max_open_orders = usize::try_from(limits.max_open_orders.get()).unwrap_or(usize::MAX);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1024);
-    let feed = MergedFeed::from_tasks(FeedMode::Live, sources(run, &strategies), None)
-        .with_metrics(metrics.clone());
-    let merge = tokio::spawn(async move { feed.forward(event_tx).await });
+    let feed = MergedFeed::from_tasks(FeedMode::Live, source_definitions, None)
+        .with_metrics(metrics.clone())
+        .with_capture(control.capture().cloned());
+    let merge = tokio::spawn(async move { feed.forward_run(event_tx).await });
     let mut tape = LiveTape::open(run, runtime)?;
     let mut order_rate_state = OrderRateState::default();
     let mut risk_state = LiveRiskState::default();
@@ -1017,10 +1101,14 @@ async fn drive_with_control_and_rate_limits(
         )
         .await?;
         if let SourceEnvelope::CexReference(envelope) = &merged.source {
-            cex_metrics.observe(&envelope.fact);
+            if let CexReferenceEvent::Trade { .. } = &envelope.fact {
+                cex_metrics.observe(&envelope.fact);
+            }
             let portfolio_daily_pnl = risk_state.daily_pnl();
             let timestamp_ms = match &envelope.fact {
-                CexReferenceEvent::Trade { timestamp_ms, .. } => *timestamp_ms,
+                CexReferenceEvent::Trade { timestamp_ms, .. }
+                | CexReferenceEvent::Twap60sSnapshot { timestamp_ms, .. }
+                | CexReferenceEvent::Twap60sUpdate { timestamp_ms, .. } => *timestamp_ms,
             };
             for (index, instance) in strategies.iter_mut().enumerate() {
                 let market = &instance.market;
@@ -1059,6 +1147,8 @@ async fn drive_with_control_and_rate_limits(
                         identity: &identity,
                         market,
                         timestamp_ms,
+                        receipt_time_ms: envelope.metadata.receipt_time_ms,
+                        shadow: shadow.as_mut(),
                         max_open_orders,
                         portfolio_daily_pnl,
                         effective_limits,
@@ -1126,6 +1216,9 @@ async fn drive_with_control_and_rate_limits(
             match &envelope.fact {
                 PmAccountEvent::Fill { order_id, size, .. } => {
                     if fill_was_applied {
+                        if shadow.is_some() {
+                            metrics.record_shadow_observed(envelope.clone());
+                        }
                         apply_reservation_fill(
                             &mut reservations,
                             &mut open_orders,
@@ -1140,6 +1233,9 @@ async fn drive_with_control_and_rate_limits(
                 }
                 PmAccountEvent::OrderCancelled { order_id, .. }
                 | PmAccountEvent::OrderRejected { order_id, .. } => {
+                    if let Some(shadow) = shadow.as_mut() {
+                        shadow.cancel_venue_order(order_id);
+                    }
                     reservations.remove(order_id);
                     open_orders.remove(&OrderId(order_id.clone()));
                 }
@@ -1170,6 +1266,15 @@ async fn drive_with_control_and_rate_limits(
                     timestamp_ms: *timestamp_ms,
                     last_trade_price: None,
                 };
+                if let Some(shadow) = shadow.as_mut() {
+                    let predictions = shadow.update_book(
+                        market,
+                        *outcome,
+                        book.clone(),
+                        envelope.metadata.receipt_time_ms,
+                    );
+                    metrics.record_shadow_predictions(predictions);
+                }
                 let fact = StrategyFact::Market(event.clone());
                 let portfolio_daily_pnl = risk_state.update_book(market, *outcome, &book, &limits);
                 if risk_state.loss_breached
@@ -1221,6 +1326,8 @@ async fn drive_with_control_and_rate_limits(
                             identity: &identity,
                             market,
                             timestamp_ms: *timestamp_ms,
+                            receipt_time_ms: envelope.metadata.receipt_time_ms,
+                            shadow: shadow.as_mut(),
                             max_open_orders,
                             portfolio_daily_pnl,
                             effective_limits,
@@ -1304,9 +1411,15 @@ async fn drive_with_control_and_rate_limits(
                 message: format!("merged feed task failed: {error}"),
             },
         })?
-        .map_err(|source| StartError::Source {
-            run: run.id().clone(),
-            source,
+        .map_err(|error| match error {
+            FeedError::Source(source) => StartError::Source {
+                run: run.id().clone(),
+                source,
+            },
+            FeedError::Capture(source) => StartError::Capture {
+                run: run.id().clone(),
+                source,
+            },
         })?;
 
     let report = finish(
@@ -2528,6 +2641,227 @@ mod risk_reconstruction_tests {
         // Then: startup fails closed through the typed storage error path.
         assert!(matches!(result, Err(StoreError::Storage { .. })));
         store.delete_database()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod oracle_capture_tests {
+    use super::drive_with_control;
+    use crate::{
+        RunControl,
+        capture::CaptureConfig,
+        test_support::{config, risk},
+    };
+    use async_trait::async_trait;
+    use pmkit_core::{MarketId, PortfolioId, RunId, StrategyId};
+    use pmkit_data::{DataSourceError, LiveDataSource, LiveOracleDataSource, SourceSignal};
+    use pmkit_event::{
+        CexReferenceEnvelope, CexReferenceEvent, SourceEnvelope, StrategyFact, StreamMetadata,
+    };
+    use pmkit_exec::{ExecError, ExecutionSnapshot, Executor, OrderId, PlaceOrder};
+    use pmkit_market::{Asset, Outcome};
+    use pmkit_runtime::StrategyRegistration;
+    use pmkit_spec::LiveRun;
+    use pmkit_strategy::{
+        Actions, Strategy, StrategyContext, StrategyError, StrategyFactory, StrategyInitError,
+    };
+    use pmkit_tape::{RawCapturePayload, RawCaptureReader, RawCaptureRecord};
+    use rust_decimal::Decimal;
+    use std::{
+        collections::HashMap,
+        fs::File,
+        io::BufReader,
+        path::PathBuf,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+    use tokio::sync::mpsc::Sender;
+
+    const RAW_FRAME: &[u8] = b"{ \"oracle\": \"exact\" }";
+    const ORACLE_BINDING: &str = "polybolt:oracle";
+    const ORACLE_SOURCE_ID: &str = "polymarket:polybolt:price.crypto.twap:60";
+
+    struct EmptyMarket;
+
+    #[async_trait]
+    impl LiveDataSource for EmptyMarket {
+        async fn subscribe(
+            &self,
+            _market: MarketId,
+            _outcome: Outcome,
+            sink: Sender<SourceSignal>,
+        ) -> Result<(), DataSourceError> {
+            sink.send(SourceSignal::Watermark(i64::MAX))
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)?;
+            sink.send(SourceSignal::Eof)
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)
+        }
+    }
+
+    #[derive(Default)]
+    struct ScriptedOracle(AtomicUsize);
+
+    #[async_trait]
+    impl LiveOracleDataSource for ScriptedOracle {
+        async fn subscribe_oracle(
+            &self,
+            asset: Asset,
+            sink: Sender<SourceSignal>,
+        ) -> Result<(), DataSourceError> {
+            if asset != Asset::Btc {
+                return Err(DataSourceError::Unavailable {
+                    message: "unexpected oracle asset".into(),
+                });
+            }
+            self.0.fetch_add(1, Ordering::Relaxed);
+            sink.send(SourceSignal::Data(Box::new(SourceEnvelope::CexReference(
+                CexReferenceEnvelope {
+                    metadata: StreamMetadata {
+                        schema_version: 1,
+                        source_id: ORACLE_SOURCE_ID.into(),
+                        source_time_ms: 10,
+                        canonical_source_rank: 2,
+                        receipt_time_ms: 12,
+                        connection_id: "oracle-session-1".into(),
+                        connection_epoch: 0,
+                        frame_sequence: 1,
+                        ingest_sequence: 1,
+                    },
+                    raw_frame: RAW_FRAME.to_vec(),
+                    fact: CexReferenceEvent::Twap60sSnapshot {
+                        asset,
+                        price: Decimal::new(67_250, 2),
+                        timestamp_ms: 10,
+                    },
+                },
+            ))))
+            .await
+            .map_err(|_| DataSourceError::SinkClosed)?;
+            sink.send(SourceSignal::Watermark(i64::MAX))
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)?;
+            sink.send(SourceSignal::Eof)
+                .await
+                .map_err(|_| DataSourceError::SinkClosed)
+        }
+    }
+
+    struct IdleExecutor;
+
+    #[async_trait]
+    impl Executor for IdleExecutor {
+        async fn preflight(&self) -> Result<ExecutionSnapshot, ExecError> {
+            Ok(ExecutionSnapshot::default())
+        }
+
+        async fn reconcile(&self) -> Result<ExecutionSnapshot, ExecError> {
+            Ok(ExecutionSnapshot::default())
+        }
+
+        async fn submit(&self, _order: &PlaceOrder, _now_ms: i64) -> Result<OrderId, ExecError> {
+            Err(ExecError::Rejected {
+                reason: "unused".into(),
+            })
+        }
+
+        async fn cancel(&self, _order_id: &OrderId) -> Result<(), ExecError> {
+            Ok(())
+        }
+
+        async fn cancel_all(&self) -> Result<(), ExecError> {
+            Ok(())
+        }
+    }
+
+    struct CaptureProbe {
+        path: PathBuf,
+        observed: Arc<Mutex<Option<RawCaptureRecord>>>,
+    }
+
+    impl Strategy for CaptureProbe {
+        fn on_event(&mut self, context: StrategyContext<'_>) -> Result<Actions, StrategyError> {
+            if matches!(
+                context.fact,
+                StrategyFact::Reference(CexReferenceEvent::Twap60sSnapshot { .. })
+            ) && let Ok(file) = File::open(&self.path)
+                && let Ok(Some(record)) = RawCaptureReader::new(BufReader::new(file)).next_record()
+                && let Ok(mut observed) = self.observed.lock()
+            {
+                *observed = Some(record);
+            }
+            Ok(Actions::none())
+        }
+    }
+
+    struct CaptureProbeFactory {
+        path: PathBuf,
+        observed: Arc<Mutex<Option<RawCaptureRecord>>>,
+    }
+
+    impl StrategyFactory for CaptureProbeFactory {
+        fn create(&self) -> Result<Box<dyn Strategy>, StrategyInitError> {
+            Ok(Box::new(CaptureProbe {
+                path: self.path.clone(),
+                observed: Arc::clone(&self.observed),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_oracle_frame_is_captured_before_strategy_evaluation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let run_id = RunId::new("live-oracle-capture")?;
+        let path = directory.path().join("run-live-oracle-capture.jsonl");
+        let market = MarketId::new("btc-5m")?;
+        let oracle = Arc::new(ScriptedOracle::default());
+        let control = RunControl {
+            capture: Some(CaptureConfig::new(directory.path()).open(&run_id)?),
+            oracle_sources: Arc::new(HashMap::from([(
+                ORACLE_BINDING.to_owned(),
+                Arc::clone(&oracle) as Arc<dyn LiveOracleDataSource>,
+            )])),
+            ..RunControl::default()
+        };
+        let observed = Arc::new(Mutex::new(None));
+        let run = LiveRun::new(
+            run_id,
+            PortfolioId::new("alice")?,
+            Arc::new(IdleExecutor),
+            Arc::new(EmptyMarket),
+            risk()?,
+        )
+        .settlement_oracle_named(ORACLE_BINDING, market.clone(), "BTC")
+        .require_settlement_oracle(ORACLE_BINDING, market.clone())
+        .strategy(StrategyRegistration::new(
+            StrategyId::new("capture-probe")?,
+            market,
+            Arc::new(CaptureProbeFactory {
+                path,
+                observed: Arc::clone(&observed),
+            }),
+        ));
+
+        drive_with_control(&run, &config()?, None, &control).await?;
+
+        assert_eq!(oracle.0.load(Ordering::Relaxed), 1);
+        let record = observed
+            .lock()
+            .map_err(|_| "capture probe mutex poisoned")?
+            .take()
+            .ok_or("strategy ran before capture was flushed")?;
+        assert_eq!(record.capture.source_id, ORACLE_SOURCE_ID);
+        assert_eq!(
+            record.capture.payload,
+            RawCapturePayload::Frame {
+                raw_bytes: RAW_FRAME.to_vec(),
+            }
+        );
         Ok(())
     }
 }
